@@ -90,7 +90,7 @@ internal class HeaderBuilder
 
     public ArraySegment<byte> GetBuffer()
     {
-#if NET451
+#if NET451 || NET45
         return new ArraySegment<byte>(stream.ToArray());
 #else
             stream.TryGetBuffer(out var buffer);
@@ -100,7 +100,7 @@ internal class HeaderBuilder
 
     public string GetString(Encoding encoding)
     {
-#if NET451
+#if NET451 || NET45
         return encoding.GetString(stream.ToArray());
 #else
             stream.TryGetBuffer(out var buffer);

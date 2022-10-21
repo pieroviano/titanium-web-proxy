@@ -211,7 +211,7 @@ internal class Decoder
                             if (nameLength + HttpHeader.HttpHeaderOverhead > dynamicTable.Capacity)
                             {
                                 dynamicTable.Clear();
-#if NET451
+#if NET451 || NET45
                                 name = Net45Compatibility.EmptyArray;
 #else
                                     name = Array.Empty<byte>();
@@ -317,7 +317,7 @@ internal class Decoder
 
                         if (valueLength == 0)
                         {
-#if NET451
+#if NET451 || NET45
                             InsertHeader(headerListener, name, Net45Compatibility.EmptyArray, indexType);
 #else
                                 name = Array.Empty<byte>();
