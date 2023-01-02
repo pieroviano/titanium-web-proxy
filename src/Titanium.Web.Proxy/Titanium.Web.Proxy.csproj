@@ -16,7 +16,6 @@
     <PackageId>$(AssemblyName).PieroViano</PackageId>
   </PropertyGroup>
 
-
   <PropertyGroup>
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
     <EmbedUntrackedSources>true</EmbedUntrackedSources>
