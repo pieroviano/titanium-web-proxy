@@ -2,6 +2,10 @@
 
   <PropertyGroup>
     <TargetFrameworks>net45;net451;net461;netstandard2.0;netstandard2.1</TargetFrameworks>
+    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+    <IncludeSymbols Condition="'$(Configuration)'=='Debug'">true</IncludeSymbols>
+    <SymbolPackageFormat Condition="'$(Configuration)'=='Debug'">snupkg</SymbolPackageFormat>
+    <IncludeSymbols Condition="'$(Configuration)'!='Debug'">false</IncludeSymbols>
     <RootNamespace>Titanium.Web.Proxy</RootNamespace>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <SignAssembly>True</SignAssembly>
@@ -11,7 +15,6 @@
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
     <VersionPrefix>3.2.0</VersionPrefix>
-    <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
     <Authors>$(AssemblyName)</Authors>
     <PackageId>$(AssemblyName).PieroViano</PackageId>
   </PropertyGroup>
@@ -21,7 +24,7 @@
     <PackageOutputPath>$(SolutionDir)Packages\</PackageOutputPath>
   </PropertyGroup>
 
-  <Import Project="$(USERPROFILE)\.nuget\packages\ObfuscatorUtility.PieroViano\1.0.0\build\ObfuscatorUtility.PieroViano.props" Condition="Exists('$(USERPROFILE)\.nuget\packages\ObfuscatorUtility.PieroViano\1.0.0\build\ObfuscatorUtility.PieroViano.props')" />
+  
   <ItemGroup>
     <PackageReference Include="ObfuscatorUtility.PieroViano" Version="1.0.0" PrivateAssets="All" />
   </ItemGroup>
