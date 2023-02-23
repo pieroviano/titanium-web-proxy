@@ -78,11 +78,6 @@ public class TunnelConnectSessionEventArgs : SessionEventArgsBase
 
     ~TunnelConnectSessionEventArgs()
     {
-#if DEBUG
-            // Finalizer should not be called
-            System.Diagnostics.Debugger.Break();
-#endif
-
         Dispose(false);
     }
 }
