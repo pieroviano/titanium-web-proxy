@@ -56,6 +56,23 @@ namespace Titanium.Web.Proxy.Extensions
 
             return null;
         }
+#elif NET40
+        internal static List<SslApplicationProtocol> GetAlpn(this ClientHelloInfo clientHelloInfo)
+        {
+            return Http11ProtocolAsList;
+        }
+
+        internal static Task AuthenticateAsClientAsync(this SslStream sslStream, SslClientAuthenticationOptions option,
+            CancellationToken token)
+        {
+            return sslStream.AuthenticateAsClientAsync(option, token);
+        }
+
+        internal static Task AuthenticateAsServerAsync(this SslStream sslStream, SslServerAuthenticationOptions options,
+            CancellationToken token)
+        {
+            return sslStream.AuthenticateAsServerAsync(options, token);
+        }
 #else
         internal static List<SslApplicationProtocol> GetAlpn(this ClientHelloInfo clientHelloInfo)
         {

@@ -74,7 +74,11 @@ namespace Titanium.Web.Proxy
                                                     await CertificateManager.CreateServerCertificate(certName);
 
                             // Successfully managed to authenticate the client using the certificate
+#if NET40
+                            await new Action(()=>sslStream.AuthenticateAsServer(certificate, false, SslProtocols.Tls, false)).Run();
+#else
                             await sslStream.AuthenticateAsServerAsync(certificate, false, SslProtocols.Tls, false);
+#endif
 
                             // HTTPS server created - we can now decrypt the client's traffic
                             clientStream = new CustomBufferedStream(sslStream, BufferPool, BufferSize);

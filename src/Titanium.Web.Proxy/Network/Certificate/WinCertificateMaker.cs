@@ -86,7 +86,7 @@ namespace Titanium.Web.Proxy.Network.Certificate
         {
             if (switchToMTAIfNeeded && Thread.CurrentThread.GetApartmentState() != ApartmentState.MTA)
             {
-                return Task.Run(() => makeCertificate(sSubjectCN, isRoot, false, signingCert),
+                return TaskEx.Run(() => makeCertificate(sSubjectCN, isRoot, false, signingCert),
                     cancellationToken).Result;
             }
 

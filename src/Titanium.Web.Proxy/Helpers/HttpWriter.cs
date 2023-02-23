@@ -107,7 +107,11 @@ namespace Titanium.Web.Proxy.Helpers
 
             if (flush)
             {
+#if NET40
+                await new Action(()=> stream.Flush()).Run(cancellationToken);
+#else
                 await stream.FlushAsync(cancellationToken);
+#endif
             }
         }
 
@@ -116,7 +120,11 @@ namespace Titanium.Web.Proxy.Helpers
             await stream.WriteAsync(data, 0, data.Length, cancellationToken);
             if (flush)
             {
+#if NET40
+                await new Action(() => stream.Flush()).Run(cancellationToken);
+#else
                 await stream.FlushAsync(cancellationToken);
+#endif
             }
         }
 
@@ -126,7 +134,11 @@ namespace Titanium.Web.Proxy.Helpers
             await stream.WriteAsync(data, offset, count, cancellationToken);
             if (flush)
             {
+#if NET40
+                await new Action(() => stream.Flush()).Run(cancellationToken);
+#else
                 await stream.FlushAsync(cancellationToken);
+#endif
             }
         }
 

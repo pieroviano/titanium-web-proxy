@@ -39,7 +39,7 @@ namespace Titanium.Web.Proxy.Network.Tcp
         internal TcpConnectionFactory(ProxyServer server)
         {
             this.Server = server;
-            Task.Run(async () => await clearOutdatedConnections());
+            TaskEx.Run(async () => await clearOutdatedConnections());
         }
 
         internal ProxyServer Server { get; }
@@ -286,7 +286,11 @@ namespace Titanium.Web.Proxy.Network.Tcp
                 var hostname = useUpstreamProxy ? externalProxy.HostName : remoteHostName;
                 var port = useUpstreamProxy ? externalProxy.Port : remotePort;
 
+#if NET40
+                var ipAddresses = Dns.GetHostAddresses(hostname);
+#else
                 var ipAddresses = await Dns.GetHostAddressesAsync(hostname);
+#endif
                 if (ipAddresses == null || ipAddresses.Length == 0)
                 {
                     throw new Exception($"Could not resolve the hostname {hostname}");
@@ -301,7 +305,11 @@ namespace Titanium.Web.Proxy.Network.Tcp
                 {
                     try
                     {
+#if NET40
+                        tcpClient.Connect(ipAddresses[i], port);
+#else
                         await tcpClient.ConnectAsync(ipAddresses[i], port);
+#endif
                         break;
                     }
                     catch (Exception e)
@@ -426,7 +434,11 @@ namespace Titanium.Web.Proxy.Network.Tcp
 
             try
             {
+#if NET40
+                await new Action(()=> @lock.Wait()).Run();
+#else
                 await @lock.WaitAsync();
+#endif
 
                 while (true)
                 {
@@ -506,7 +518,11 @@ namespace Titanium.Web.Proxy.Network.Tcp
 
                     try
                     {
+#if NET40
+                        await new Action(() => @lock.Wait()).Run();
+#else
                         await @lock.WaitAsync();
+#endif
 
                         //clear empty queues
                         var emptyKeys = cache.Where(x => x.Value.Count == 0).Select(x => x.Key).ToList();
@@ -535,7 +551,7 @@ namespace Titanium.Web.Proxy.Network.Tcp
                 finally
                 {
                     //cleanup every 3 seconds by default
-                    await Task.Delay(1000 * 3);
+                    await TimeSpan.FromMilliseconds(1000 * 3).Delay();
                 }
 
             }

@@ -166,7 +166,11 @@ namespace Titanium.Web.Proxy
                             try
                             {
                                 //make sure the host can be resolved before creating the prefetch task
+#if NET40
+                                ipAddresses = Dns.GetHostAddresses(connectArgs.HttpClient.Request.RequestUri.Host);
+#else
                                 ipAddresses = await Dns.GetHostAddressesAsync(connectArgs.HttpClient.Request.RequestUri.Host);
+#endif
                             }
                             catch (SocketException) { }
 

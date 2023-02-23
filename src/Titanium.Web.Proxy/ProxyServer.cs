@@ -238,7 +238,7 @@ namespace Titanium.Web.Proxy
         /// <summary>
         ///     List of supported Ssl versions.
         /// </summary>
-        public SslProtocols SupportedSslProtocols { get; set; } = SslProtocols.Ssl3 | SslProtocols.Tls | SslProtocols.Tls11 | SslProtocols.Tls12;
+        public SslProtocols SupportedSslProtocols { get; set; } = SslProtocols.Ssl3 | SslProtocols.Tls | (SslProtocols)768 | (SslProtocols)3072;
 
         /// <summary>
         ///     The buffer pool used throughout this proxy instance.
@@ -701,7 +701,7 @@ namespace Titanium.Web.Proxy
         private Task<ExternalProxy> getSystemUpStreamProxy(SessionEventArgsBase sessionEventArgs)
         {
             var proxy = systemProxyResolver.GetProxy(sessionEventArgs.HttpClient.Request.RequestUri);
-            return Task.FromResult(proxy);
+            return proxy.FromResult();
         }
 
         /// <summary>
@@ -733,7 +733,7 @@ namespace Titanium.Web.Proxy
 
             if (tcpClient != null)
             {
-                Task.Run(async () =>
+                TaskEx.Run(async () =>
                 {
                     await handleClient(tcpClient, endPoint);
                 });

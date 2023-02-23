@@ -138,7 +138,11 @@ namespace Titanium.Web.Proxy.StreamExtended.Network
         /// <returns>
         /// A task that represents the asynchronous copy operation.
         /// </returns>
-        public override async Task CopyToAsync(Stream destination, int bufferSize, CancellationToken cancellationToken = default)
+        public
+#if !NET40
+override 
+#endif
+async Task CopyToAsync(Stream destination, int bufferSize, CancellationToken cancellationToken = default)
         {
             if (bufferLength > 0)
             {
@@ -147,7 +151,16 @@ namespace Titanium.Web.Proxy.StreamExtended.Network
                 bufferLength = 0;
             }
 
+#if !NET40
             await base.CopyToAsync(destination, bufferSize, cancellationToken);
+#else
+            await new Action(() =>
+            {
+                base.CopyTo
+                    (destination, bufferSize);
+
+            }).Run(cancellationToken);
+#endif
         }
 
         /// <summary>
@@ -157,9 +170,20 @@ namespace Titanium.Web.Proxy.StreamExtended.Network
         /// <returns>
         /// A task that represents the asynchronous flush operation.
         /// </returns>
-        public override Task FlushAsync(CancellationToken cancellationToken = default)
+        public
+#if !NET40
+override 
+#endif
+            Task FlushAsync(CancellationToken cancellationToken = default)
         {
+#if !NET40
             return baseStream.FlushAsync(cancellationToken);
+#else
+            return new Action(() =>
+            {
+                baseStream.Flush();
+            }).Run(cancellationToken);
+#endif
         }
 
         /// <summary>
@@ -182,7 +206,11 @@ namespace Titanium.Web.Proxy.StreamExtended.Network
         /// less than the requested number, or it can be 0 (zero)
         /// if the end of the stream has been reached.
         /// </returns>
-        public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken = default)
+        public
+#if !NET40
+override 
+#endif
+            async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken = default)
         {
             if (bufferLength == 0)
             {
@@ -324,7 +352,11 @@ namespace Titanium.Web.Proxy.StreamExtended.Network
         /// A task that represents the asynchronous write operation.
         /// </returns>
         [DebuggerStepThrough]
-        public override async Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken = default)
+        public
+#if !NET40
+override 
+#endif
+            async Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken = default)
         {
             OnDataWrite(buffer, offset, count);
 
