@@ -460,7 +460,7 @@ internal class TcpConnectionFactory : IDisposable
 #if NET451
                     tcpServerSocket?.Close();
 #else
-                        tcpServerSocket?.Dispose();
+                    tcpServerSocket?.Dispose();
 #endif
                     tcpServerSocket = null;
                 }
