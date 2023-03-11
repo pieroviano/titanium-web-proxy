@@ -481,7 +481,7 @@ internal class TcpConnectionFactory : IDisposable
 
                 if (prefetch) return null;
 
-                throw new Exception($"Could not establish connection to {hostname}", lastException);
+                throw new TitaniumException($"Could not establish connection to {hostname}", lastException);
             }
 
             if (sessionArgs != null) sessionArgs.TimeLine["Connection Established"] = DateTime.UtcNow;
