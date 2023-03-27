@@ -1,6 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
-  <Import Project = "$(UserProfile)\.nuget\packages\obfuscatorutility\1.0.0\build\Obfuscator.Utility.targets" Condition="Exists('$(UserProfile)\.nuget\packages\obfuscatorutility\1.0.0\build\Obfuscator.Utility.targets')" />
-  <Import Project = "$(UserProfile)\.nuget\packages\obfuscatorutility\1.0.0\build\Obfuscator.Utility.props" Condition="Exists('$(UserProfile)\.nuget\packages\obfuscatorutility\1.0.0\build\Obfuscator.Utility.props')" />
+  <Import Project = "$(UserProfile)\.nuget\packages\nugetutility\$(NuGetUtilityVersion)\build\NuGet.Utility.targets" Condition="Exists('$(UserProfile)\.nuget\packages\nugetutility\$(NuGetUtilityVersion)\build\NuGet.Utility.targets')" />
+  <Import Project = "$(UserProfile)\.nuget\packages\nugetutility\$(NuGetUtilityVersion)\build\NuGet.Utility.props" Condition="Exists('$(UserProfile)\.nuget\packages\nugetutility\$(NuGetUtilityVersion)\build\NuGet.Utility.props')" />
 
   <PropertyGroup>
     <TargetFrameworks>net45;net451;net461;netstandard2.0;netstandard2.1</TargetFrameworks>
@@ -28,7 +28,7 @@
 
   
   <ItemGroup>
-    <PackageReference Include="ObfuscatorUtility" Version="1.0.0" PrivateAssets="All" />
+    <PackageReference Include="NuGetUtility" Version="$(NuGetUtilityVersion).*-*" PrivateAssets="All" />
   </ItemGroup>
 
   <ItemGroup>
@@ -43,12 +43,8 @@
   </ItemGroup>
 
   <ItemGroup Condition="'$(TargetFramework)' != 'net45' and '$(TargetFramework)' != 'net451' and '$(TargetFramework)' != 'net40'">
-    <PackageReference Include="Microsoft.Win32.Registry">
-      <Version>5.0.0</Version>
-    </PackageReference>
-    <PackageReference Include="System.Security.Principal.Windows">
-      <Version>5.0.0</Version>
-    </PackageReference>
+    <PackageReference Include="Microsoft.Win32.Registry" Version="5.0.0" />
+    <PackageReference Include="System.Security.Principal.Windows" Version="5.0.0" />
   </ItemGroup>
 
   <ItemGroup>
