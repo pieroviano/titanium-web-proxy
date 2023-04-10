@@ -18,11 +18,7 @@
     <LangVersion>latest</LangVersion>
     <VersionPrefix>3.2.0</VersionPrefix>
     <Authors>$(AssemblyName)</Authors>
-    <PackageId>$(AssemblyName).PieroViano</PackageId>
-  </PropertyGroup>
-
-  <PropertyGroup>
-    <PackageId>$(MSBuildProjectName).PieroViano</PackageId>
+    <PackageId>Net4x.$(AssemblyName)</PackageId>
     <PackageOutputPath>$(SolutionDir)Packages\</PackageOutputPath>
   </PropertyGroup>
 
