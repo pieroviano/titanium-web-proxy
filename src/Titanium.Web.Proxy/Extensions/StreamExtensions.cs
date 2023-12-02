@@ -1,4 +1,7 @@
 ﻿using System;
+#if NET40
+using System.Extensions.IO;
+#endif
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;

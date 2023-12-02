@@ -1,5 +1,8 @@
 ﻿using System;
 using System.Diagnostics;
+#if NET40
+using System.Extensions.IO;
+#endif
 using System.IO;
 using System.Text;
 using System.Threading;
