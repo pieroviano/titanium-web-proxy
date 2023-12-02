@@ -11,7 +11,7 @@
     <DocumentoUnicoLibrariesVersion>2.1.0</DocumentoUnicoLibrariesVersion>
     <IdentityServer4Version>1.0.0</IdentityServer4Version>
     <NotepadSharpVersion>1.1.0</NotepadSharpVersion>
-    <PdfRecognizerLibraryVersion>1.0.0</PdfRecognizerLibraryVersion>
+    <PdfRecognizerLibraryVersion>1.1.0</PdfRecognizerLibraryVersion>
     <SetupCustomActionVersion>1.1.0</SetupCustomActionVersion>
     <ImmatricolazioniLibraries>1.0.0</ImmatricolazioniLibraries>
     <NumberConverterLibVersion>1.0.0</NumberConverterLibVersion>
@@ -86,7 +86,44 @@
     <NewtonsoftJsonVersion>13.0.3</NewtonsoftJsonVersion>
     <NuGetUtilityPocVersion>1.0.0</NuGetUtilityPocVersion>
     <PackAsToolVersion>1.0.0</PackAsToolVersion>
-    <VersionSuffix Condition="'$(Configuration)'!='Release'">0-at20230515031705</VersionSuffix>
-    <VersionSuffix Condition="'$(Configuration)'=='Release'">0</VersionSuffix>
+    <serilog-sinks-fileVersion>5.0.1</serilog-sinks-fileVersion>
+    <DapperLibrariesVersion>1.0.0</DapperLibrariesVersion>
+    <Html2XhtmlVersion>1.1.4</Html2XhtmlVersion>
+    <BackgroundWorkerLibraryVersion>2.1.0</BackgroundWorkerLibraryVersion>
+    <CoreLibrarySerilogLoggerVersion>2.1.0</CoreLibrarySerilogLoggerVersion>
+    <WebBrowserLibraryInterfacesVersion>1.2.0</WebBrowserLibraryInterfacesVersion>
+    <PdfLibNetVersion>1.0.0</PdfLibNetVersion>
+    <PdfToPdfAVersion>1.0.75</PdfToPdfAVersion>
+    <UnitTestLibraryVersion>1.1.0</UnitTestLibraryVersion>
+    <Xsd2DbVersion>1.1.0</Xsd2DbVersion>
+    <iTextCoreVersion>1.1.0</iTextCoreVersion>
+    <PdfRepresentationVersion>1.1.0</PdfRepresentationVersion>
+    <StarbVersion>23.5.0</StarbVersion>
+    <NuGetUtilityVersion>2.0.10</NuGetUtilityVersion>
+    <DocumentoUnicoVersion>2.1.0</DocumentoUnicoVersion>
+    <SystemDataDataSetExtensionsVersion>4.5.0</SystemDataDataSetExtensionsVersion>
+    <PagedListVersion>4.5.0</PagedListVersion>
+    <DataGridLibVersion>1.0.0</DataGridLibVersion>
+    <Net4xDataDataSetExtensionsVersion>4.7.0</Net4xDataDataSetExtensionsVersion>
+    <Net4xWebVersion>4.8.9037</Net4xWebVersion>
+    <TextControlVersion>1.0.0</TextControlVersion>
+    <MicrosoftSqlServerTypesVersion>4.0.0</MicrosoftSqlServerTypesVersion>
+    <Net4xSqlServerTypesVersion>4.0.0</Net4xSqlServerTypesVersion>
+    <SystemMemoryVersion>4.5.5</SystemMemoryVersion>
+    <MicrosoftDataSqlClientVersion>5.1.1</MicrosoftDataSqlClientVersion>
+    <SystemDataSqlClientVersion>4.8.5</SystemDataSqlClientVersion>
+    <Net4xEntityFrameworkVersion>6.4.4</Net4xEntityFrameworkVersion>
+    <AggiuntaSTAVersion>1.0.0</AggiuntaSTAVersion>
+    <Net4xDrawingVersion>4.8.9037</Net4xDrawingVersion>
+    <Net4xiTextSharpVersion>5.5.14</Net4xiTextSharpVersion>
+    <SystemConfigurationConfigurationManagerVersion>7.0.0</SystemConfigurationConfigurationManagerVersion>
+    <SystemCodeDomVersion>7.0.0</SystemCodeDomVersion>
+    <SystemSecurityPermissionsVersion>7.0.0</SystemSecurityPermissionsVersion>
+    <MicrosoftExtensionsLogging461Version>2.2.0</MicrosoftExtensionsLogging461Version>
+    <MicrosoftExtensionsLoggingVersion>7.0.0</MicrosoftExtensionsLoggingVersion>
+    <SystemDataCommonVersion>4.3.0</SystemDataCommonVersion>
+    <SystemDrawingCommonVersion>7.0.0</SystemDrawingCommonVersion>
+    <NotifyIconWpfVersion>1.0.0</NotifyIconWpfVersion>
+    <Net4xConfigurationVersion>1.0.0</Net4xConfigurationVersion>
   </PropertyGroup>
 </Project>

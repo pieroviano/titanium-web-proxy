@@ -427,7 +427,12 @@ internal class TcpConnectionFactory : IDisposable
                         // which will throw
                         try
                         {
-                            connectTask.Dispose();
+                            if (connectTask.Status == TaskStatus.Canceled ||
+                                connectTask.Status == TaskStatus.RanToCompletion ||
+                                connectTask.Status == TaskStatus.Faulted)
+                            {
+                                connectTask.Dispose();
+                            }
                         }
                         catch
                         {
@@ -439,7 +444,7 @@ internal class TcpConnectionFactory : IDisposable
 #if NET451
                             tcpServerSocket?.Close();
 #else
-                                tcpServerSocket?.Dispose();
+                            tcpServerSocket?.Dispose();
 #endif
                             tcpServerSocket = null;
                         }
