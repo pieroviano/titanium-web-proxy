@@ -82,7 +82,7 @@ namespace Titanium.Web.Proxy.Network.Tcp
                 //delay calling tcp connection close()
                 //so that client have enough time to call close first.
                 //This way we can push tcp Time_Wait to client side when possible.
-                await TaskEx.Delay(1000);
+                await TaskEx.DelayAsync(1000);
                 proxyServer.UpdateClientConnectionCount(false);
                 tcpClient.CloseSocket();
             });

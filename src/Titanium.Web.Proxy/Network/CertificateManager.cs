@@ -495,7 +495,7 @@ namespace Titanium.Web.Proxy.Network
                 // after a minute come back to check for outdated certificates in cache
                 try
                 {
-                    await (TimeSpan.FromMilliseconds(1000 * 60).Delay(cancellationToken));
+                    await (TimeSpan.FromMilliseconds(1000 * 60).DelayAsync(cancellationToken));
                 }
                 catch (TaskCanceledException)
                 {

@@ -2,7 +2,7 @@
     <PropertyGroup>
         <NuGetPackageRoot Condition="'$(NuGetPackageRoot)'=='' and '$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Windows)))' == 'true'">$(USERPROFILE)\.nuget\packages\</NuGetPackageRoot>
         <NuGetPackageRoot Condition="'$(NuGetPackageRoot)'=='' and '$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Windows)))' != 'true'">~/.nuget/packages/</NuGetPackageRoot>
-        <VersionBuildSuffix Condition="'$(Configuration)'!='Release'">*</VersionBuildSuffix>
+        <VersionBuildSuffix Condition="'$(Configuration)'!='Release'">*-*</VersionBuildSuffix>
         <VersionBuildSuffix Condition="'$(Configuration)'=='Release'">*</VersionBuildSuffix>
         <NuGetUtilityVersion Condition="'$(NuGetUtilityVersion)' == ''">2.0.12</NuGetUtilityVersion>
         <DirectoryNuGet>true</DirectoryNuGet>
@@ -58,7 +58,7 @@
         <FormLoggingVersion>1.2.0</FormLoggingVersion>
         <UtilityLibraryVersion>1.2.0</UtilityLibraryVersion>
         <AppDomainTaskLibraryVersion>1.8.2</AppDomainTaskLibraryVersion>
-        <ConfigurationLibraryVersion>1.5.0</ConfigurationLibraryVersion>
+        <ConfigurationLibraryVersion>1.5.0.2</ConfigurationLibraryVersion>
         <DataAccessLibraryVersion>2.2.0</DataAccessLibraryVersion>
         <CoreLibraryVersion>2.2.0</CoreLibraryVersion>
         <IoCLibraryVersion>1.6.0</IoCLibraryVersion>
@@ -86,13 +86,13 @@
         <NuGetUtilityPocVersion>2.0.12</NuGetUtilityPocVersion>
         <PackAsToolVersion>1.1.0</PackAsToolVersion>
         <serilog-sinks-fileVersion>5.0.1</serilog-sinks-fileVersion>
-        <DapperLibrariesVersion>1.2.0</DapperLibrariesVersion>
+        <DapperLibrariesVersion>1.0.0</DapperLibrariesVersion>
         <Html2XhtmlVersion>1.1.5</Html2XhtmlVersion>
         <BackgroundWorkerLibraryVersion>2.2.0</BackgroundWorkerLibraryVersion>
         <CoreLibrarySerilogLoggerVersion>2.2.0</CoreLibrarySerilogLoggerVersion>
         <WebBrowserLibraryInterfacesVersion>1.3.0</WebBrowserLibraryInterfacesVersion>
         <PdfLibNetVersion>2.0.0</PdfLibNetVersion>
-        <PdfToPdfAVersion>1.80.0</PdfToPdfAVersion>
+        <PdfToPdfAVersion>1.0.76</PdfToPdfAVersion>
         <UnitTestLibraryVersion>1.2.0</UnitTestLibraryVersion>
         <Xsd2DbVersion>1.2.0</Xsd2DbVersion>
         <iTextCoreVersion>1.2.0</iTextCoreVersion>
@@ -120,7 +120,7 @@
         <MicrosoftExtensionsLoggingVersion>7.0.0</MicrosoftExtensionsLoggingVersion>
         <SystemDataCommonVersion>4.3.0</SystemDataCommonVersion>
         <SystemDrawingCommonVersion>7.0.0</SystemDrawingCommonVersion>
-        <NotifyIconWpfVersion>2.2.0</NotifyIconWpfVersion>
+        <NotifyIconWpfVersion>1.2.1</NotifyIconWpfVersion>
         <Net4xConfigurationVersion>1.1.0</Net4xConfigurationVersion>
         <BarcodeVersion>1.1.0</BarcodeVersion>
         <CompressExistingPDFVersion>2.0.0</CompressExistingPDFVersion>
@@ -129,10 +129,10 @@
         <EasyTabsVersion>1.1.0</EasyTabsVersion>
         <WindowsAPICodePackVersion>1.1.6</WindowsAPICodePackVersion>
         <AsyncEnumerableVersion>1.2.0</AsyncEnumerableVersion>
-        <UpdateLibraryPocVersion>1.30.0</UpdateLibraryPocVersion>
+        <UpdateLibraryPocVersion>1.1.0</UpdateLibraryPocVersion>
         <Net4xMSHTMLVersion>1.1.0</Net4xMSHTMLVersion>
         <BrutalDevStrongNameSignerVersion>3.2.1</BrutalDevStrongNameSignerVersion>
-        <ValuesFromSelectVersion>2.2.0</ValuesFromSelectVersion>
+        <ValuesFromSelectVersion>1.2.0</ValuesFromSelectVersion>
         <HostProcessLibrary>1.0.0</HostProcessLibrary>
         <WpfAdornedControlVersion>1.1.0</WpfAdornedControlVersion>
         <CreateHiddenProcessVersion>1.1.0</CreateHiddenProcessVersion>
@@ -148,39 +148,5 @@
         <CertificateLibraryVersion>1.0.0</CertificateLibraryVersion>
         <SqlParametersToVariableDefinitionsVersion>1.0.0</SqlParametersToVariableDefinitionsVersion>
         <MockAdoNetVersion>1.0.0</MockAdoNetVersion>
-        <UpdateLibraryPoCVersion>1.30.0</UpdateLibraryPoCVersion>
-        <CompileLibraryVersion>1.0.0</CompileLibraryVersion>
-        <CodeDomExtVersion>2.2.0</CodeDomExtVersion>
-        <MsTestsToNunitVersion>1.0.0</MsTestsToNunitVersion>
-        <WrapperGeneratorVersion>1.0.0</WrapperGeneratorVersion>
-        <ConsoleApp1Version>2.0.12</ConsoleApp1Version>
-        <NuGetUtilityVersion>2.0.12</NuGetUtilityVersion>
-        <StarbNet8Version>30.0.0</StarbNet8Version>
-        <SystemCodeDom5Version>5.0.0</SystemCodeDom5Version>
-        <SystemCodeDom6Version>6.0.0</SystemCodeDom6Version>
-        <SystemCodeDom7Version>7.0.0</SystemCodeDom7Version>
-        <SystemCodeDom8Version>8.0.0</SystemCodeDom8Version>
-        <UpdateLibraryPocnet8windowsVersion>1.30.0</UpdateLibraryPocnet8windowsVersion>
-        <UpdateLibraryPoCnet8windowsVersion>1.30.0</UpdateLibraryPoCnet8windowsVersion>
-        <Net4xWrapperGeneratorVersion>1.0.0</Net4xWrapperGeneratorVersion>
-        <LibEntityFrameworkVersion>1.2.0</LibEntityFrameworkVersion>
-        <EntityFrameworkVersion>6.4.4</EntityFrameworkVersion>
-        <Net4xEntityFrameworkVersion>6.4.4</Net4xEntityFrameworkVersion>
-        <Net4xEntityFrameworkLibVersion>1.2.0</Net4xEntityFrameworkLibVersion>
-        <EntityFrameworkLibVersion>1.2.0</EntityFrameworkLibVersion>
-        <CoreLibrarySerilog2100LoggerVersion>2.10.0</CoreLibrarySerilog2100LoggerVersion>
-        <CoreLibrarySerilog250LoggerVersion>2.5.0</CoreLibrarySerilog250LoggerVersion>
-        <CoreLibrarySerilog1514LoggerVersion>1.5.14</CoreLibrarySerilog1514LoggerVersion>
-        <CoreLibrarySerilog260LoggerVersion>2.6.0</CoreLibrarySerilog260LoggerVersion>
-        <TopMostLibraryVersion>1.0.0</TopMostLibraryVersion>
-        <ViewCodeDomVersion>1.0.0</ViewCodeDomVersion>
-        <CodeDomModifierVersion>1.0.0</CodeDomModifierVersion>
-        <CSharpParserVersion>1.0.0</CSharpParserVersion>
-        <GtkSharpVersion>1.80.0</GtkSharpVersion>
-        <SgmlLibraryVersion>1.0.0</SgmlLibraryVersion>
-        <HardcodetNotifyIconWpfVersion>1.1.0</HardcodetNotifyIconWpfVersion>
-        <DataHandlerLibraryVersion>1.0.0</DataHandlerLibraryVersion>
-        <MdiInActiveXVersion>2.2.0</MdiInActiveXVersion>
-        <HostProcessLibraryVersion>1.0.0</HostProcessLibraryVersion>
     </PropertyGroup>
 </Project>

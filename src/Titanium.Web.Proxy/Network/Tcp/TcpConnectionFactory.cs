@@ -551,7 +551,7 @@ namespace Titanium.Web.Proxy.Network.Tcp
                 finally
                 {
                     //cleanup every 3 seconds by default
-                    await TimeSpan.FromMilliseconds(1000 * 3).Delay();
+                    await TimeSpan.FromMilliseconds(1000 * 3).DelayAsync();
                 }
 
             }
