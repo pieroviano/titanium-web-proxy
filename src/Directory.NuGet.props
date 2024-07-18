@@ -176,11 +176,13 @@
         <ViewCodeDomVersion>1.0.0</ViewCodeDomVersion>
         <CodeDomModifierVersion>1.0.0</CodeDomModifierVersion>
         <CSharpParserVersion>1.0.0</CSharpParserVersion>
-        <GtkSharpVersion>1.80.0</GtkSharpVersion>
+        <GtkSharpVersion>3.24.24</GtkSharpVersion>
         <SgmlLibraryVersion>1.0.0</SgmlLibraryVersion>
         <HardcodetNotifyIconWpfVersion>1.1.0</HardcodetNotifyIconWpfVersion>
         <DataHandlerLibraryVersion>1.0.0</DataHandlerLibraryVersion>
         <MdiInActiveXVersion>2.2.0</MdiInActiveXVersion>
         <HostProcessLibraryVersion>1.0.0</HostProcessLibraryVersion>
+        <DocxToHTMLVersion>1.0.0</DocxToHTMLVersion>
+        <Net4xWshRuntimeVersion>1.0.0</Net4xWshRuntimeVersion>
     </PropertyGroup>
 </Project>

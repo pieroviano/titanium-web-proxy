@@ -6264,6 +6264,16 @@
             "Version": "$(NuGetUtilityVersion)"
           }
         ]
+      },
+      {
+        "Name": "Net4x.InputBoxLibrary.GtkWinForms",
+        "Project": "InputBox.GtkWinForms\\InputBoxLibrary.GtkWinForms.csproj",
+        "PackageReferences": null
+      },
+      {
+        "Name": "Net4x.GtkWindowsFormsLibrary",
+        "Project": "GtkWindowsFormsLibrary\\GtkWindowsFormsLibrary.csproj",
+        "PackageReferences": null
       }
     ]
   },
@@ -12631,6 +12641,21 @@
       {
         "Name": "UpdateManagerLibrary\\UpdateManagerLibrary.csproj",
         "Project": "Net4x.UpdateManagerLibrary",
+        "PackageReferences": null
+      },
+      {
+        "Name": "UpdateLibrary\\Update.Library.csproj",
+        "Project": "Net4x.Update.Library",
+        "PackageReferences": null
+      },
+      {
+        "Name": "UpdateCommons\\Update.Commons.csproj",
+        "Project": "Net4x.Update.Commons",
+        "PackageReferences": null
+      },
+      {
+        "Name": "UpdateManagerLibrary\\Update.Manager.csproj",
+        "Project": "Net4x.Update.Manager",
         "PackageReferences": null
       }
     ]
@@ -24226,6 +24251,80 @@
       {
         "Name": "Net4x.$(MSBuildProjectName)",
         "Project": "DataHandlerLibrary\\DataHandlerLibrary.csproj",
+        "PackageReferences": null
+      }
+    ]
+  },
+  {
+    "Solution": {
+      "Path": "D:\\CommonLibrary\\Docx-Html-Docx\\DocxToHTML.sln",
+      "Version": "DocxToHTMLVersion"
+    },
+    "NuGetPackages": [
+      {
+        "Name": "DocxToHTML.Converter",
+        "Project": "DocxToHTML.Converter\\DocxToHTML.Converter.csproj",
+        "PackageReferences": null
+      },
+      {
+        "Name": "HTMLtoDOCX.Converter",
+        "Project": "HTMLtoDOCX.Converter\\HTMLtoDOCX.Converter.csproj",
+        "PackageReferences": null
+      },
+      {
+        "Name": "DocxToHTML.Converter\\DocxToHTML.Converter.csproj",
+        "Project": "Net4x.DocxToHTML.Converter",
+        "PackageReferences": null
+      },
+      {
+        "Name": "HTMLtoDOCX.Converter\\HTMLtoDOCX.Converter.csproj",
+        "Project": "Net4x.HTMLtoDOCX.Converter",
+        "PackageReferences": null
+      }
+    ]
+  },
+  {
+    "Solution": {
+      "Path": "D:\\CommonLibrary\\Net4x.WshRuntime\\Net4x.WshRuntime.sln",
+      "Version": "Net4xWshRuntimeVersion"
+    },
+    "NuGetPackages": [
+      {
+        "Name": "Net4x.WshRuntime",
+        "Project": "Net4x.WshRuntime\\Net4x.WshRuntime.csproj",
+        "PackageReferences": null
+      },
+      {
+        "Name": "WshRuntime.Tests\\WshRuntime.Tests.csproj",
+        "Project": "WshRuntime.Tests",
+        "PackageReferences": null
+      }
+    ]
+  },
+  {
+    "Solution": {
+      "Path": "D:\\CommonLibrary\\Net4x.MsHtml\\Net4x.MSHTML.sln",
+      "Version": "Net4xMSHTMLVersion"
+    },
+    "NuGetPackages": [
+      {
+        "Name": "Net4x.Net35.MSHTML",
+        "Project": "Net4x.MSHTML.net35\\Net4x.Net35.MSHTML.csproj",
+        "PackageReferences": null
+      },
+      {
+        "Name": "Net4x.Net40.MSHTML",
+        "Project": "Net4x.MSHTML.net40\\Net4x.Net40.MSHTML.csproj",
+        "PackageReferences": null
+      },
+      {
+        "Name": "Net4x.Net45.MSHTML",
+        "Project": "Net4x.MSHTML.net45\\Net4x.Net45.MSHTML.csproj",
+        "PackageReferences": null
+      },
+      {
+        "Name": "Net4x.Netcoreapp.MSHTML",
+        "Project": "Net4x.MSHTML.netcoreapp\\Net4x.Netcoreapp.MSHTML.csproj",
         "PackageReferences": null
       }
     ]
