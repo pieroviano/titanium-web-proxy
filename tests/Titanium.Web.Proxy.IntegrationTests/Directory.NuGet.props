@@ -4,7 +4,7 @@
         <NuGetPackageRoot Condition="'$(NuGetPackageRoot)'=='' and '$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Windows)))' != 'true'">~/.nuget/packages/</NuGetPackageRoot>
         <VersionBuildSuffix Condition="'$(Configuration)'!='Release'">*-*</VersionBuildSuffix>
         <VersionBuildSuffix Condition="'$(Configuration)'=='Release'">*</VersionBuildSuffix>
-        <NuGetUtilityVersion Condition="'$(NuGetUtilityVersion)' == ''">2.0.12</NuGetUtilityVersion>
+        <NuGetUtilityVersion Condition="'$(NuGetUtilityVersion)' == ''">2.1.0</NuGetUtilityVersion>
         <DirectoryNuGet>true</DirectoryNuGet>
         <ImmatricolazioniWsLibrariesVersion>1.1.0</ImmatricolazioniWsLibrariesVersion>
         <FatturaElettronicaVersion>3.2.1</FatturaElettronicaVersion>
@@ -76,7 +76,6 @@
         <Net30LinqBridgeVersion>1.5.0</Net30LinqBridgeVersion>
         <Net35ThreadingTasksVersion>1.4.0</Net35ThreadingTasksVersion>
         <Net35ActionsVersion>1.3.0</Net35ActionsVersion>
-        <Net35ThredingTasksVersion>1.4.0</Net35ThredingTasksVersion>
         <MSBuildCommunityTasksVersion>1.6.0</MSBuildCommunityTasksVersion>
         <DotNetZipVersion>1.16.0</DotNetZipVersion>
         <ObfuscarVersion>2.2.37</ObfuscarVersion>
