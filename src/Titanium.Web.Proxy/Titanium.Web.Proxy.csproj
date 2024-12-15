@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project Sdk="Microsoft.NET.Sdk">
-    <Import Condition="Exists('$(UserProfile)\.nuget\packages\nugetutility\$(NuGetUtilityVersion)\build\NuGet.Utility.targets')" Project="$(UserProfile)\.nuget\packages\nugetutility\$(NuGetUtilityVersion)\build\NuGet.Utility.targets" />
-    <Import Condition="Exists('$(UserProfile)\.nuget\packages\nugetutility\$(NuGetUtilityVersion)\build\NuGet.Utility.props')" Project="$(UserProfile)\.nuget\packages\nugetutility\$(NuGetUtilityVersion)\build\NuGet.Utility.props" />
+    <Import Condition="Exists('$(UserProfile)\.nuget\packages\net4x.nugetutility\$(NuGetUtilityVersion)\build\NuGet.Utility.targets')" Project="$(UserProfile)\.nuget\packages\net4x.nugetutility\$(NuGetUtilityVersion)\build\NuGet.Utility.targets" />
+    <Import Condition="Exists('$(UserProfile)\.nuget\packages\net4x.nugetutility\$(NuGetUtilityVersion)\build\NuGet.Utility.props')" Project="$(UserProfile)\.nuget\packages\net4x.nugetutility\$(NuGetUtilityVersion)\build\NuGet.Utility.props" />
     <PropertyGroup>
         <TargetFrameworks>net45;net451;net461;netstandard2.0;netstandard2.1</TargetFrameworks>
         <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
@@ -24,7 +24,7 @@
     <ItemGroup>
         <PackageReference Include="BrotliSharpLib" Version="0.3.3" />
         <PackageReference Include="Microsoft.Win32.Registry" Condition="'$(TargetFramework)' != 'net45' and '$(TargetFramework)' != 'net451' and '$(TargetFramework)' != 'net40'" Version="5.0.0" />
-        <PackageReference Include="NuGetUtility" PrivateAssets="All" Version="$(NuGetUtilityVersion)" />
+        <PackageReference Include="Net4x.NuGetUtility" PrivateAssets="All" Version="$(NuGetUtilityVersion)" />
         <PackageReference Include="Portable.BouncyCastle" Version="1.8.8" />
         <PackageReference Include="System.Buffers" Condition="'$(TargetFramework)' != 'netstandard2.1' and '$(TargetFramework)' != 'net40'" Version="4.5.1" />
         <PackageReference Include="System.Memory" Condition="'$(TargetFramework)' != 'netstandard2.1' and '$(TargetFramework)' != 'net40'" Version="4.5.4" />
