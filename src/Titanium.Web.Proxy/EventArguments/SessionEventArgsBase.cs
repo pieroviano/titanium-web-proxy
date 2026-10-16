@@ -299,6 +299,16 @@ public abstract class SessionEventArgsBase : ProxyEventArgsBase, IDisposable
         disposed = true;
     }
 
+    ~SessionEventArgsBase()
+    {
+#if DEBUG
+            // Finalizer should not be called
+            System.Diagnostics.Debugger.Break();
+#endif
+
+        Dispose(false);
+    }
+
     /// <summary>
     ///     Fired when data is sent within this session to server/client.
     /// </summary>

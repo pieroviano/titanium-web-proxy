@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project>
+    <!--
+      Directory.Build.Props gives every project in src/ a VersionSuffix (yyDDD). On its own that
+      makes the SDK compose a PRERELEASE version (7.0.24-26289), so a stable package such as
+      Net4x.Titanium.Web.Proxy (which sets Version explicitly) cannot depend on its sibling
+      projects without NU5104.
+
+      Compose the fork's stable four-part version here instead - a .targets file is imported after
+      the project body, so $(VersionPrefix) is the one the project itself declared.
+    -->
+    <PropertyGroup Condition="'$(VersionSuffix)'!='' and '$(VersionPrefix)'!=''">
+        <Version>$(VersionPrefix).$(VersionSuffix)</Version>
+        <PackageVersion>$(Version)</PackageVersion>
+    </PropertyGroup>
+</Project>
