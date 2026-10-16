@@ -1,103 +1,86 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project Sdk="Microsoft.NET.Sdk">
-
-  <PropertyGroup>
-    <TargetFrameworks>net45;net451;net461;netstandard2.0;netstandard2.1;net10.0</TargetFrameworks>
-    <RootNamespace>Titanium.Web.Proxy</RootNamespace>
-    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
-    <SignAssembly>True</SignAssembly>
-    <AssemblyOriginatorKeyFile>StrongNameKey.snk</AssemblyOriginatorKeyFile>
-    <DelaySign>False</DelaySign>
-    <AllowUnsafeBlocks>True</AllowUnsafeBlocks>
-    <Nullable>enable</Nullable>
-    <LangVersion>latest</LangVersion>
-    <!-- Keep in sync with the AssemblyVersion/AssemblyFileVersion attributes in
+    <PropertyGroup>
+        <TargetFrameworks>net45;net451;net461;netstandard2.0;netstandard2.1;net10.0</TargetFrameworks>
+        <RootNamespace>Titanium.Web.Proxy</RootNamespace>
+        <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+        <SignAssembly>True</SignAssembly>
+        <AssemblyOriginatorKeyFile>StrongNameKey.snk</AssemblyOriginatorKeyFile>
+        <DelaySign>False</DelaySign>
+        <AllowUnsafeBlocks>True</AllowUnsafeBlocks>
+        <Nullable>enable</Nullable>
+        <LangVersion>latest</LangVersion>
+        <!-- Keep in sync with the AssemblyVersion/AssemblyFileVersion attributes in
          Properties/AssemblyInfo.cs on every bump - GenerateAssemblyInfo is false above, so the SDK
          does not derive those attributes from this property automatically. -->
-    <VersionPrefix>7.0.24</VersionPrefix>
-    <!-- The library itself is the canonical implementation of the TWP001 experimental HTTP/3 APIs.
+        <VersionPrefix>7.0.24</VersionPrefix>
+        <!-- The library itself is the canonical implementation of the TWP001 experimental HTTP/3 APIs.
          Suppress the diagnostic internally; consumers will still see it. -->
-    <!--
+        <!--
       CA1068: several internal async APIs keep CancellationToken before trailing optional/context args.
       CA1069: HTTP/2 frame flags and SSPI buffers intentionally reuse native constant values.
       SYSLIB1054: WinHTTP/SSPI DllImport signatures need classic marshalling (structs/ref) that
       LibraryImport does not support without a larger interop rewrite.
     -->
-    <NoWarn>$(NoWarn);TWP001;CA1068;CA1069;SYSLIB1054</NoWarn>
-  </PropertyGroup>
-
-  <!-- Net4x fork packaging. -->
-  <PropertyGroup>
-    <PackageReadmeFile>README.md</PackageReadmeFile>
-    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
-    <IncludeSymbols Condition="'$(Configuration)'=='Debug'">true</IncludeSymbols>
-    <SymbolPackageFormat Condition="'$(Configuration)'=='Debug'">snupkg</SymbolPackageFormat>
-    <IncludeSymbols Condition="'$(Configuration)'!='Debug'">false</IncludeSymbols>
-    <Version>$(VersionPrefix).$(VersionSuffix)</Version>
-    <Authors>$(AssemblyName)</Authors>
-    <PackageId>Net4x.$(AssemblyName)</PackageId>
-    <PackageOutputPath>$(SolutionDir)Packages\</PackageOutputPath>
-  </PropertyGroup>
-
-  <ItemGroup>
-    <None Include="README.md" Link="README.md" Pack="true" PackagePath="\README.md" />
-  </ItemGroup>
-
-  <!-- Modern surface: the Abstractions contracts, logging and the public API baseline are net10.0 only. -->
-  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
-    <ProjectReference Include="..\Titanium.Web.Proxy.Abstractions\Titanium.Web.Proxy.Abstractions.csproj" />
-    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
-    <!-- Public API compatibility baseline: fails the build (RS0016/RS0017/RS0036/etc, all elevated to
+        <NoWarn>$(NoWarn);TWP001;CA1068;CA1069;SYSLIB1054</NoWarn>
+        <PackageReadmeFile>README.md</PackageReadmeFile>
+        <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+        <IncludeSymbols Condition="'$(Configuration)'=='Debug'">true</IncludeSymbols>
+        <SymbolPackageFormat Condition="'$(Configuration)'=='Debug'">snupkg</SymbolPackageFormat>
+        <IncludeSymbols Condition="'$(Configuration)'!='Debug'">false</IncludeSymbols>
+        <Version>$(VersionPrefix).$(VersionSuffix)</Version>
+        <Authors>$(AssemblyName)</Authors>
+        <PackageId>Net4x.$(AssemblyName)</PackageId>
+        <PackageOutputPath>$(SolutionDir)Packages\</PackageOutputPath>
+    </PropertyGroup>
+    <!-- Net4x fork packaging. -->
+    <ItemGroup>
+        <None Include="README.md" Link="README.md" Pack="true" PackagePath="\README.md" />
+    </ItemGroup>
+    <!-- Modern surface: the Abstractions contracts, logging and the public API baseline are net10.0 only. -->
+    <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
+        <ProjectReference Include="..\Titanium.Web.Proxy.Abstractions\Titanium.Web.Proxy.Abstractions.csproj" />
+        <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
+        <!-- Public API compatibility baseline: fails the build (RS0016/RS0017/RS0036/etc, all elevated to
          errors under warnings-as-errors) if the public surface changes without a matching entry in
          PublicAPI.Shipped.txt/PublicAPI.Unshipped.txt below, catching accidental breaking changes and
          accidental new public surface alike before they reach a release. -->
-    <PackageReference Include="Microsoft.CodeAnalysis.PublicApiAnalyzers" Version="5.6.0">
-      <PrivateAssets>all</PrivateAssets>
-      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
-    </PackageReference>
-    <AdditionalFiles Include="PublicAPI.Shipped.txt" />
-    <AdditionalFiles Include="PublicAPI.Unshipped.txt" />
-  </ItemGroup>
-
-  <!-- BouncyCastle: the 2.x package drops net45/net451, which still need the portable build. -->
-  <ItemGroup Condition="'$(TargetFramework)' == 'net45' or '$(TargetFramework)' == 'net451'">
-    <PackageReference Include="Portable.BouncyCastle" Version="1.8.8" />
-  </ItemGroup>
-  <ItemGroup Condition="'$(TargetFramework)' != 'net45' and '$(TargetFramework)' != 'net451'">
-    <PackageReference Include="BouncyCastle.Cryptography" Version="2.6.2" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <PackageReference Include="BrotliSharpLib" Version="0.3.3" />
-    <PackageReference Include="Net4x.NuGetUtility" PrivateAssets="All" Version="$(NuGetUtilityVersion)" />
-    <PackageReference Include="Microsoft.Win32.Registry" Condition="'$(TargetFramework)' != 'net45' and '$(TargetFramework)' != 'net451' and '$(TargetFramework)' != 'net40' and '$(TargetFramework)' != 'net10.0'" Version="5.0.0" />
-    <PackageReference Include="System.Buffers" Condition="'$(TargetFramework)' != 'netstandard2.1' and '$(TargetFramework)' != 'net40' and '$(TargetFramework)' != 'net10.0'" Version="4.5.1" />
-    <PackageReference Include="System.Memory" Condition="'$(TargetFramework)' != 'netstandard2.1' and '$(TargetFramework)' != 'net40' and '$(TargetFramework)' != 'net10.0'" Version="4.5.4" />
-    <PackageReference Include="System.Security.Principal.Windows" Condition="'$(TargetFramework)' != 'net45' and '$(TargetFramework)' != 'net451' and '$(TargetFramework)' != 'net40' and '$(TargetFramework)' != 'net10.0'" Version="5.0.0" />
-    <PackageReference Include="System.Threading.Tasks.Extensions" Condition="'$(TargetFramework)' != 'netstandard2.1' and '$(TargetFramework)' != 'net40' and '$(TargetFramework)' != 'net10.0'" Version="4.5.4" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <Compile Update="Network\WinAuth\Security\Common.cs">
-      <ExcludeFromSourceAnalysis>True</ExcludeFromSourceAnalysis>
-      <ExcludeFromStyleCop>True</ExcludeFromStyleCop>
-    </Compile>
-    <Compile Update="Network\WinAuth\Security\LittleEndian.cs">
-      <ExcludeFromSourceAnalysis>True</ExcludeFromSourceAnalysis>
-      <ExcludeFromStyleCop>True</ExcludeFromStyleCop>
-    </Compile>
-    <Compile Update="Network\WinAuth\Security\Message.cs">
-      <ExcludeFromSourceAnalysis>True</ExcludeFromSourceAnalysis>
-      <ExcludeFromStyleCop>True</ExcludeFromStyleCop>
-    </Compile>
-    <Compile Update="Network\WinAuth\Security\State.cs">
-      <ExcludeFromSourceAnalysis>True</ExcludeFromSourceAnalysis>
-      <ExcludeFromStyleCop>True</ExcludeFromStyleCop>
-    </Compile>
-    <Compile Update="Properties\AssemblyInfo.cs">
-      <ExcludeFromSourceAnalysis>True</ExcludeFromSourceAnalysis>
-      <ExcludeFromStyleCop>True</ExcludeFromStyleCop>
-    </Compile>
-  </ItemGroup>
-
+        <PackageReference Include="Microsoft.CodeAnalysis.PublicApiAnalyzers" Version="5.6.0" PrivateAssets="all" IncludeAssets="runtime; build; native; contentfiles; analyzers; buildtransitive" />
+        <AdditionalFiles Include="PublicAPI.Shipped.txt" />
+        <AdditionalFiles Include="PublicAPI.Unshipped.txt" />
+    </ItemGroup>
+    <!-- BouncyCastle: the 2.x package drops net45/net451, which still need the portable build. -->
+    <ItemGroup>
+        <PackageReference Include="Portable.BouncyCastle" Version="1.8.8" Condition="'$(TargetFramework)' == 'net45' or '$(TargetFramework)' == 'net451'" />
+        <PackageReference Include="BouncyCastle.Cryptography" Version="2.6.2" Condition="'$(TargetFramework)' != 'net45' and '$(TargetFramework)' != 'net451'" />
+        <PackageReference Include="BrotliSharpLib" Version="0.3.3" />
+        <PackageReference Include="Net4x.NuGetUtility" PrivateAssets="All" Version="$(NuGetUtilityVersion)" />
+        <PackageReference Include="Microsoft.Win32.Registry" Condition="'$(TargetFramework)' != 'net45' and '$(TargetFramework)' != 'net451' and '$(TargetFramework)' != 'net40' and '$(TargetFramework)' != 'net10.0'" Version="5.0.0" />
+        <PackageReference Include="System.Buffers" Condition="'$(TargetFramework)' != 'netstandard2.1' and '$(TargetFramework)' != 'net40' and '$(TargetFramework)' != 'net10.0'" Version="4.5.1" />
+        <PackageReference Include="System.Memory" Condition="'$(TargetFramework)' != 'netstandard2.1' and '$(TargetFramework)' != 'net40' and '$(TargetFramework)' != 'net10.0'" Version="4.5.4" />
+        <PackageReference Include="System.Security.Principal.Windows" Condition="'$(TargetFramework)' != 'net45' and '$(TargetFramework)' != 'net451' and '$(TargetFramework)' != 'net40' and '$(TargetFramework)' != 'net10.0'" Version="5.0.0" />
+        <PackageReference Include="System.Threading.Tasks.Extensions" Condition="'$(TargetFramework)' != 'netstandard2.1' and '$(TargetFramework)' != 'net40' and '$(TargetFramework)' != 'net10.0'" Version="4.5.4" />
+    </ItemGroup>
+    <ItemGroup>
+        <Compile Update="Network\WinAuth\Security\Common.cs">
+            <ExcludeFromSourceAnalysis>True</ExcludeFromSourceAnalysis>
+            <ExcludeFromStyleCop>True</ExcludeFromStyleCop>
+        </Compile>
+        <Compile Update="Network\WinAuth\Security\LittleEndian.cs">
+            <ExcludeFromSourceAnalysis>True</ExcludeFromSourceAnalysis>
+            <ExcludeFromStyleCop>True</ExcludeFromStyleCop>
+        </Compile>
+        <Compile Update="Network\WinAuth\Security\Message.cs">
+            <ExcludeFromSourceAnalysis>True</ExcludeFromSourceAnalysis>
+            <ExcludeFromStyleCop>True</ExcludeFromStyleCop>
+        </Compile>
+        <Compile Update="Network\WinAuth\Security\State.cs">
+            <ExcludeFromSourceAnalysis>True</ExcludeFromSourceAnalysis>
+            <ExcludeFromStyleCop>True</ExcludeFromStyleCop>
+        </Compile>
+        <Compile Update="Properties\AssemblyInfo.cs">
+            <ExcludeFromSourceAnalysis>True</ExcludeFromSourceAnalysis>
+            <ExcludeFromStyleCop>True</ExcludeFromStyleCop>
+        </Compile>
+    </ItemGroup>
 </Project>
