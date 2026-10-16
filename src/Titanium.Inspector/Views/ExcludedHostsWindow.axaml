@@ -1,0 +1,58 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:loc="using:Titanium.Inspector.Localization"
+        x:Class="Titanium.Inspector.Views.ExcludedHostsWindow"
+        AutomationProperties.AutomationId="ExcludedHostsWindow"
+        Title="{loc:Loc window.excludedHosts}"
+        Width="640" Height="600"
+        MinWidth="480" MinHeight="320"
+        WindowStartupLocation="CenterOwner">
+  <DockPanel Margin="16">
+    <DockPanel DockPanel.Dock="Bottom" Margin="0,16,0,0">
+      <Button x:Name="ResetDefaultsButton" DockPanel.Dock="Left" Content="{loc:Loc excluded.reset}" MinWidth="120"
+              AutomationProperties.AutomationId="ExcludedHostsResetDefaults" />
+      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8">
+        <Button x:Name="SaveButton" Content="{loc:Loc common.save}" MinWidth="88" AutomationProperties.AutomationId="ExcludedHostsSave" />
+        <Button x:Name="CancelButton" Content="{loc:Loc common.cancel}" MinWidth="88" IsCancel="True" AutomationProperties.AutomationId="ExcludedHostsCancel" />
+      </StackPanel>
+    </DockPanel>
+    <ScrollViewer Classes="dialogBody">
+      <StackPanel Spacing="12">
+        <TextBlock FontWeight="SemiBold" Text="{loc:Loc excluded.bypass}" />
+        <TextBlock Opacity="0.75" TextWrapping="Wrap"
+                   Text="{loc:Loc excluded.bypassHelp}" />
+        <TextBox x:Name="BypassHostsBox" FlowDirection="LeftToRight" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="120"
+                 Watermark="*.microsoftonline.com&#x0a;login.live.com"
+                 FontFamily="Consolas,Courier New,monospace"
+                 AutomationProperties.AutomationId="ExcludedBypassHosts" />
+
+        <TextBlock FontWeight="SemiBold" Text="{loc:Loc excluded.notDecrypted}" />
+        <TextBlock Opacity="0.75" TextWrapping="Wrap"
+                   Text="{loc:Loc excluded.notDecryptedHelp}" />
+        <TextBox x:Name="SkipHostsBox" FlowDirection="LeftToRight" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="72"
+                 Watermark="dropbox.com&#x0a;webex.com"
+                 FontFamily="Consolas,Courier New,monospace"
+                 AutomationProperties.AutomationId="ExcludedSkipHosts" />
+
+        <TextBlock FontWeight="SemiBold" Text="{loc:Loc excluded.learnHeading}" />
+        <CheckBox x:Name="LearningEnabledCheck" Content="{loc:Loc excluded.learn}"
+                  AutomationProperties.AutomationId="ExcludedLearningEnabled" />
+        <TextBlock Opacity="0.75" TextWrapping="Wrap"
+                   Text="{loc:Loc excluded.learnHelp}" />
+        <TextBlock x:Name="LearningPausedBanner" IsVisible="False" Opacity="0.85" TextWrapping="Wrap"
+                   Text="{loc:Loc excluded.learnPaused}" />
+        <ListBox x:Name="LearnedList" MinHeight="96" MaxHeight="180"
+                 AutomationProperties.AutomationId="ExcludedLearnedList" />
+        <TextBlock x:Name="LearnedEmptyText" Opacity="0.6" Text="{loc:Loc excluded.noneLearned}" />
+        <StackPanel Orientation="Horizontal" Spacing="8">
+          <Button x:Name="PromoteLearnedButton" Content="{loc:Loc excluded.promote}" MinWidth="160"
+                  AutomationProperties.AutomationId="ExcludedLearnedPromote" />
+          <Button x:Name="ForgetLearnedButton" Content="{loc:Loc common.forget}" MinWidth="88"
+                  AutomationProperties.AutomationId="ExcludedLearnedForget" />
+          <Button x:Name="ClearLearnedButton" Content="{loc:Loc excluded.clearLearned}" MinWidth="120"
+                  AutomationProperties.AutomationId="ExcludedLearnedClear" />
+        </StackPanel>
+      </StackPanel>
+    </ScrollViewer>
+  </DockPanel>
+</Window>

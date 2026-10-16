@@ -1,0 +1,608 @@
+using Avalonia.Automation;
+using Avalonia.Controls;
+using Avalonia.LogicalTree;
+using Avalonia.VisualTree;
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+using Titanium.E2E.Tests.Harness;
+using Titanium.Inspector.Services;
+using Titanium.Inspector.ViewModels;
+using Titanium.Inspector.Views;
+
+namespace Titanium.E2E.Tests.UiHeadless;
+
+/// <summary>Suites A–I: every MainWindow AutomationId is reachable under Headless.</summary>
+[TestClass]
+public class AutomationIdCoverageHeadlessTests
+{
+    private static readonly string[] MainWindowIds =
+    [
+        "MainMenu",
+        "MenuFile",
+        "MenuExportHar",
+        "MenuExportSelectedHar",
+        "MenuImportHar",
+        "MenuExportArchive",
+        "MenuExportSelectedArchive",
+        "MenuImportArchive",
+        "MenuExit",
+        "MenuCapture",
+        "MenuStartCapture",
+        "MenuStopCapture",
+        "MenuToggleCapturing",
+        "MenuClearSessions",
+        "MenuRemoveSelected",
+        "MenuKeepOnlySelected",
+        "MenuRemoveMatching",
+        "CtxKeepOnlySelected",
+        "CtxRemoveMatching",
+        "AutoStartCaptureCheck",
+        "AutoSystemProxyCheck",
+        "MenuDisableCaching",
+        "MenuForceUncompressed",
+        "MenuProxyLocalhost",
+        "MenuLoopbackExempt",
+        "MenuRootCertificate",
+        "MenuInstallCa",
+        "MenuRemoveCa",
+        "MenuRotateCa",
+        "MenuRemoveOldRootCas",
+        "MenuExportCa",
+        "MenuTrustFirefoxCa",
+        "MenuDeviceCa",
+        "MenuTools",
+        "MenuToolsComposer",
+        "MenuToolsBreakpoints",
+        "MenuToolsAutoResponder",
+        "MenuToolsScripts",
+        "MenuOptions",
+        "MenuTheme",
+        "MenuThemeLight",
+        "MenuThemeDark",
+        "MenuThemeAutomatic",
+        "MenuColumns",
+        "MenuColumn_Id",
+        "MenuColumn_Method",
+        "MenuColumn_Status",
+        "MenuColumn_Host",
+        "MenuColumn_URL",
+        "MenuColumn_Protocol",
+        "MenuColumn_Duration",
+        "MenuColumn_TTFB",
+        "MenuColumn_Size",
+        "MenuColumn_Process",
+        "MenuColumn_Started",
+        "MenuColumn_Scheme",
+        "MenuColumn_ContentType",
+        "MenuColumn_Comment",
+        "MenuColumnsReset",
+        "MenuSessionRetention",
+        "MenuHttpsDecryptHosts",
+        "MenuIgnoreServerCertErrors",
+        "MenuAddViaHeader",
+        "MenuUpdateChannel",
+        "MenuUpdateChannelStable",
+        "MenuUpdateChannelBeta",
+        "MenuCheckUpdatesOnStartup",
+        "MenuNetwork",
+        "MenuLogging",
+        "MenuAlwaysOnTop",
+        "MenuResetSettings",
+        "MenuHelp",
+        "MenuCheckForUpdates",
+        "MenuDocumentation",
+        "MenuReportIssue",
+        "MenuKeyboardShortcuts",
+        "MenuAbout",
+        "SearchBox",
+        "ToolbarFilterGroup",
+        "OpenFiltersButton",
+        "SearchHideChips",
+        "MethodFilterButton",
+        "HideImagesFilterCheck",
+        "ErrorsOnlyFilterCheck",
+        "ClearFiltersButton",
+        "StatusFilterButton",
+        "ToolbarBindAddress",
+        "ToolbarBindPort",
+        "ToggleInterceptButton",
+        "ListeningIndicator",
+        "EndpointStatusText",
+        "CapturingCheck",
+        "DecryptHttpsCheck",
+        "SystemProxyCheck",
+        "SessionsGrid",
+        "SessionsContextMenu",
+        "CtxReplay",
+        "CtxLoadComposer",
+        "CtxSaveAs",
+        "CtxSaveRequestBody",
+        "CtxSaveResponseBody",
+        "CtxSaveRawHttp",
+        "CtxExport",
+        "CtxExportSelectedHar",
+        "CtxExportSelectedArchive",
+        "CtxCopyAs",
+        "CtxCopyUrl",
+        "CtxCopyAsCurl",
+        "CtxCopyAsFetch",
+        "CtxDiffSessions",
+        "CtxFilterMenu",
+        "CtxFilterByHost",
+        "CtxFilterByStatus",
+        "CtxMark",
+        "CtxComment",
+        "CtxFindRelated",
+        "CtxHideHost",
+        "CtxExcludeHost",
+        "CtxFilterByProcess",
+        "CtxHideProcess",
+        "CtxRemoveSelected",
+        "CloseDetailsButton",
+        "PaneNavList",
+        "PaneContentTitle",
+        "TabOuterInspect",
+        "PaneNavComposer",
+        "PaneNavBreakpoints",
+        "PaneNavAutoResponder",
+        "PaneNavScripts",
+        "PaneNavMapRemote",
+        "InspectEmptyHint",
+        "InspectTabs",
+        "TabRequest",
+        "ToggleReqHeadersPane",
+        "ReqHeadersSplitter",
+        "ReqHeadersText",
+        "SelectedOpaqueHint",
+        "CopyReqHeaders",
+        "ReqBodyText",
+        "ReqBodyCaptureHint",
+        "BodyPretty",
+        "BodyHex",
+        "SaveRequestBody",
+        "ReqBodyPreviewImage",
+        "TabResponse",
+        "ToggleRespHeadersPane",
+        "RespHeadersSplitter",
+        "RespHeadersText",
+        "RespOpaqueHint",
+        "CopyRespHeaders",
+        "RespBodyText",
+        "RespBodyCaptureHint",
+        "RespBodyPretty",
+        "RespBodyHex",
+        "SaveResponseBody",
+        "BodyPreviewImage",
+        "TabDiff",
+        "DiffText",
+        "TabFrames",
+        "FramesText",
+        "TabSse",
+        "SseText",
+        "TabProtobuf",
+        "ProtobufText",
+        "TabStatistics",
+        "StatisticsSummary",
+        "StatisticsCopy",
+        "ComboNetworkThrottle",
+        "TabComposer",
+        "ComposerMethod",
+        "ComposerUrl",
+        "ComposerHeaders",
+        "ComposerBody",
+        "ComposerBodyFromFileHint",
+        "ComposerLoad",
+        "ComposerLoadBodyFile",
+        "ComposerSend",
+        "TabBreakpoints",
+        "BreakpointEnabled",
+        "BreakpointOnResponse",
+        "BreakpointUrlFilter",
+        "BreakpointEditBody",
+        "BreakpointApply",
+        "BreakpointContinue",
+        "BreakpointAbort",
+        "TabAutoResponder",
+        "AutoResponderEnabled",
+        "AutoResponderRules",
+        "AutoResponderMatch",
+        "AutoResponderStatus",
+        "AutoResponderContentType",
+        "AutoResponderBody",
+        "AutoResponderLocalFile",
+        "AutoResponderBrowseLocal",
+        "AutoResponderAdd",
+        "MapRemoteEnabled",
+        "MapRemoteMatch",
+        "MapRemoteTarget",
+        "MapRemoteAdd",
+        "MenuToolsMapRemote",
+        "MenuRunLog",
+        "MenuTimeline",
+        "TabMapRemote",
+        "AutoResponderUpdate",
+        "AutoResponderDelete",
+        "TabScripts",
+        "ScriptSyntaxHelp",
+        "ScriptOnRequest",
+        "ScriptOnResponse",
+        "StatusText",
+        "StatusBusyProgress",
+        "StatusBarPanel",
+        "SessionCountText",
+        "SessionCountLink",
+        "CustomSettingsLink",
+        "AutoResponderGraphQlOperation",
+        "AutoResponderGraphQlFromSelected",
+        "BreakpointGraphQlOperation",
+        "BreakpointGraphQlFromSelected",
+        "ExclusionSummaryLink",
+        "MapRemoteDelete",
+        "MapRemoteGraphQlOperation",
+        "MapRemoteGraphQlFromSelected",
+        "MapRemoteRules",
+        "MapRemoteUpdate",
+        "TabInspectHost",
+        "ToolbarCaptureToggles",
+        "ToolbarEndpoint",
+        "ToolbarPanel",
+        "ToolbarSearchFilters"
+    ];
+
+    [TestMethod]
+    [TestCategory("E2E-UI-Headless")]
+    public async Task EveryMainWindowAutomationId_IsReachable()
+    {
+        await using var fx = new InspectorHeadlessFixture();
+        await fx.StartAsync();
+        await fx.DispatchAsync(() =>
+        {
+            var snap = new SessionSnapshot
+            {
+                Id = 1,
+                Method = "POST",
+                StatusCode = 200,
+                Host = "id.test",
+                Url = "https://id.test/api",
+                Protocol = "HTTP/1.1",
+                ProcessName = "chrome",
+                RequestBodyText = "req",
+                ResponseBodyText = "res",
+                RequestBodyCapture = BodyCaptureState.Complete,
+                ResponseBodyCapture = BodyCaptureState.Complete,
+                IsWebSocket = true,
+                IsServerSentEvents = true,
+                SseEvents =
+                [
+                    new SseEventSnapshot { Event = "ping", Data = "1" },
+                ],
+                IsGrpc = true,
+                ProtobufDecodedText = "[{\"field\":1}]",
+            };
+            fx.ViewModel.SeedSession(snap);
+            // Single-select so Save/Copy/Filter submenu children (IsVisible-bound) stay in the tree.
+            fx.ViewModel.SelectedSession = snap;
+            fx.ViewModel.SetSelectedSessions([snap]);
+            fx.ViewModel.SearchQuery = "-host:other.test";
+            fx.Robot.Click("MenuToolsComposer");
+
+            // ContextMenu items are not in the visual tree until opened.
+            Assert.IsTrue(fx.Robot.TryFind<Avalonia.Controls.DataGrid>("SessionsGrid", out var grid) && grid is not null);
+            Assert.IsNotNull(grid.ContextMenu);
+            grid.ContextMenu.Open(grid);
+
+            var missing = MainWindowIds
+                .Where(id => !fx.Robot.TryFind<Avalonia.Controls.Control>(id, out _))
+                .ToList();
+            Assert.AreEqual(0, missing.Count, "Missing AutomationIds: " + string.Join(", ", missing));
+        });
+    }
+
+    [TestMethod]
+    [TestCategory("E2E-UI-Headless")]
+    public async Task CaptureMenu_Toggles_RoundTrip()
+    {
+        await using var fx = new InspectorHeadlessFixture();
+        await fx.StartAsync();
+        await fx.DispatchAsync(() =>
+        {
+            // Avoid mutating BindPort/Address here — TextBox re-measure can race Headless teardown fonts.
+            fx.Robot.SetCheck("AutoStartCaptureCheck", false);
+            fx.Robot.SetCheck("AutoSystemProxyCheck", false);
+            Assert.IsFalse(fx.ViewModel.AutoStartCapture);
+            Assert.IsFalse(fx.ViewModel.AutoSystemProxyOnStart);
+
+            var loopbackWasOn = fx.ViewModel.ProxyLoopback;
+            fx.Robot.SetCheck("MenuProxyLocalhost", !loopbackWasOn);
+            Assert.AreEqual(!loopbackWasOn, fx.ViewModel.ProxyLoopback);
+            fx.Robot.SetCheck("MenuProxyLocalhost", loopbackWasOn);
+            Assert.AreEqual(loopbackWasOn, fx.ViewModel.ProxyLoopback);
+
+            fx.Robot.SetCheck("CapturingCheck", false);
+            Assert.IsFalse(fx.ViewModel.Capturing);
+            fx.Robot.SetCheck("MenuToggleCapturing", true);
+            Assert.IsTrue(fx.ViewModel.Capturing);
+
+            var debugWasOn = fx.ViewModel.DebugFileLogging;
+            fx.ViewModel.ToggleDebugLoggingCommand.Execute(null);
+            Assert.AreEqual(!debugWasOn, fx.ViewModel.DebugFileLogging);
+            fx.ViewModel.ToggleDebugLoggingCommand.Execute(null);
+            Assert.AreEqual(debugWasOn, fx.ViewModel.DebugFileLogging);
+
+            var ignoreWasOn = fx.ViewModel.IgnoreServerCertificateErrors;
+            fx.Robot.SetCheck("MenuIgnoreServerCertErrors", !ignoreWasOn);
+            Assert.AreEqual(!ignoreWasOn, fx.ViewModel.IgnoreServerCertificateErrors);
+            fx.Robot.SetCheck("MenuIgnoreServerCertErrors", ignoreWasOn);
+            Assert.AreEqual(ignoreWasOn, fx.ViewModel.IgnoreServerCertificateErrors);
+        });
+
+        await fx.DispatchAsync(async () =>
+        {
+            fx.ViewModel.StartCaptureCommand.Execute(null);
+            var deadline = DateTime.UtcNow.AddSeconds(15);
+            while (!fx.Interception.IsRunning && DateTime.UtcNow < deadline)
+            {
+                await Task.Delay(50);
+            }
+
+            Assert.IsTrue(fx.Interception.IsRunning, fx.ViewModel.StatusText);
+            fx.Robot.SetCheck("SystemProxyCheck", true);
+            Assert.IsTrue(fx.ViewModel.SystemProxy);
+            fx.Robot.SetCheck("SystemProxyCheck", false);
+            Assert.IsFalse(fx.ViewModel.SystemProxy);
+        });
+    }
+
+    [TestMethod]
+    [TestCategory("E2E-UI-Headless")]
+    public async Task Breakpoints_And_Scripts_Fields_RoundTrip()
+    {
+        await using var fx = new InspectorHeadlessFixture();
+        await fx.StartAsync();
+        await fx.DispatchAsync(() =>
+        {
+            fx.Robot.Click("MenuToolsBreakpoints");
+            fx.Robot.SetCheck("BreakpointEnabled", true);
+            fx.Robot.SetCheck("BreakpointOnResponse", true);
+            fx.Robot.SetText("BreakpointUrlFilter", "*/api/*");
+            fx.Robot.SetText("BreakpointEditBody", "patched");
+            Assert.AreEqual(1, fx.ViewModel.SelectedToolsTabIndex);
+
+            fx.Robot.Click("MenuToolsScripts");
+            Assert.IsTrue(fx.Robot.TryFind<Avalonia.Controls.Control>("ScriptSyntaxHelp", out _));
+            fx.Robot.SetText("ScriptOnRequest", "abort");
+            fx.Robot.SetText("ScriptOnResponse", "set-status 418");
+            Assert.AreEqual(3, fx.ViewModel.SelectedToolsTabIndex);
+            Assert.AreEqual("abort", fx.ViewModel.ScriptOnRequest);
+            Assert.AreEqual("set-status 418", fx.ViewModel.ScriptOnResponse);
+        });
+    }
+
+    [TestMethod]
+    [TestCategory("E2E-UI-Headless")]
+    public async Task Inspect_CloseDetails_AndFramesTab()
+    {
+        await using var fx = new InspectorHeadlessFixture();
+        await fx.StartAsync();
+        await fx.DispatchAsync(() =>
+        {
+            fx.ViewModel.Sessions.Add(new SessionSnapshot
+            {
+                Id = 3,
+                Method = "GET",
+                Url = "wss://ws.test/socket",
+                IsWebSocket = true,
+                Protocol = "HTTP/1.1",
+                Host = "ws.test",
+            });
+            fx.ViewModel.SelectedSession = fx.ViewModel.Sessions[0];
+            Assert.IsTrue(fx.ViewModel.ShowSessionDetails);
+            Assert.IsTrue(fx.ViewModel.ShowWsFramesTab);
+
+            fx.Robot.Click("TabFrames");
+            Assert.AreEqual((int)InspectTab.WsFrames, fx.ViewModel.SelectedInspectTabIndex);
+
+            fx.Robot.Click("CloseDetailsButton");
+            Assert.IsFalse(fx.ViewModel.ShowSessionDetails);
+        });
+    }
+
+    [TestMethod]
+    [TestCategory("E2E-UI-Headless")]
+    public async Task Inspect_SseProtobufTabs_AndNetworkThrottleCombo()
+    {
+        await using var fx = new InspectorHeadlessFixture();
+        await fx.StartAsync();
+        await fx.DispatchAsync(() =>
+        {
+            fx.ViewModel.Sessions.Add(new SessionSnapshot
+            {
+                Id = 11,
+                Method = "GET",
+                StatusCode = 200,
+                Host = "sse.test",
+                Url = "http://sse.test/stream",
+                Protocol = "HTTP/1.1",
+                ContentType = "text/event-stream",
+                IsServerSentEvents = true,
+                ResponseBodyText = "data: hi\n\n",
+                SseEvents = SseEventParser.Parse("data: hi\n\n"),
+                IsGrpc = true,
+                ProtobufDecodedText = ProtobufMessageDecoder.DecodeWireFormat(
+                    [0x0a, 0x02, (byte)'o', (byte)'k'],
+                    stripGrpcFrame: false),
+            });
+            fx.ViewModel.SelectedSession = fx.ViewModel.Sessions[0];
+            Assert.IsTrue(fx.ViewModel.ShowSseTab);
+            Assert.IsTrue(fx.ViewModel.ShowProtobufTab);
+
+            fx.Robot.Click("TabSse");
+            Assert.AreEqual((int)InspectTab.Sse, fx.ViewModel.SelectedInspectTabIndex);
+            StringAssert.Contains(fx.ViewModel.SelectedSseEvents, "hi");
+
+            fx.Robot.Click("TabProtobuf");
+            Assert.AreEqual((int)InspectTab.Protobuf, fx.ViewModel.SelectedInspectTabIndex);
+            StringAssert.Contains(fx.ViewModel.SelectedProtobufDecoded, "ok");
+
+            Assert.IsTrue(fx.Robot.TryFind<Avalonia.Controls.ComboBox>("ComboNetworkThrottle", out var combo) && combo is not null);
+            fx.ViewModel.NetworkThrottleProfile = "Slow 3G";
+            Assert.AreEqual("Slow 3G", fx.ViewModel.NetworkThrottleProfile);
+            Assert.IsNotNull(fx.Interception.ThrottleProfile);
+            Assert.IsTrue(fx.Interception.ThrottleProfile!.IsEnabled);
+            fx.ViewModel.NetworkThrottleProfile = "None";
+            Assert.IsNull(fx.Interception.ThrottleProfile);
+        });
+    }
+
+    [TestMethod]
+    [TestCategory("E2E-UI-Headless")]
+    public async Task FileImportExportArchive_UsesPathPicker()
+    {
+        await using var fx = new InspectorHeadlessFixture();
+        await fx.StartAsync();
+        var zip = Path.Combine(Path.GetTempPath(), "twp-arch-" + Guid.NewGuid().ToString("N") + ".zip");
+        fx.PathPicker.SavePath = zip;
+        await fx.DispatchAsync(() =>
+        {
+            fx.ViewModel.SeedSession(new SessionSnapshot
+            {
+                Id = 5,
+                Method = "GET",
+                StatusCode = 200,
+                Host = "a",
+                Url = "http://a/",
+                Protocol = "HTTP/1.1",
+            });
+            fx.Robot.Click("MenuExportArchive");
+        });
+
+        // File.Exists is true as soon as the zip is created, before the central directory
+        // is written. Wait for the status that is set only after the writer closes.
+        await fx.WaitUntilAsync(
+            () => fx.ViewModel.StatusText.Contains("Exported 1 sessions", StringComparison.Ordinal)
+                  || fx.ViewModel.StatusText.Contains("Export archive failed", StringComparison.Ordinal),
+            TimeSpan.FromSeconds(20));
+
+        await fx.DispatchAsync(() =>
+        {
+            Assert.IsTrue(fx.PathPicker.SaveCalls >= 1, "Export path picker was not invoked");
+            Assert.IsTrue(
+                fx.ViewModel.StatusText.Contains("Exported 1 sessions", StringComparison.Ordinal)
+                || File.Exists(zip),
+                "StatusText after export: " + fx.ViewModel.StatusText
+                + "; zipExists=" + File.Exists(zip));
+            Assert.IsTrue(File.Exists(zip), "Export zip was not written");
+        });
+
+        // Import from a copy so any lingering writer handle on the export path cannot block macOS.
+        var importZip = Path.Combine(Path.GetTempPath(), "twp-arch-in-" + Guid.NewGuid().ToString("N") + ".zip");
+        var copyDeadline = DateTime.UtcNow.AddSeconds(10);
+        Exception? lastCopy = null;
+        while (DateTime.UtcNow < copyDeadline)
+        {
+            try
+            {
+                File.Copy(zip, importZip, overwrite: true);
+                lastCopy = null;
+                break;
+            }
+            catch (IOException ex)
+            {
+                lastCopy = ex;
+                await Task.Delay(100);
+            }
+        }
+
+        if (lastCopy is not null)
+        {
+            throw new IOException($"Could not copy export zip for import: {zip}", lastCopy);
+        }
+
+        fx.PathPicker.OpenPath = importZip;
+
+        var sessionsBeforeImport = 0;
+        await fx.DispatchAsync(() => sessionsBeforeImport = fx.ViewModel.Sessions.Count);
+
+        await fx.DispatchAsync(() => fx.Robot.Click("MenuImportArchive"));
+
+        await fx.WaitUntilAsync(
+            () => fx.ViewModel.StatusText.Contains("Appended", StringComparison.Ordinal)
+                  || fx.ViewModel.StatusText.Contains("Import archive failed", StringComparison.Ordinal)
+                  || fx.ViewModel.Sessions.Count > sessionsBeforeImport,
+            TimeSpan.FromSeconds(20));
+
+        await fx.DispatchAsync(() =>
+        {
+            Assert.IsTrue(fx.PathPicker.OpenCalls >= 1, "Import path picker was not invoked");
+            Assert.IsTrue(
+                fx.ViewModel.StatusText.Contains("Appended", StringComparison.Ordinal)
+                || fx.ViewModel.Sessions.Count > sessionsBeforeImport,
+                "StatusText after import: " + fx.ViewModel.StatusText
+                + "; sessions=" + fx.ViewModel.Sessions.Count);
+        });
+        try { File.Delete(zip); } catch { /* ignore */ }
+        try { File.Delete(importZip); } catch { /* ignore */ }
+    }
+
+    [TestMethod]
+    [TestCategory("E2E-UI-Headless")]
+    public async Task RetentionAndLoggingDialogs_ExposeFolderAutomationIds()
+    {
+        await using var fx = new InspectorHeadlessFixture();
+        await fx.StartAsync();
+        await fx.DispatchAsync(() =>
+        {
+            var settingsPath = Path.Combine(
+                Path.GetTempPath(),
+                "twp-settings-" + Guid.NewGuid().ToString("N") + ".json");
+            var settings = new SettingsService(settingsPath);
+
+            var retention = new SessionRetentionWindow(settings);
+            AssertHasAutomationId(retention, "RetentionCacheFolderPath");
+            AssertHasAutomationId(retention, "RetentionCacheUsage");
+            AssertHasAutomationId(retention, "RetentionOpenCacheFolder");
+            AssertHasAutomationId(retention, "RetentionClearSavedCache");
+
+            var logging = new LoggingSettingsWindow(settings, applyLogging: null);
+            AssertHasAutomationId(logging, "LoggingOpenFolder");
+            AssertHasAutomationId(logging, "LoggingBrowse");
+            AssertHasAutomationId(logging, "LoggingPath");
+
+            var about = new AboutWindow();
+            AssertHasAutomationId(about, "AboutWindow");
+            AssertHasAutomationId(about, "AboutOk");
+
+            var exclusions = new ExcludedHostsWindow(settings, readOnly: false, onSaved: null);
+            AssertHasAutomationId(exclusions, "ExcludedHostsWindow");
+            AssertHasAutomationId(exclusions, "ExcludedBypassHosts");
+            AssertHasAutomationId(exclusions, "ExcludedSkipHosts");
+            AssertHasAutomationId(exclusions, "ExcludedHostsResetDefaults");
+            AssertHasAutomationId(exclusions, "ExcludedHostsSave");
+            Assert.IsFalse(exclusions.GetLogicalDescendants().OfType<Control>().Any(c =>
+                string.Equals(AutomationProperties.GetAutomationId(c), "ExcludedOnlyHosts", StringComparison.Ordinal)
+                || string.Equals(AutomationProperties.GetAutomationId(c), "ExcludedBuiltInList", StringComparison.Ordinal)
+                || string.Equals(AutomationProperties.GetAutomationId(c), "ExcludedProxyLoopback", StringComparison.Ordinal)));
+
+            var excludeHost = new ExcludeHostDialog(settings, "api.example.com");
+            AssertHasAutomationId(excludeHost, "ExcludeHostDialog");
+            AssertHasAutomationId(excludeHost, "ExcludeHostAdd");
+            AssertHasAutomationId(excludeHost, "ExcludeHostWildcardParent");
+            Assert.IsFalse(excludeHost.GetLogicalDescendants().OfType<Control>().Any(c =>
+                string.Equals(AutomationProperties.GetAutomationId(c), "ExcludeHostTunnelOnly", StringComparison.Ordinal)
+                || string.Equals(AutomationProperties.GetAutomationId(c), "ExcludeHostBypassProxy", StringComparison.Ordinal)));
+        });
+    }
+
+    private static void AssertHasAutomationId(Control root, string automationId)
+    {
+        bool IdMatch(Avalonia.StyledElement c) =>
+            string.Equals(
+                AutomationProperties.GetAutomationId(c),
+                automationId,
+                StringComparison.Ordinal);
+
+        var found = IdMatch(root)
+            || root.GetLogicalDescendants().OfType<Control>().Any(IdMatch)
+            || root.GetVisualDescendants().OfType<Control>().Any(IdMatch);
+        Assert.IsTrue(found, "Missing AutomationId on dialog: " + automationId);
+    }
+}

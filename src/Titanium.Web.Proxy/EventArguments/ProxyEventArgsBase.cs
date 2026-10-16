@@ -7,18 +7,18 @@ namespace Titanium.Web.Proxy.EventArguments;
 ///     The base event arguments
 /// </summary>
 /// <seealso cref="System.EventArgs" />
-public abstract class ProxyEventArgsBase : EventArgs
+public abstract class ProxyEventArgsBase : EventArgs // NOSONAR S3376 -- Public API name is retained for compatibility.
 {
     private readonly TcpClientConnection clientConnection;
     internal readonly ProxyServer Server;
 
-    internal ProxyEventArgsBase(ProxyServer server, TcpClientConnection clientConnection)
+    private protected ProxyEventArgsBase(ProxyServer server, TcpClientConnection clientConnection)
     {
         this.clientConnection = clientConnection;
         Server = server;
     }
 
-    public object ClientUserData
+    public object? ClientUserData
     {
         get => clientConnection.ClientUserData;
         set => clientConnection.ClientUserData = value;

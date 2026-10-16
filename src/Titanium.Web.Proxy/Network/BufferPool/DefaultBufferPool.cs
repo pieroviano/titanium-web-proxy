@@ -1,14 +1,15 @@
-﻿using System.Buffers;
+﻿using System;
+using System.Buffers;
 
 namespace Titanium.Web.Proxy.StreamExtended.BufferPool;
 
 /// <summary>
-///     A concrete IBufferPool implementation using a thread-safe stack.
-///     Works well when all consumers ask for buffers with the same size.
-///     If your application would use variable size buffers consider implementing IBufferPool using System.Buffers library
-///     from Microsoft.
+///     A concrete IBufferPool implementation backed by the shared <see cref="System.Buffers.ArrayPool{T}" />.
+///     It is thread-safe and handles both fixed and variable size buffer requests.
+///     Note: rented buffers may be larger than the requested size (ArrayPool bucketing) and are not
+///     cleared on return, so callers must not assume the buffer length equals the requested size.
 /// </summary>
-internal class DefaultBufferPool : IBufferPool
+internal sealed class DefaultBufferPool : IBufferPool
 {
     /// <summary>
     ///     Buffer size in bytes used throughout this proxy.
@@ -44,8 +45,14 @@ internal class DefaultBufferPool : IBufferPool
         ArrayPool<byte>.Shared.Return(buffer);
     }
 
-    public void Dispose()
+    public void Dispose() // NOSONAR CA1822 -- IDisposable contract requires an instance member.
     {
-        //Nothing to dispose. But need for the interface
+        Dispose(true);
+        GC.SuppressFinalize(this);
+    }
+
+    private static void Dispose(bool disposing)
+    {
+        // Nothing to dispose; required for IBufferPool.
     }
 }

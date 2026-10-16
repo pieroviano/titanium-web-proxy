@@ -67,11 +67,10 @@ internal sealed class Socks4Handler : SocksHandler
     /// <exception cref="ArgumentException"><c>port</c> is invalid.</exception>
     private int GetHostPortBytes(string host, int port, Memory<byte> buffer)
     {
-        if (host == null)
-            throw new ArgumentNullException(nameof(host));
+        ArgumentNullException.ThrowIfNull(host);
 
         if (port <= 0 || port > 65535)
-            throw new ArgumentException(nameof(port));
+            throw new ArgumentException("Port must be between 1 and 65535.", nameof(port));
 
         var length = 10 + Username.Length + host.Length;
         Debug.Assert(buffer.Length >= length);
@@ -99,8 +98,7 @@ internal sealed class Socks4Handler : SocksHandler
     /// <exception cref="ArgumentNullException"><c>remoteEP</c> is null.</exception>
     private int GetEndPointBytes(IPEndPoint remoteEp, Memory<byte> buffer)
     {
-        if (remoteEp == null)
-            throw new ArgumentNullException(nameof(remoteEp));
+        ArgumentNullException.ThrowIfNull(remoteEp);
 
         var length = 9 + Username.Length;
         Debug.Assert(buffer.Length >= length);
@@ -116,81 +114,6 @@ internal sealed class Socks4Handler : SocksHandler
     }
 
     /// <summary>
-    ///     Starts negotiating with the SOCKS server.
-    /// </summary>
-    /// <param name="host">The host to connect to.</param>
-    /// <param name="port">The port to connect to.</param>
-    /// <exception cref="ArgumentNullException"><c>host</c> is null.</exception>
-    /// <exception cref="ArgumentException"><c>port</c> is invalid.</exception>
-    /// <exception cref="ProxyException">The proxy rejected the request.</exception>
-    /// <exception cref="SocketException">An operating system error occurs while accessing the Socket.</exception>
-    /// <exception cref="ObjectDisposedException">The Socket has been closed.</exception>
-    public override void Negotiate(string host, int port)
-    {
-        var buffer = ArrayPool<byte>.Shared.Rent(10 + Username.Length + host.Length);
-        try
-        {
-            var length = GetHostPortBytes(host, port, buffer);
-            Negotiate(buffer, length);
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(buffer);
-        }
-    }
-
-    /// <summary>
-    ///     Starts negotiating with the SOCKS server.
-    /// </summary>
-    /// <param name="remoteEp">The IPEndPoint to connect to.</param>
-    /// <exception cref="ArgumentNullException"><c>remoteEP</c> is null.</exception>
-    /// <exception cref="ProxyException">The proxy rejected the request.</exception>
-    /// <exception cref="SocketException">An operating system error occurs while accessing the Socket.</exception>
-    /// <exception cref="ObjectDisposedException">The Socket has been closed.</exception>
-    public override void Negotiate(IPEndPoint remoteEp)
-    {
-        var buffer = ArrayPool<byte>.Shared.Rent(9 + Username.Length);
-        try
-        {
-            var length = GetEndPointBytes(remoteEp, buffer);
-            Negotiate(buffer, length);
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(buffer);
-        }
-    }
-
-    /// <summary>
-    ///     Starts negotiating with the SOCKS server.
-    /// </summary>
-    /// <param name="connect">The bytes to send when trying to authenticate.</param>
-    /// <param name="length">The byte count to send when trying to authenticate.</param>
-    /// <exception cref="ArgumentNullException"><c>connect</c> is null.</exception>
-    /// <exception cref="ArgumentException"><c>connect</c> is too small.</exception>
-    /// <exception cref="ProxyException">The proxy rejected the request.</exception>
-    /// <exception cref="SocketException">An operating system error occurs while accessing the Socket.</exception>
-    /// <exception cref="ObjectDisposedException">The Socket has been closed.</exception>
-    private void Negotiate(byte[] connect, int length)
-    {
-        if (connect == null)
-            throw new ArgumentNullException(nameof(connect));
-
-        if (length < 2)
-            throw new ArgumentException(nameof(length));
-
-        if (Server.Send(connect, 0, length, SocketFlags.None) < length)
-            throw new SocketException(10054);
-
-        ReadBytes(connect, 8);
-        if (connect[1] != 90)
-        {
-            Server.Close();
-            throw new ProxyException("Negotiation failed.");
-        }
-    }
-
-    /// <summary>
     ///     Starts negotiating asynchronously with a SOCKS proxy server.
     /// </summary>
     /// <param name="host">The remote server to connect to.</param>
@@ -200,14 +123,15 @@ internal sealed class Socks4Handler : SocksHandler
     /// <param name="state">The state.</param>
     /// <returns>An IAsyncProxyResult that references the asynchronous connection.</returns>
     public override AsyncProxyResult BeginNegotiate(string host, int port, HandShakeComplete callback,
-        IPEndPoint proxyEndPoint, object state)
+        IPEndPoint proxyEndPoint, AsyncProxyResult asyncResult)
     {
         ProtocolComplete = callback;
         Buffer = ArrayPool<byte>.Shared.Rent(10 + Username.Length + host.Length);
         BufferCount = GetHostPortBytes(host, port, Buffer);
+        // Assign all callback-visible state before BeginConnect can complete.
+        var result = asyncResult ?? throw new ArgumentNullException(nameof(asyncResult));
         Server.BeginConnect(proxyEndPoint, OnConnect, Server);
-        AsyncResult = new AsyncProxyResult(state);
-        return AsyncResult;
+        return result;
     }
 
     /// <summary>
@@ -219,14 +143,15 @@ internal sealed class Socks4Handler : SocksHandler
     /// <param name="state">The state.</param>
     /// <returns>An IAsyncProxyResult that references the asynchronous connection.</returns>
     public override AsyncProxyResult BeginNegotiate(IPEndPoint remoteEp, HandShakeComplete callback,
-        IPEndPoint proxyEndPoint, object state)
+        IPEndPoint proxyEndPoint, AsyncProxyResult asyncResult)
     {
         ProtocolComplete = callback;
         Buffer = ArrayPool<byte>.Shared.Rent(9 + Username.Length);
         BufferCount = GetEndPointBytes(remoteEp, Buffer);
+        // Assign all callback-visible state before BeginConnect can complete.
+        var result = asyncResult ?? throw new ArgumentNullException(nameof(asyncResult));
         Server.BeginConnect(proxyEndPoint, OnConnect, Server);
-        AsyncResult = new AsyncProxyResult(state);
-        return AsyncResult;
+        return result;
     }
 
     /// <summary>

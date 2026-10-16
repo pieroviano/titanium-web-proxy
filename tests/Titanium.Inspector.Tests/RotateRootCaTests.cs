@@ -1,0 +1,472 @@
+using System;
+using System.IO;
+using System.Net;
+using System.Reflection;
+using System.Threading.Tasks;
+using System.Windows.Input;
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+using Titanium.Inspector.Services;
+using Titanium.Inspector.ViewModels;
+
+namespace Titanium.Inspector.Tests;
+
+[TestClass]
+public class RotateRootCaTests
+{
+    private static readonly string[] RemovedRootThumbprints = ["AAAA1111", "BBBB2222"];
+
+    [TestMethod]
+    public async Task RotateCa_Cancel_DoesNotChangePfx()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "ti-rot-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            using var interception = new InterceptionService { UseInMemoryTrustState = true };
+            OverrideRootPfx(interception, Path.Combine(dir, "rootCert.pfx"));
+            await interception.StartAsync(IPAddress.Loopback, 0);
+            var before = interception.RootCertificate!.Thumbprint;
+
+            var dialogs = new ScriptedInspectorDialogs { RotateRootCaResult = false };
+            var settings = new SettingsService(Path.Combine(dir, "settings.json"));
+            var registry = new SessionRegistry();
+            var vm = new MainWindowViewModel(
+                new SessionStreamBuffer(registry),
+                registry,
+                new UpdateService(settings),
+                settings,
+                interception,
+                dialogs);
+
+            await ExecuteAsync(vm.RotateCaCommand);
+            Assert.AreEqual(1, dialogs.RotateRootCaCalls);
+            Assert.AreEqual(before, interception.RootCertificate!.Thumbprint);
+            StringAssert.Contains(vm.StatusText, "cancelled");
+            interception.EnsureShutdown();
+        }
+        finally
+        {
+            try { if (Directory.Exists(dir)) Directory.Delete(dir, true); } catch { /* best-effort */ }
+        }
+    }
+
+    [TestMethod]
+    public async Task RotateCa_Cancel_LeavesDecryptHttpsOn()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "ti-rot-cancel-mitm-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            using var interception = new InterceptionService { UseInMemoryTrustState = true };
+            OverrideRootPfx(interception, Path.Combine(dir, "rootCert.pfx"));
+            await interception.StartAsync(IPAddress.Loopback, 0);
+
+            var dialogs = new ScriptedInspectorDialogs
+            {
+                RotateRootCaResult = false,
+                InstallRootCaResult = true,
+            };
+            var settings = new SettingsService(Path.Combine(dir, "settings.json"));
+            var registry = new SessionRegistry();
+            var vm = new MainWindowViewModel(
+                new SessionStreamBuffer(registry),
+                registry,
+                new UpdateService(settings),
+                settings,
+                interception,
+                dialogs);
+
+            await ExecuteUntilAsync(vm.InstallCaCommand, () => interception.IsRootTrusted && !vm.IsStatusBusy);
+            vm.DecryptHttps = true;
+            Assert.IsTrue(vm.DecryptHttps);
+
+            await ExecuteAsync(vm.RotateCaCommand);
+            Assert.AreEqual(1, dialogs.RotateRootCaCalls);
+            Assert.IsTrue(vm.DecryptHttps, "Cancel must not disable Decrypt HTTPS");
+            Assert.IsTrue(interception.DecryptHttps);
+            StringAssert.Contains(vm.StatusText, "cancelled");
+            interception.EnsureShutdown();
+        }
+        finally
+        {
+            try { if (Directory.Exists(dir)) Directory.Delete(dir, true); } catch { /* best-effort */ }
+        }
+    }
+
+    [TestMethod]
+    public async Task RotateCa_Accept_ChangesThumbprintAndClearsLocalCrts()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "ti-rot2-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            using var interception = new InterceptionService { UseInMemoryTrustState = true };
+            OverrideRootPfx(interception, Path.Combine(dir, "rootCert.pfx"));
+            await interception.StartAsync(IPAddress.Loopback, 0);
+            var before = interception.RootCertificate!.Thumbprint;
+            Directory.CreateDirectory(Path.Combine(dir, "crts"));
+            File.WriteAllText(Path.Combine(dir, "crts", "junk.pfx"), "x");
+
+            var dialogs = new ScriptedInspectorDialogs
+            {
+                RotateRootCaResult = true,
+                InstallRootCaResult = false
+            };
+            var settings = new SettingsService(Path.Combine(dir, "settings.json"));
+            var registry = new SessionRegistry();
+            var vm = new MainWindowViewModel(
+                new SessionStreamBuffer(registry),
+                registry,
+                new UpdateService(settings),
+                settings,
+                interception,
+                dialogs);
+
+            await ExecuteUntilAsync(
+                vm.RotateCaCommand,
+                () => interception.RootCertificate is not null
+                      && !string.Equals(before, interception.RootCertificate.Thumbprint, StringComparison.OrdinalIgnoreCase)
+                      && File.Exists(Path.Combine(dir, "rootCert.pfx")));
+            Assert.AreNotEqual(before, interception.RootCertificate!.Thumbprint);
+            Assert.IsFalse(Directory.Exists(Path.Combine(dir, "crts")));
+            Assert.IsTrue(File.Exists(Path.Combine(dir, "rootCert.pfx")));
+            interception.EnsureShutdown();
+        }
+        finally
+        {
+            try { if (Directory.Exists(dir)) Directory.Delete(dir, true); } catch { /* best-effort */ }
+        }
+    }
+
+    [TestMethod]
+    public async Task LegacySharedCrts_PruneOnce_IsIdempotentOnStart()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "ti-leg-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var shared = Path.Combine(dir, "shared-crts");
+        Directory.CreateDirectory(shared);
+        File.WriteAllText(Path.Combine(shared, "old.pfx"), "x");
+        try
+        {
+            using var interception = new InterceptionService
+            {
+                UseInMemoryTrustState = true,
+                LegacyCrtsTestRoot = dir
+            };
+            OverrideRootPfx(interception, Path.Combine(dir, "rootCert.pfx"));
+            await interception.StartAsync(IPAddress.Loopback, 0);
+            Assert.IsFalse(Directory.Exists(shared), "first Start should prune shared crts");
+            Assert.IsTrue(File.Exists(Path.Combine(dir, "legacy-shared-crts-cleared")));
+
+            Directory.CreateDirectory(shared);
+            File.WriteAllText(Path.Combine(shared, "again.pfx"), "y");
+            interception.EnsureShutdown();
+
+            using var interception2 = new InterceptionService
+            {
+                UseInMemoryTrustState = true,
+                LegacyCrtsTestRoot = dir
+            };
+            OverrideRootPfx(interception2, Path.Combine(dir, "rootCert.pfx"));
+            await interception2.StartAsync(IPAddress.Loopback, 0);
+            Assert.IsTrue(Directory.Exists(shared), "marker present → Start must not prune again");
+            interception2.EnsureShutdown();
+        }
+        finally
+        {
+            try { if (Directory.Exists(dir)) Directory.Delete(dir, true); } catch { /* best-effort */ }
+        }
+    }
+
+    [TestMethod]
+    public async Task Rotate_AlwaysPrunesSharedCrtsEvenWithMarker()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "ti-leg2-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, "legacy-shared-crts-cleared"), "already");
+        var shared = Path.Combine(dir, "shared-crts");
+        Directory.CreateDirectory(shared);
+        File.WriteAllText(Path.Combine(shared, "old.pfx"), "x");
+        try
+        {
+            using var interception = new InterceptionService
+            {
+                UseInMemoryTrustState = true,
+                LegacyCrtsTestRoot = dir
+            };
+            OverrideRootPfx(interception, Path.Combine(dir, "rootCert.pfx"));
+            await interception.StartAsync(IPAddress.Loopback, 0);
+            Assert.IsTrue(Directory.Exists(shared), "Start with marker keeps shared crts");
+
+            Assert.IsTrue(interception.RotateRootCertificate(false));
+            Assert.IsFalse(Directory.Exists(shared), "Rotate always prunes shared crts");
+            interception.EnsureShutdown();
+        }
+        finally
+        {
+            try { if (Directory.Exists(dir)) Directory.Delete(dir, true); } catch { /* best-effort */ }
+        }
+    }
+
+    [TestMethod]
+    [TestCategory("Regression-2026-10-07")]
+    public async Task RemoveOldRootCas_WithNothingStale_KeepsCurrentRootAndReportsNone()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "ti-oldroot-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            using var interception = new InterceptionService { UseInMemoryTrustState = true };
+            OverrideRootPfx(interception, Path.Combine(dir, "rootCert.pfx"));
+            await interception.StartAsync(IPAddress.Loopback, 0);
+            var before = interception.RootCertificate!.Thumbprint;
+
+            Assert.AreEqual(0, interception.ListStaleRootThumbprints(machineStore: false).Count,
+                "In-memory trust state must never enumerate or touch the real certificate stores.");
+
+            var settings = new SettingsService(Path.Combine(dir, "settings.json"));
+            var registry = new SessionRegistry();
+            var vm = new MainWindowViewModel(
+                new SessionStreamBuffer(registry),
+                registry,
+                new UpdateService(settings),
+                settings,
+                interception,
+                new ScriptedInspectorDialogs());
+
+            await ExecuteUntilAsync(
+                vm.RemoveOldRootCasCommand,
+                () => !vm.IsStatusBusy && vm.StatusText.Contains("No old Titanium root CAs", StringComparison.OrdinalIgnoreCase));
+            Assert.AreEqual(before, interception.RootCertificate!.Thumbprint, "The current root must be untouched.");
+            interception.EnsureShutdown();
+        }
+        finally
+        {
+            try { if (Directory.Exists(dir)) Directory.Delete(dir, true); } catch { }
+        }
+    }
+
+    [TestMethod]
+    [TestCategory("Regression-2026-10-07")]
+    public async Task RemoveOldRootCas_RemovesOnlyStaleThumbprints_NeverTheCurrentRoot()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "ti-oldroot2-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            using var interception = new InterceptionService { UseInMemoryTrustState = true };
+            OverrideRootPfx(interception, Path.Combine(dir, "rootCert.pfx"));
+            await interception.StartAsync(IPAddress.Loopback, 0);
+            var current = interception.RootCertificate!.Thumbprint;
+
+            var removed = new System.Collections.Concurrent.ConcurrentQueue<string>();
+            var stale = new System.Collections.Generic.List<string> { "AAAA1111", "BBBB2222" };
+            // The fake store also (wrongly) lists the current root, as a race with Install could.
+            interception.ListStaleRootsOverride = _ =>
+                stale.Concat(new[] { current.ToLowerInvariant() }).ToArray();
+            interception.RemoveRootOverride = (_, thumbprint) =>
+            {
+                removed.Enqueue(thumbprint);
+                stale.Remove(thumbprint);
+            };
+
+            var settings = new SettingsService(Path.Combine(dir, "settings.json"));
+            var registry = new SessionRegistry();
+            var vm = new MainWindowViewModel(
+                new SessionStreamBuffer(registry),
+                registry,
+                new UpdateService(settings),
+                settings,
+                interception,
+                new ScriptedInspectorDialogs());
+
+            await ExecuteUntilAsync(
+                vm.RemoveOldRootCasCommand,
+                () => !vm.IsStatusBusy && vm.StatusText.Contains("Removed 2 old", StringComparison.OrdinalIgnoreCase));
+
+            CollectionAssert.AreEquivalent(RemovedRootThumbprints, removed.ToArray());
+            CollectionAssert.DoesNotContain(removed.ToArray(), current);
+            Assert.AreEqual(current, interception.RootCertificate!.Thumbprint);
+            interception.EnsureShutdown();
+        }
+        finally
+        {
+            try { if (Directory.Exists(dir)) Directory.Delete(dir, true); } catch { }
+        }
+    }
+
+    private static void OverrideRootPfx(InterceptionService interception, string path)
+    {
+        var field = typeof(InterceptionService).GetField("_rootPfxPath",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.IsNotNull(field);
+        field!.SetValue(interception, path);
+    }
+
+    private static async Task ExecuteAsync(ICommand command)
+    {
+        command.Execute(null);
+        await Task.Delay(150);
+    }
+
+    private static async Task ExecuteUntilAsync(ICommand command, Func<bool> done, int timeoutMs = 15000)
+    {
+        command.Execute(null);
+        var deadline = Environment.TickCount64 + timeoutMs;
+        while (!done())
+        {
+            if (Environment.TickCount64 >= deadline)
+                Assert.Fail("Timed out waiting for Rotate CA to finish.");
+            await Task.Delay(25);
+        }
+    }
+    [TestMethod]
+    public async Task RotateCa_WhenProxyStopped_SetsStartFirstStatus()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "ti-rot-stop-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            using var interception = new InterceptionService { UseInMemoryTrustState = true };
+            OverrideRootPfx(interception, Path.Combine(dir, "rootCert.pfx"));
+            var dialogs = new ScriptedInspectorDialogs { RotateRootCaResult = true };
+            var settings = new SettingsService(Path.Combine(dir, "settings.json"));
+            var registry = new SessionRegistry();
+            var vm = new MainWindowViewModel(
+                new SessionStreamBuffer(registry),
+                registry,
+                new UpdateService(settings),
+                settings,
+                interception,
+                dialogs);
+
+            await ExecuteAsync(vm.RotateCaCommand);
+            StringAssert.Contains(vm.StatusText, "Start the proxy first");
+            Assert.AreEqual(0, dialogs.RotateRootCaCalls);
+        }
+        finally
+        {
+            try { if (Directory.Exists(dir)) Directory.Delete(dir, true); } catch { }
+        }
+    }
+
+    [TestMethod]
+    public async Task RotateCa_AcceptInstall_UpdatesStatusViaInstallHelper()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "ti-rot-inst-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            using var interception = new InterceptionService { UseInMemoryTrustState = true };
+            OverrideRootPfx(interception, Path.Combine(dir, "rootCert.pfx"));
+            await interception.StartAsync(IPAddress.Loopback, 0);
+            // Force decrypt on so RotateCa clears it.
+            var settings = new SettingsService(Path.Combine(dir, "settings.json"));
+            settings.Current.DecryptHttps = true;
+            var dialogs = new ScriptedInspectorDialogs
+            {
+                RotateRootCaResult = true,
+                InstallRootCaResult = true,
+                TrustRecoveryResult = TrustRecoveryChoice.Cancel
+            };
+            var registry = new SessionRegistry();
+            var vm = new MainWindowViewModel(
+                new SessionStreamBuffer(registry),
+                registry,
+                new UpdateService(settings),
+                settings,
+                interception,
+                dialogs);
+            vm.DecryptHttps = true;
+
+            await ExecuteUntilAsync(
+                vm.RotateCaCommand,
+                () => interception.IsRootTrusted &&
+                      !vm.IsStatusBusy &&
+                      vm.StatusText.Contains("trusted", StringComparison.OrdinalIgnoreCase));
+            Assert.IsFalse(vm.DecryptHttps);
+            StringAssert.Contains(vm.StatusText, "trusted", StringComparison.OrdinalIgnoreCase);
+            interception.EnsureShutdown();
+        }
+        finally
+        {
+            try { if (Directory.Exists(dir)) Directory.Delete(dir, true); } catch { }
+        }
+    }
+
+    [TestMethod]
+    public async Task RotateCa_UserInstallFails_ElevatesAndTrusts()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "ti-rot-elev-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            using var interception = new InterceptionService
+            {
+                UseInMemoryTrustState = true,
+                FailNextUserTrustInstall = true
+            };
+            OverrideRootPfx(interception, Path.Combine(dir, "rootCert.pfx"));
+            await interception.StartAsync(IPAddress.Loopback, 0);
+            var dialogs = new ScriptedInspectorDialogs
+            {
+                RotateRootCaResult = true,
+                InstallRootCaResult = true,
+                TrustRecoveryResult = TrustRecoveryChoice.Primary
+            };
+            var settings = new SettingsService(Path.Combine(dir, "settings.json"));
+            var registry = new SessionRegistry();
+            var vm = new MainWindowViewModel(
+                new SessionStreamBuffer(registry),
+                registry,
+                new UpdateService(settings),
+                settings,
+                interception,
+                dialogs);
+
+            await ExecuteUntilAsync(
+                vm.RotateCaCommand,
+                () => dialogs.TrustRecoveryCalls >= 1
+                      && !vm.IsStatusBusy
+                      && interception.IsRootTrusted
+                      && vm.StatusText.Contains("trusted", StringComparison.OrdinalIgnoreCase));
+            Assert.AreEqual(1, dialogs.TrustRecoveryCalls);
+            StringAssert.Contains(vm.StatusText, "trusted", StringComparison.OrdinalIgnoreCase);
+            interception.EnsureShutdown();
+        }
+        finally
+        {
+            try { if (Directory.Exists(dir)) Directory.Delete(dir, true); } catch { }
+        }
+    }
+
+    [TestMethod]
+    public async Task OpenLoopbackExempt_WithoutOwner_SetsProbeStatus_OnWindows()
+    {
+        if (!OperatingSystem.IsWindows())
+            Assert.Inconclusive("Windows-only");
+
+        var dir = Path.Combine(Path.GetTempPath(), "ti-loop-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            using var interception = new InterceptionService { UseInMemoryTrustState = true };
+            var settings = new SettingsService(Path.Combine(dir, "settings.json"));
+            var registry = new SessionRegistry();
+            var vm = new MainWindowViewModel(
+                new SessionStreamBuffer(registry),
+                registry,
+                new UpdateService(settings),
+                settings,
+                interception,
+                new ScriptedInspectorDialogs());
+
+            await ExecuteAsync(vm.OpenLoopbackExemptCommand);
+            StringAssert.Contains(vm.StatusText, "Store app allow-list OK");
+        }
+        finally
+        {
+            try { if (Directory.Exists(dir)) Directory.Delete(dir, true); } catch { }
+        }
+    }
+}

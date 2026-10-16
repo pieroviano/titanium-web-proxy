@@ -1,4 +1,3 @@
-﻿#if NETSTANDARD2_1
 /*
  * Copyright 2014 Twitter, Inc
  * This file is a derivative work modified by Ringo Leese
@@ -26,7 +25,7 @@ namespace Titanium.Web.Proxy.Http2.Hpack
         private const int BucketSize = 17;
 
         // a linked hash map of header fields
-        private readonly HeaderEntry[] headerFields = new HeaderEntry[BucketSize];
+        private readonly HeaderEntry?[] headerFields = new HeaderEntry?[BucketSize];
         private readonly HeaderEntry head = new HeaderEntry(-1, ByteString.Empty, ByteString.Empty, int.MaxValue, null);
         private int size;
 
@@ -62,7 +61,7 @@ namespace Titanium.Web.Proxy.Http2.Hpack
         /// <param name="sensitive">If set to <c>true</c> sensitive.</param>
         /// <param name="indexType">Index type.</param>
         /// <param name="useStaticName">Use static name.</param>
-        public void EncodeHeader(BinaryWriter output, ByteString name, ByteString value, bool sensitive =
+        public void EncodeHeader(BinaryWriter output, ByteString name, ByteString value, bool sensitive = // NOSONAR S3776 -- This protocol/state-machine path shares mutable parsing or transport state; splitting it further would create disproportionate regression risk.
  false, HpackUtil.IndexType indexType = HpackUtil.IndexType.Incremental, bool useStaticName = true)
         {
             // If the header value is sensitive then it must never be indexed
@@ -103,7 +102,7 @@ namespace Titanium.Web.Proxy.Http2.Hpack
             var headerField = GetEntry(name, value);
             if (headerField != null)
             {
-                int index = GetIndex(headerField.Index) + StaticTable.Length;
+                int index = GetIndex(headerField.EntryIndex) + StaticTable.Length;
 
                 // Section 6.1. Indexed Header Field Representation
                 EncodeInteger(output, 0x80, 7, index);
@@ -118,11 +117,39 @@ namespace Titanium.Web.Proxy.Http2.Hpack
                 }
                 else
                 {
+                    // Only "Incremental" indexing inserts a new entry into the dynamic table (RFC 7541
+                    // 6.2.2/6.2.3: "Literal Header Field without Indexing"/"Never Indexed" representations
+                    // MUST NOT be added to the dynamic table). A peer's compliant decoder mirrors this exactly,
+                    // so unconditionally calling Add() here (as this used to) desyncs our dynamic table from
+                    // the peer's: our table ends up with extra entries the peer never inserted, so every index
+                    // computed afterwards for a *later* entry is off relative to what the peer's decoder has,
+                    // eventually resolving to a wrong/out-of-range index and the peer failing decode with a
+                    // COMPRESSION_ERROR (e.g. this is hit whenever ":path" - encoded with IndexType.None to
+                    // avoid polluting the table with highly variable paths - is followed by any subsequently
+                    // indexed header).
+                    bool willIndex = indexType == HpackUtil.IndexType.Incremental;
+
+                    // Make room for the new entry *before* resolving a name-only reference: EnsureCapacity
+                    // evicts the oldest dynamic-table entries, and if it evicted the very entry a name-only
+                    // lookup would have matched, an index computed beforehand would now point at a stale/wrong
+                    // slot (a real HPACK protocol violation - the peer's decoder would reject or misdecode the
+                    // header block). Evicting first means a subsequent lookup can only match entries that are
+                    // actually still present once the new entry is added. Only relevant when we're actually
+                    // about to add an entry; skip it otherwise so a non-indexed header never evicts entries it
+                    // has no need to make room for.
+                    if (willIndex)
+                    {
+                        EnsureCapacity(headerSize);
+                    }
+
                     int nameIndex = useStaticName ? GetNameIndex(name) : -1;
-                    EnsureCapacity(headerSize);
 
                     EncodeLiteral(output, name, value, indexType, nameIndex);
-                    Add(name, value);
+
+                    if (willIndex)
+                    {
+                        Add(name, value);
+                    }
                 }
             }
         }
@@ -191,7 +218,7 @@ namespace Titanium.Web.Proxy.Http2.Hpack
         /// </summary>
         /// <param name="output">Output.</param>
         /// <param name="stringData">String data.</param>
-        private void EncodeStringLiteral(BinaryWriter output, ByteString stringData)
+        private static void EncodeStringLiteral(BinaryWriter output, ByteString stringData)
         {
             int huffmanLength = HuffmanEncoder.Instance.GetEncodedLength(stringData);
             if (huffmanLength < stringData.Length)
@@ -214,7 +241,7 @@ namespace Titanium.Web.Proxy.Http2.Hpack
         /// <param name="value">Value.</param>
         /// <param name="indexType">Index type.</param>
         /// <param name="nameIndex">Name index.</param>
-        private void EncodeLiteral(BinaryWriter output, ByteString name, ByteString value, HpackUtil.IndexType indexType,
+        private static void EncodeLiteral(BinaryWriter output, ByteString name, ByteString value, HpackUtil.IndexType indexType,
             int nameIndex)
         {
             int mask;
@@ -237,7 +264,7 @@ namespace Titanium.Web.Proxy.Http2.Hpack
                     break;
 
                 default:
-                    throw new Exception("should not reach here");
+                    throw new InvalidOperationException("should not reach here");
             }
 
             EncodeInteger(output, mask, prefixBits, nameIndex == -1 ? 0 : nameIndex);
@@ -288,7 +315,7 @@ namespace Titanium.Web.Proxy.Http2.Hpack
         /// </summary>
         private int Length()
         {
-            return size == 0 ? 0 : head.After.Index - head.Before.Index + 1;
+            return size == 0 ? 0 : head.After.EntryIndex - head.Before.EntryIndex + 1;
         }
 
         /// <summary>
@@ -309,7 +336,7 @@ namespace Titanium.Web.Proxy.Http2.Hpack
             int i = Index(h);
             for (var e = headerFields[i]; e != null; e = e.Next)
             {
-                if (e.Hash == h && name.Equals(e.NameData) && Equals(value, e.ValueData))
+                if (e.EntryHash == h && name.Equals(e.NameData) && Equals(value, e.ValueData))
                 {
                     return e;
                 }
@@ -336,9 +363,9 @@ namespace Titanium.Web.Proxy.Http2.Hpack
             int index = -1;
             for (HeaderEntry? e = headerFields[i]; e != null; e = e.Next)
             {
-                if (e.Hash == h && name.Equals(e.NameData))
+                if (e.EntryHash == h && name.Equals(e.NameData))
                 {
-                    index = e.Index;
+                    index = e.EntryIndex;
                     break;
                 }
             }
@@ -358,7 +385,7 @@ namespace Titanium.Web.Proxy.Http2.Hpack
                 return index;
             }
 
-            return index - head.Before.Index + 1;
+            return index - head.Before.EntryIndex + 1;
         }
 
         /// <summary>
@@ -390,7 +417,7 @@ namespace Titanium.Web.Proxy.Http2.Hpack
             int h = Hash(name);
             int i = Index(h);
             var old = headerFields[i];
-            var e = new HeaderEntry(h, name, value, head.Before.Index - 1, old);
+            var e = new HeaderEntry(h, name, value, head.Before.EntryIndex - 1, old);
             headerFields[i] = e;
             e.AddBefore(head);
             size += headerSize;
@@ -399,15 +426,15 @@ namespace Titanium.Web.Proxy.Http2.Hpack
         /// <summary>
         /// Remove and return the oldest header field from the dynamic table.
         /// </summary>
-        private HttpHeader? Remove()
+        private void Remove()
         {
             if (size == 0)
             {
-                return null;
+                return;
             }
 
             var eldest = head.After;
-            int h = eldest.Hash;
+            int h = eldest.EntryHash;
             int i = Index(h);
             var prev = headerFields[i];
             var e = prev;
@@ -427,14 +454,13 @@ namespace Titanium.Web.Proxy.Http2.Hpack
 
                     eldest.Remove();
                     size -= eldest.Size;
-                    return eldest;
+                    return;
                 }
 
                 prev = e;
                 e = next;
             }
 
-            return null;
         }
 
         /// <summary>
@@ -489,7 +515,7 @@ namespace Titanium.Web.Proxy.Http2.Hpack
         /// <summary>
         /// A linked hash map HeaderField entry.
         /// </summary>
-        private class HeaderEntry : HttpHeader
+        private sealed class HeaderEntry : HttpHeader
         {
             // This is used to compute the index in the dynamic table.
 
@@ -501,9 +527,9 @@ namespace Titanium.Web.Proxy.Http2.Hpack
             // These fields comprise the chained list for header fields with the same hash.
             public HeaderEntry? Next { get; set; }
 
-            public int Hash { get; }
+            public int EntryHash { get; }
 
-            public int Index { get; }
+            public int EntryIndex { get; }
 
             /// <summary>
             /// Creates new entry.
@@ -515,8 +541,8 @@ namespace Titanium.Web.Proxy.Http2.Hpack
             /// <param name="next">Next.</param>
             public HeaderEntry(int hash, ByteString name, ByteString value, int index, HeaderEntry? next) : base(name, value, true)
             {
-                Index = index;
-                Hash = hash;
+                EntryIndex = index;
+                EntryHash = hash;
                 Next = next;
                 Before = this;
                 After = this;
@@ -545,4 +571,3 @@ namespace Titanium.Web.Proxy.Http2.Hpack
         }
     }
 }
-#endif

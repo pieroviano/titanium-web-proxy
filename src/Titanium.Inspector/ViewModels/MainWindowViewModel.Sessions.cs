@@ -1,0 +1,1936 @@
+using System.Collections.ObjectModel;
+using System.ComponentModel;
+using System.Net;
+using System.Runtime.CompilerServices;
+using System.Text;
+using System.Windows.Input;
+using Avalonia;
+using Avalonia.Controls;
+using Avalonia.Controls.ApplicationLifetimes;
+using Avalonia.Platform.Storage;
+using Avalonia.Threading;
+using Titanium.Inspector.Localization;
+using Titanium.Inspector.Services;
+using Titanium.Inspector.Views;
+using Titanium.Web.Proxy;
+using Titanium.Web.Proxy.Network;
+
+namespace Titanium.Inspector.ViewModels;
+
+public sealed partial class MainWindowViewModel
+{
+    private const int BulkGridEditThreshold = 32;
+    private static string SearchingBodiesStatus => LanguageService.Get("status.searchingBodies");
+
+    private int _bodyFilterGeneration;
+    private CancellationTokenSource? _bodyFilterCts;
+
+    /// <summary>Managed thread id of the last <c>body:</c> scan. Zero until one runs.</summary>
+    internal int LastBodyFilterThreadId { get; private set; }
+
+    /// <summary>Managed thread id of the last HAR/archive export write.</summary>
+    internal int LastExportThreadId { get; private set; }
+
+    private Task ClearSessionsAsync()
+    {
+        // Drop selection before mutating the grid so the DataGrid cannot cascade-select
+        // a neighbor row (SelectedSession setter would reopen a closed details pane).
+        CancelBodyFilter();
+        _selectedSessions.Clear();
+        SelectedSession = null;
+        ShowSessionDetails = false;
+
+        _userRemovalDepth++;
+        _suppressOpenSessionDetails = true;
+        long freed;
+        try
+        {
+            // Store.Clear does not raise SessionsRemoved. One grid Clear is a single Reset.
+            freed = _store.Clear();
+            Sessions.Clear();
+        }
+        finally
+        {
+            _suppressOpenSessionDetails = false;
+            _userRemovalDepth--;
+        }
+
+        _retentionEvictedTotal = 0;
+        _interception.ResetSessionIdSequence();
+        ResetSeenMethods();
+        SyncViewsToTrackedSessions(null);
+        RefreshSessionCountText();
+        NotifyFilterSelectionProperties();
+        SetOutcomeStatus(
+            SessionRetentionWindow.FormatSessionsClearedStatus(freed),
+            StatusSeverity.Success,
+            toastImportant: true);
+        return Task.CompletedTask;
+    }
+    private Task RemoveSelectedSessionsAsync()
+    {
+        var selected = ResolveExportSelection();
+        if (selected.Count == 0)
+        {
+            SetGuardStatus("Select one or more sessions to remove");
+            return Task.CompletedTask;
+        }
+
+        var ids = selected.Select(s => s.Id).ToHashSet();
+        // Clear selection of removed rows before store/grid mutation (same cascade as Clear).
+        _selectedSessions.RemoveAll(s => ids.Contains(s.Id));
+        if (SelectedSession is not null && ids.Contains(SelectedSession.Id))
+        {
+            SelectedSession = null;
+            ShowSessionDetails = false;
+        }
+
+        _userRemovalDepth++;
+        _suppressOpenSessionDetails = true;
+        try
+        {
+            // SessionsRemoved updates the grid (one Reset when the selection is large).
+            _store.Remove(ids);
+        }
+        finally
+        {
+            _suppressOpenSessionDetails = false;
+            _userRemovalDepth--;
+        }
+
+        RefreshSessionCountText();
+        NotifyFilterSelectionProperties();
+        SetOutcomeStatus(
+            selected.Count == 1 ? "Removed 1 session" : $"Removed {selected.Count} sessions",
+            StatusSeverity.Success,
+            toastImportant: true);
+        return Task.CompletedTask;
+    }
+
+    /// <summary>True when Keep only selected would remove other sessions.</summary>
+    public bool CanKeepOnlySelected =>
+        HasSelectedSessions && ResolveFilterSelection().Count < _all.Count;
+
+    private async Task KeepOnlySelectedAsync()
+    {
+        var keep = ResolveFilterSelection().Select(s => s.Id).ToHashSet();
+        if (keep.Count == 0 || keep.Count >= _all.Count)
+        {
+            return;
+        }
+
+        var visible = Sessions.Select(s => s.Id).ToHashSet();
+        var remove = _all.Where(s => !keep.Contains(s.Id)).Select(s => s.Id).ToList();
+        var hidden = remove.Count(id => !visible.Contains(id));
+
+        if (!await _dialogs.ConfirmRemoveSessionsAsync(TryGetMainWindow(), remove.Count, hidden).ConfigureAwait(true))
+        {
+            return;
+        }
+
+        RemoveCapturedIds(remove);
+    }
+
+    private async Task RemoveMatchingFilterAsync()
+    {
+        // Empty search matches every session — refuse so this cannot act as a silent Clear all.
+        if (!HasActiveSearch)
+        {
+            StatusText = LanguageService.Get("menu.removeMatchingNeedsFilter");
+            return;
+        }
+
+        var remove = Sessions.Select(s => s.Id).ToList();
+        if (remove.Count == 0)
+        {
+            return;
+        }
+
+        var visible = remove.ToHashSet();
+        var hidden = 0;
+        foreach (var session in _all.Where(s => !visible.Contains(s.Id) && SessionSearch.Matches(s, SearchQuery)))
+        {
+            hidden++;
+            remove.Add(session.Id);
+        }
+
+        if (!await _dialogs.ConfirmRemoveSessionsAsync(TryGetMainWindow(), remove.Count, hidden).ConfigureAwait(true))
+        {
+            return;
+        }
+
+        RemoveCapturedIds(remove);
+    }
+
+    private void RemoveCapturedIds(List<long> remove)
+    {
+        var ids = remove.ToHashSet();
+        _selectedSessions.RemoveAll(s => ids.Contains(s.Id));
+        if (SelectedSession is not null && ids.Contains(SelectedSession.Id))
+        {
+            SelectedSession = null;
+            ShowSessionDetails = false;
+        }
+
+        _userRemovalDepth++;
+        _suppressOpenSessionDetails = true;
+        try
+        {
+            _store.Remove(ids);
+        }
+        finally
+        {
+            _suppressOpenSessionDetails = false;
+            _userRemovalDepth--;
+        }
+
+        RefreshSessionCountText();
+        NotifyFilterSelectionProperties();
+        SetOutcomeStatus(
+            ids.Count == 1 ? "Removed 1 session" : $"Removed {ids.Count} sessions",
+            StatusSeverity.Success,
+            toastImportant: true);
+    }
+    private async Task LoadFromSelectedAsync()
+    {
+        var selected = SelectedSession;
+        if (selected is null)
+        {
+            StatusText = "Select a session to load into Composer";
+            return;
+        }
+
+        await _store.EnsureBodiesLoadedAsync(selected, _statusRevertCts?.Token ?? CancellationToken.None).ConfigureAwait(false);
+        await MarshalToUiAsync(() =>
+        {
+            ComposerMethod = selected.Method;
+            ComposerUrl = selected.Url;
+            ComposerHeaders = selected.RequestHeadersText ?? "";
+            ComposerBody = selected.RequestBodyText ?? "";
+            ComposerBodyFilePath = null;
+            StatusText = selected.RequestBodyCapture is BodyCaptureState.Truncated or BodyCaptureState.NotCaptured or BodyCaptureState.Streaming
+                ? "Composer loaded (request body was truncated or not fully captured)"
+                : "Composer loaded from selected session";
+        }, _statusRevertCts?.Token ?? CancellationToken.None).ConfigureAwait(false);
+    }
+
+    private async Task FillGraphQlFromSelectedAsync()
+    {
+        var selected = SelectedSession;
+        if (selected is null)
+        {
+            SetGuardStatus("Select a session to copy its GraphQL operation");
+            return;
+        }
+
+        await _store.EnsureBodiesLoadedAsync(selected, _statusRevertCts?.Token ?? CancellationToken.None).ConfigureAwait(false);
+        await MarshalToUiAsync(() =>
+        {
+            if (!GraphQlOperationMatcher.TryGetOperationName(selected.RequestBodyText, out var name) ||
+                string.IsNullOrWhiteSpace(name))
+            {
+                SetGuardStatus("Selected session has no GraphQL operation name in the request body");
+                return;
+            }
+
+            if (ShowBreakpointsPane)
+            {
+                Breakpoints.GraphQlOperationName = name;
+            }
+            else if (ShowAutoResponderPane)
+            {
+                AutoResponderGraphQlOperation = name;
+            }
+            else if (ShowMapRemotePane)
+            {
+                MapRemoteGraphQlOperation = name;
+            }
+            else
+            {
+                SetGuardStatus("Open Breakpoints, AutoResponder, or Map Remote to set the GraphQL filter");
+                return;
+            }
+
+            StatusText = $"GraphQL filter set to {name}";
+        }, _statusRevertCts?.Token ?? CancellationToken.None).ConfigureAwait(false);
+    }
+
+    private async Task LoadIntoComposerAsync()
+    {
+        var selected = SelectedSession;
+        if (selected is null)
+        {
+            StatusText = "Select a session to load into Composer";
+            return;
+        }
+
+        await _store.EnsureBodiesLoadedAsync(selected, _statusRevertCts?.Token ?? CancellationToken.None).ConfigureAwait(false);
+        await MarshalToUiAsync(() =>
+        {
+            ComposerMethod = selected.Method;
+            ComposerUrl = selected.Url;
+            ComposerHeaders = selected.RequestHeadersText ?? "";
+            ComposerBody = selected.RequestBodyText ?? "";
+            ComposerBodyFilePath = null;
+            StatusText = selected.RequestBodyCapture is BodyCaptureState.Truncated or BodyCaptureState.NotCaptured or BodyCaptureState.Streaming
+                ? "Composer loaded (request body was truncated or not fully captured)"
+                : "Composer loaded from selected session";
+        }, StatusCancelToken).ConfigureAwait(false);
+        await OpenToolsTabAsync(0).ConfigureAwait(false);
+    }
+    private async Task CopyUrlAsync()
+    {
+        var urls = ResolveCopyUrls();
+        if (urls.Count == 0)
+        {
+            StatusText = "Select a session with a URL to copy";
+            return;
+        }
+
+        var text = string.Join(Environment.NewLine, urls);
+        var window = TryGetMainWindow();
+        if (window?.Clipboard is { } clipboard)
+        {
+            await clipboard.SetTextAsync(text);
+        }
+
+        StatusText = urls.Count == 1 ? "Copied URL" : $"Copied {urls.Count} URLs";
+    }
+    private async Task CopyAsCurlAsync()
+    {
+        if (!TryBuildCopyAsCurl(out var curl))
+        {
+            StatusText = "Select one session with a URL to copy as curl";
+            return;
+        }
+
+        await CopyTextToClipboardAsync(curl).ConfigureAwait(false);
+        StatusText = "Copied as curl";
+    }
+    private async Task CopyAsFetchAsync()
+    {
+        if (!TryBuildCopyAsFetch(out var fetch))
+        {
+            StatusText = "Select one session with a URL to copy as fetch";
+            return;
+        }
+
+        await CopyTextToClipboardAsync(fetch).ConfigureAwait(false);
+        StatusText = "Copied as fetch";
+    }
+    private async Task CopyAsPowerShellAsync()
+    {
+        if (!TryBuildCopyAsPowerShell(out var text))
+        {
+            StatusText = "Select one session with a URL to copy as PowerShell";
+            return;
+        }
+
+        await CopyTextToClipboardAsync(text).ConfigureAwait(false);
+        StatusText = "Copied as PowerShell";
+    }
+    private async Task CopyAsPythonAsync()
+    {
+        if (!TryBuildCopyAsPython(out var text))
+        {
+            StatusText = "Select one session with a URL to copy as Python";
+            return;
+        }
+
+        await CopyTextToClipboardAsync(text).ConfigureAwait(false);
+        StatusText = "Copied as Python";
+    }
+    private async Task CopyAsTableAsync()
+    {
+        if (!TryBuildRowsAsTable(out var text, out var written, out var truncated))
+        {
+            StatusText = "No sessions to copy as a table";
+            return;
+        }
+
+        await CopyTextToClipboardAsync(text).ConfigureAwait(false);
+        if (truncated)
+        {
+            StatusText = $"Copied {written.ToString(System.Globalization.CultureInfo.InvariantCulture)} rows (list was longer)";
+        }
+        else if (written == 1)
+        {
+            StatusText = "Copied 1 row as a table";
+        }
+        else
+        {
+            StatusText = $"Copied {written.ToString(System.Globalization.CultureInfo.InvariantCulture)} rows as a table";
+        }
+    }
+    private async Task SaveRawHttpAsync()
+    {
+        var session = SelectedSession;
+        if (session is null)
+        {
+            StatusText = "Select a session to save";
+            return;
+        }
+
+        var path = await _pathPicker.PickSavePathAsync(
+            "Save session as raw HTTP text",
+            $"session-{session.Id.ToString(System.Globalization.CultureInfo.InvariantCulture)}.http",
+            "HTTP text",
+            "*.http").ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return;
+        }
+
+        FileStream? har = null;
+        try
+        {
+            if (session.BodiesOnDisk)
+            {
+                _store.TryOpenSpilledHar(session, out har);
+            }
+
+            await using var output = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read);
+            var result = SessionRawHttp.Write(session, output, har);
+            StatusText = result.Truncated
+                ? "Saved raw HTTP text (a body was cut at 32 MB)"
+                : "Saved raw HTTP text";
+        }
+        finally
+        {
+            if (har is not null)
+            {
+                await har.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+    }
+    private async Task DiffSessionsAsync()
+    {
+        var selection = ResolveFilterSelection();
+        if (selection.Count != 2)
+        {
+            StatusText = "Select exactly two sessions to diff";
+            return;
+        }
+
+        // Comparing two multi-MB bodies is CPU-bound: keep it off the UI thread when a UI exists.
+        var left = selection[0];
+        var right = selection[1];
+        var diff = Application.Current is null
+            ? SessionDiff.Compare(left, right)
+            : await Task.Run(() => SessionDiff.Compare(left, right), CancellationToken.None);
+
+        // The clipboard gets the full report; the on-screen TextBox is bounded (layout cost).
+        _diffLeftId = left.Id;
+        _diffRightId = right.Id;
+        SessionDiffText = InspectorDisplayText.ForTextBox(diff.Text);
+        await CopyTextToClipboardAsync(diff.Text).ConfigureAwait(false);
+        ShowSessionDetails = true;
+        SelectedOuterPaneIndex = 0;
+        SelectedInspectTabIndex = (int)InspectTab.Diff;
+        StatusText = diff.HasDifferences ? "Session Diff: differences found (copied)" : "Session Diff: identical (copied)";
+    }
+    /// <summary>Compares exactly two selected sessions (E2E / probe).</summary>
+    public bool TryBuildSessionDiff(out SessionDiffResult diff)
+    {
+        diff = new SessionDiffResult(false, "");
+        var selection = ResolveFilterSelection();
+        if (selection.Count != 2)
+        {
+            return false;
+        }
+
+        diff = SessionDiff.Compare(selection[0], selection[1]);
+        return true;
+    }
+    /// <summary>Builds curl for the single selected session (E2E / probe).</summary>
+    public bool TryBuildCopyAsCurl(out string curl)
+    {
+        curl = "";
+        var session = ResolveSingleCopySession();
+        if (session is null || !SessionRequestCodegen.CanGenerate(session))
+        {
+            return false;
+        }
+
+        curl = SessionRequestCodegen.ToCurl(session);
+        return true;
+    }
+    /// <summary>Builds fetch for the single selected session (E2E / probe).</summary>
+    public bool TryBuildCopyAsFetch(out string fetch)
+    {
+        fetch = "";
+        var session = ResolveSingleCopySession();
+        if (session is null || !SessionRequestCodegen.CanGenerate(session))
+        {
+            return false;
+        }
+
+        fetch = SessionRequestCodegen.ToFetch(session);
+        return true;
+    }
+    /// <summary>Builds a PowerShell request for the single selected session (tests / probe).</summary>
+    public bool TryBuildCopyAsPowerShell(out string text)
+    {
+        text = "";
+        var session = ResolveSingleCopySession();
+        if (session is null || !SessionRequestCodegen.CanGenerate(session))
+        {
+            return false;
+        }
+
+        text = SessionRequestCodegen.ToPowerShell(session);
+        return true;
+    }
+    /// <summary>Builds a Python requests call for the single selected session (tests / probe).</summary>
+    public bool TryBuildCopyAsPython(out string text)
+    {
+        text = "";
+        var session = ResolveSingleCopySession();
+        if (session is null || !SessionRequestCodegen.CanGenerate(session))
+        {
+            return false;
+        }
+
+        text = SessionRequestCodegen.ToPython(session);
+        return true;
+    }
+    /// <summary>Builds a spreadsheet table for the selection, or the visible rows when nothing is selected.</summary>
+    public bool TryBuildRowsAsTable(out string text, out int written, out bool truncated)
+    {
+        text = "";
+        written = 0;
+        truncated = false;
+        var rows = ResolveFilterSelection();
+        if (rows.Count == 0)
+        {
+            rows = Sessions.ToList();
+        }
+
+        if (rows.Count == 0)
+        {
+            return false;
+        }
+
+        text = SessionRequestCodegen.ToTable(rows, out written, out truncated);
+        return true;
+    }
+    private static async Task CopyTextToClipboardAsync(string text)
+    {
+        var window = TryGetMainWindow();
+        if (window?.Clipboard is { } clipboard)
+        {
+            await clipboard.SetTextAsync(text).ConfigureAwait(false);
+        }
+    }
+    private async Task FindRelatedAsync(string? kind)
+    {
+        var selection = ResolveFilterSelection();
+        if (selection.Count != 1 || string.IsNullOrEmpty(kind))
+        {
+            StatusText = "Select one session to find related rows";
+            return;
+        }
+
+        var seed = selection[0];
+        var all = _all.ToList();
+        var result = all.Count > 300
+            ? await Task.Run(() => ResolveRelation(kind, all, seed), StatusCancelToken).ConfigureAwait(true)
+            : ResolveRelation(kind, all, seed);
+        if (result.Ids.Length == 0)
+        {
+            StatusText = kind == "connection" && seed.ConnectionId <= 0
+                ? "This session has no connection id"
+                : "No related sessions";
+            return;
+        }
+
+        SearchQuery = SessionSearch.SetKeyedToken(
+            SearchQuery,
+            "ids",
+            string.Join(',', result.Ids));
+        StatusText = result.Capped
+            ? "Showing 500 related sessions (list was longer)"
+            : $"Showing {result.Ids.Length.ToString(System.Globalization.CultureInfo.InvariantCulture)} related sessions";
+    }
+
+    private static RelationResult ResolveRelation(string kind, List<SessionSnapshot> all, SessionSnapshot seed) =>
+        kind switch
+        {
+            "connection" => SessionRelations.SameConnection(all, seed),
+            "referer" => SessionRelations.SameReferer(all, seed),
+            "redirect" => SessionRelations.RedirectChain(all, seed),
+            _ => SessionRelations.SameUrl(all, seed),
+        };
+
+    private Task FilterByHostAsync()
+    {
+        var host = ResolveUnanimousFilterHost();
+        if (string.IsNullOrEmpty(host))
+        {
+            StatusText = "Filter by host needs one shared host in the selection";
+            return Task.CompletedTask;
+        }
+
+        SearchQuery = SessionSearch.SetKeyedToken(SearchQuery, "host", host);
+        StatusText = $"Filtered by host:{host}";
+        return Task.CompletedTask;
+    }
+    private Task FilterByStatusAsync()
+    {
+        var code = ResolveUnanimousStatus();
+        if (code is null)
+        {
+            StatusText = "Filter by status needs one shared status code in the selection";
+            return Task.CompletedTask;
+        }
+
+        SearchQuery = SessionSearch.SetKeyedToken(SearchQuery, "status", code.Value.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        StatusText = $"Filtered by status:{code.Value}";
+        return Task.CompletedTask;
+    }
+
+    /// <summary>Raised after a mark or comment changes so realized grid rows can restyle without a per-row binding.</summary>
+    public event EventHandler? SessionAnnotationsChanged;
+
+    private void SetMark(object? parameter)
+    {
+        var selection = ResolveFilterSelection();
+        if (selection.Count == 0)
+        {
+            StatusText = "Select a session first to mark it";
+            return;
+        }
+
+        var name = parameter as string;
+        var mark = string.IsNullOrEmpty(name) || name.Equals("None", StringComparison.OrdinalIgnoreCase)
+            ? SessionMark.None
+            : Enum.Parse<SessionMark>(name, ignoreCase: true);
+        foreach (var session in selection)
+        {
+            session.Mark = mark;
+        }
+
+        SessionAnnotationsChanged?.Invoke(this, EventArgs.Empty);
+        ApplyFilter();
+        StatusText = BuildMarkStatus(mark, selection.Count);
+    }
+
+    private static string BuildMarkStatus(SessionMark mark, int count)
+    {
+        if (mark == SessionMark.None)
+        {
+            return count == 1 ? "Mark cleared" : $"Mark cleared on {count} sessions";
+        }
+
+        var name = mark.ToString().ToLowerInvariant();
+        return count == 1 ? $"Marked {name}" : $"Marked {name} on {count} sessions";
+    }
+
+    private async Task CommentAsync()
+    {
+        var selection = ResolveFilterSelection();
+        if (selection.Count == 0)
+        {
+            StatusText = "Select a session first to comment";
+            return;
+        }
+
+        var current = selection.Count == 1 ? selection[0].Comment : null;
+        var text = await _dialogs.PromptCommentAsync(TryGetMainWindow(), current, SessionSnapshot.CommentMaxLength);
+        if (text is null)
+        {
+            return;
+        }
+
+        foreach (var session in selection)
+        {
+            session.Comment = text;
+        }
+
+        if (!string.IsNullOrEmpty(text))
+        {
+            // Comment column is off by default — show it so the note is visible in the grid.
+            SetGridColumnVisible("Comment", true);
+        }
+
+        SessionAnnotationsChanged?.Invoke(this, EventArgs.Empty);
+        ApplyFilter();
+        StatusText = BuildCommentStatus(text, selection.Count);
+    }
+
+    private static string BuildCommentStatus(string text, int count)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            return count == 1 ? "Comment cleared" : $"Comment cleared on {count} sessions";
+        }
+
+        return count == 1
+            ? "Comment saved — shown in the Comment column and on row hover"
+            : $"Comment saved on {count} sessions — Comment column shown";
+    }
+    private Task FilterByProcessAsync()
+    {
+        var process = ResolveUnanimousFilterProcess();
+        if (string.IsNullOrEmpty(process))
+        {
+            StatusText = "Filter by process needs one shared process in the selection";
+            return Task.CompletedTask;
+        }
+
+        SearchQuery = SessionSearch.SetKeyedToken(SearchQuery, "process", process);
+        StatusText = $"Filtered by process:{process}";
+        return Task.CompletedTask;
+    }
+    private Task HideHostAsync()
+    {
+        var host = ResolveUnanimousFilterHost();
+        if (string.IsNullOrEmpty(host))
+        {
+            StatusText = "Hide host needs one shared host in the selection";
+            return Task.CompletedTask;
+        }
+
+        SearchQuery = SessionSearch.AddToken(SearchQuery, "-host", host);
+        StatusText = $"Hidden host:{host} · Clear filters to show";
+        return Task.CompletedTask;
+    }
+    private Task HideProcessAsync()
+    {
+        var process = ResolveUnanimousFilterProcess();
+        if (string.IsNullOrEmpty(process))
+        {
+            StatusText = "Hide process needs one shared process in the selection";
+            return Task.CompletedTask;
+        }
+
+        // Search tokens cannot contain spaces, so "Google Chrome" becomes -process:Google, which also hides
+        // other names containing "Google". Hiding more than the user pointed at must not be silent.
+        var token = process.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)[0];
+        SearchQuery = SessionSearch.AddToken(SearchQuery, "-process", process);
+        StatusText = token.Length < process.Length
+            ? $"Hidden process:{token} (shortened at the space; also hides other names containing it) · Clear filters to show"
+            : $"Hidden process:{process} · Clear filters to show";
+        return Task.CompletedTask;
+    }
+    /// <summary>True when selection shares one non-empty host (single or multi-select).</summary>
+    public bool CanFilterByHost => ResolveUnanimousFilterHost() is not null;
+
+    /// <summary>True when selection shares one HTTP status code.</summary>
+    public bool CanFilterByStatus => ResolveUnanimousStatus() is not null;
+
+    /// <summary>True when the Filter submenu has at least one applicable action.</summary>
+    public bool CanFilterSessionMenu =>
+        CanFilterByHost || CanFilterByStatus || CanFilterByProcess || CanExcludeHost;
+
+    /// <summary>True when at least one session is selected.</summary>
+    public bool HasSelectedSessions => ResolveFilterSelection().Count > 0;
+    /// <summary>True when exactly one session is selected (Replay / Composer / save body).</summary>
+    public bool HasSingleSelectedSession => ResolveFilterSelection().Count == 1;
+    /// <summary>True when at least one selected session has a URL to copy (multi-select OK).</summary>
+    public bool CanCopyUrl => ResolveCopyUrls().Count > 0;
+    /// <summary>True when exactly two sessions are selected for Session Diff.</summary>
+    public bool CanDiffSessions => ResolveFilterSelection().Count == 2;
+    private string? ResolveUnanimousFilterHost()
+    {
+        var selection = ResolveFilterSelection();
+        if (selection.Count == 0)
+        {
+            return null;
+        }
+
+        string? host = null;
+        foreach (var session in selection)
+        {
+            var value = ResolveSessionHost(session);
+            if (string.IsNullOrEmpty(value))
+            {
+                return null;
+            }
+
+            if (host is null)
+            {
+                host = value;
+            }
+            else if (!host.Equals(value, StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
+        }
+
+        return host;
+    }
+    private int? ResolveUnanimousStatus()
+    {
+        var selection = ResolveFilterSelection();
+        if (selection.Count == 0)
+        {
+            return null;
+        }
+
+        if (selection.Any(s => s.StatusCode is not (>= 100 and <= 599)))
+        {
+            return null;
+        }
+
+        var codes = selection.Select(s => s.StatusCode).Distinct().ToList();
+        return codes.Count == 1 ? codes[0] : null;
+    }
+    private string? ResolveUnanimousFilterProcess()
+    {
+        var selection = ResolveFilterSelection();
+        if (selection.Count == 0)
+        {
+            return null;
+        }
+
+        string? process = null;
+        foreach (var session in selection)
+        {
+            var value = ResolveSessionProcess(session);
+            if (string.IsNullOrEmpty(value))
+            {
+                return null;
+            }
+
+            if (process is null)
+            {
+                process = value;
+            }
+            else if (!process.Equals(value, StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
+        }
+
+        return process;
+    }
+    private IReadOnlyList<SessionSnapshot> ResolveFilterSelection()
+    {
+        if (_selectedSessions.Count > 0)
+        {
+            return _selectedSessions;
+        }
+
+        return SelectedSession is null
+            ? Array.Empty<SessionSnapshot>()
+            : new List<SessionSnapshot> { SelectedSession };
+    }
+    private static string? ResolveSessionHost(SessionSnapshot session)
+    {
+        if (!string.IsNullOrWhiteSpace(session.Host))
+        {
+            return session.Host.Trim();
+        }
+
+        return Uri.TryCreate(session.Url, UriKind.Absolute, out var uri) && !string.IsNullOrEmpty(uri.Host)
+            ? uri.Host
+            : null;
+    }
+    private static string? ResolveSessionProcess(SessionSnapshot session)
+    {
+        if (!string.IsNullOrWhiteSpace(session.ProcessName))
+        {
+            return session.ProcessName.Trim();
+        }
+
+        return session.ProcessId > 0 ? session.ProcessId.ToString() : null;
+    }
+    private void NotifyFilterSelectionProperties()
+    {
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(CanFilterByHost)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(CanFilterByStatus)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(CanExcludeHost)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(CanFilterByProcess)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(CanFilterSessionMenu)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(HasSelectedSessions)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(HasSingleSelectedSession)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(CanCopyUrl)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(CanCopyAsCurl)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(CanCopyAsTable)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(CanCopySessionMenu)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(CanSaveRawHttp)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(CanSaveRequestBody)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(CanSaveResponseBody)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(CanSaveSessionMenu)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(CanDiffSessions)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(CanKeepOnlySelected)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(CanRemoveMatchingFilter)));
+        RaiseSessionCommandCanExecuteChanged();
+    }
+    private void RaiseSessionCommandCanExecuteChanged()
+    {
+        _clearSessionsCommand.RaiseCanExecuteChanged();
+        _removeSelectedSessionsCommand.RaiseCanExecuteChanged();
+        _keepOnlySelectedCommand.RaiseCanExecuteChanged();
+        _removeMatchingCommand.RaiseCanExecuteChanged();
+        _exportSelectedHarCommand.RaiseCanExecuteChanged();
+        _exportSelectedArchiveCommand.RaiseCanExecuteChanged();
+        _copyAsCurlCommand.RaiseCanExecuteChanged();
+        _copyAsFetchCommand.RaiseCanExecuteChanged();
+        _copyAsPowerShellCommand.RaiseCanExecuteChanged();
+        _copyAsPythonCommand.RaiseCanExecuteChanged();
+        _copyAsTableCommand.RaiseCanExecuteChanged();
+        _saveRawHttpCommand.RaiseCanExecuteChanged();
+        _diffSessionsCommand.RaiseCanExecuteChanged();
+    }
+    private List<string> ResolveCopyUrls() =>
+        ResolveFilterSelection()
+            .Where(snap => !string.IsNullOrEmpty(snap.Url))
+            .Select(snap => snap.Url)
+            .ToList();
+    private Task AddAutoResponderRuleAsync()
+    {
+        if (!TryGetAutoResponderStatus(out var status))
+        {
+            return Task.CompletedTask;
+        }
+
+        if (string.IsNullOrWhiteSpace(AutoResponderLocalFilePath)
+            && AutoResponderBody.Length > InspectorBodyLimits.MaxInlineToolBodyChars)
+        {
+            SetGuardStatus("Inline AutoResponder body is too large — use Map Local for larger bodies");
+            return Task.CompletedTask;
+        }
+
+        AutoResponder.AddRule(new AutoResponderRule
+        {
+            MatchUrl = AutoResponderMatch,
+            StatusCode = status,
+            Body = AutoResponderBody,
+            ContentType = AutoResponderContentType,
+            LocalFilePath = AutoResponderLocalFilePath,
+            GraphQlOperationName = AutoResponderGraphQlOperation,
+            Enabled = true,
+        });
+        PersistAutoResponder();
+        StatusText = $"AutoResponder rule added ({AutoResponder.Rules.Count} total)";
+        return Task.CompletedTask;
+    }
+    private Task DeleteAutoResponderRuleAsync()
+    {
+        if (AutoResponder.SelectedRule is null)
+        {
+            StatusText = "Select an AutoResponder rule to delete";
+            return Task.CompletedTask;
+        }
+
+        AutoResponder.RemoveRule(AutoResponder.SelectedRule);
+        AutoResponder.SelectedRule = null;
+        PersistAutoResponder();
+        StatusText = "AutoResponder rule deleted";
+        return Task.CompletedTask;
+    }
+    private Task UpdateAutoResponderRuleAsync()
+    {
+        if (AutoResponder.SelectedRule is null)
+        {
+            StatusText = "Select an AutoResponder rule to update";
+            return Task.CompletedTask;
+        }
+
+        if (!TryGetAutoResponderStatus(out var status))
+        {
+            return Task.CompletedTask;
+        }
+
+        if (string.IsNullOrWhiteSpace(AutoResponderLocalFilePath)
+            && AutoResponderBody.Length > InspectorBodyLimits.MaxInlineToolBodyChars)
+        {
+            SetGuardStatus("Inline AutoResponder body is too large — use Map Local for larger bodies");
+            return Task.CompletedTask;
+        }
+
+        var rule = AutoResponder.SelectedRule;
+        rule.MatchUrl = AutoResponderMatch;
+        rule.StatusCode = status;
+        rule.Body = AutoResponderBody;
+        rule.ContentType = AutoResponderContentType;
+        rule.LocalFilePath = AutoResponderLocalFilePath;
+        rule.GraphQlOperationName = AutoResponderGraphQlOperation;
+        PersistAutoResponder();
+        StatusText = "AutoResponder rule updated";
+        return Task.CompletedTask;
+    }
+
+    private bool TryGetAutoResponderStatus(out int status)
+    {
+        if (TryParseHttpStatus(AutoResponderStatusText, out status))
+        {
+            AutoResponderStatus = status;
+            return true;
+        }
+
+        SetOutcomeStatus(InvalidHttpStatusMessage(AutoResponderStatusText), StatusSeverity.Error, toastImportant: true);
+        status = 0;
+        return false;
+    }
+    private async Task BrowseAutoResponderLocalFileAsync()
+    {
+        var path = await _pathPicker.PickOpenPathAsync(
+            "Map Local — choose response file",
+            "All files",
+            "*.*").ConfigureAwait(true);
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return;
+        }
+
+        AutoResponderLocalFilePath = path;
+        StatusText = $"Map Local file: {path}";
+    }
+    private Task AddMapRemoteRuleAsync()
+    {
+        MapRemote.AddRule(new MapRemoteRule
+        {
+            MatchUrl = MapRemoteMatch,
+            TargetUrl = MapRemoteTarget,
+            GraphQlOperationName = MapRemoteGraphQlOperation,
+            Enabled = true,
+        });
+        PersistMapRemote();
+        StatusText = $"Map Remote rule added ({MapRemote.Rules.Count} total)";
+        return Task.CompletedTask;
+    }
+    private Task DeleteMapRemoteRuleAsync()
+    {
+        if (MapRemote.SelectedRule is null)
+        {
+            StatusText = "Select a Map Remote rule to delete";
+            return Task.CompletedTask;
+        }
+
+        MapRemote.RemoveRule(MapRemote.SelectedRule);
+        MapRemote.SelectedRule = null;
+        PersistMapRemote();
+        StatusText = "Map Remote rule deleted";
+        return Task.CompletedTask;
+    }
+    private Task UpdateMapRemoteRuleAsync()
+    {
+        if (MapRemote.SelectedRule is null)
+        {
+            StatusText = "Select a Map Remote rule to update";
+            return Task.CompletedTask;
+        }
+
+        var rule = MapRemote.SelectedRule;
+        rule.MatchUrl = MapRemoteMatch;
+        rule.TargetUrl = MapRemoteTarget;
+        rule.GraphQlOperationName = MapRemoteGraphQlOperation;
+        PersistMapRemote();
+        StatusText = "Map Remote rule updated";
+        return Task.CompletedTask;
+    }
+    private void OnSessionsBatchAdded(List<SessionSnapshot> batch)
+    {
+        if (batch.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var snapshot in batch)
+        {
+            _store.Add(snapshot);
+            NoteSessionMethod(snapshot.Method);
+        }
+
+        if (SessionSearch.HasBodyToken(SearchQuery))
+        {
+            // HAR body reads stay off the UI thread and coalesce while capture is hot.
+            RunBodyFilter();
+            RefreshSessionCountText();
+            return;
+        }
+
+        // SessionUpdated may have raced ahead of this batched capture add and already
+        // inserted the row; never append the same snapshot twice.
+        foreach (var snapshot in batch.Where(snapshot =>
+                     SessionSearch.Matches(snapshot, SearchQuery, bodyMatcher: null) &&
+                     Sessions.IndexOf(snapshot) < 0))
+        {
+            Sessions.Add(snapshot);
+        }
+
+        RefreshSessionCountText();
+    }
+
+    private void OnSessionAddedToFilter(SessionSnapshot snapshot)
+    {
+        NoteSessionMethod(snapshot.Method);
+        if (SessionSearch.HasBodyToken(SearchQuery))
+        {
+            RunBodyFilter();
+            return;
+        }
+
+        // Store already holds the row — append to the filtered grid in place.
+        if (SessionSearch.Matches(snapshot, SearchQuery, bodyMatcher: null) &&
+            Sessions.IndexOf(snapshot) < 0)
+        {
+            Sessions.Add(snapshot);
+        }
+
+        RefreshSessionCountText();
+    }
+
+    /// <summary>
+    /// Re-evaluate filter membership when status/content-type/etc. arrive after the row was added.
+    /// Avoids a full <see cref="ApplyFilter"/> rebuild on every SSE tee chunk.
+    /// </summary>
+    private void OnSessionUpdatedForFilter(SessionSnapshot snapshot)
+    {
+        NoteSessionMethod(snapshot.Method);
+        // Capture is batched (~50ms). CONNECT/response updates can reach the UI first.
+        // Do not invent a grid row until the store owns the session — otherwise the later
+        // batch add would duplicate it.
+        if (_store.TryGet(snapshot.Id) is null)
+        {
+            return;
+        }
+
+        if (SessionSearch.HasBodyToken(SearchQuery))
+        {
+            RunBodyFilter();
+            return;
+        }
+
+        var matches = SessionSearch.Matches(snapshot, SearchQuery, bodyMatcher: null);
+        var index = Sessions.IndexOf(snapshot);
+        if (matches)
+        {
+            if (index < 0)
+            {
+                Sessions.Add(snapshot);
+                RefreshSessionCountText();
+            }
+        }
+        else if (index >= 0)
+        {
+            RunWithGridEchoSuppress(() =>
+            {
+                if (ReferenceEquals(SelectedSession, snapshot))
+                {
+                    ClearSelectionRemovedByFilter();
+                }
+
+                Sessions.RemoveAt(index);
+            });
+            RefreshSessionCountText();
+        }
+    }
+
+    private void OnSessionsRemoved(IReadOnlyList<SessionSnapshot> removed)
+    {
+        if (removed.Count == 0)
+        {
+            return;
+        }
+
+        var ids = removed.Select(s => s.Id).ToHashSet();
+        // Clear selection before removing rows — otherwise Avalonia DataGrid selects a
+        // neighbor and SelectedSession reopens the details pane.
+        _selectedSessions.RemoveAll(s => ids.Contains(s.Id));
+        if (SelectedSession is not null && ids.Contains(SelectedSession.Id))
+        {
+            SelectedSession = null;
+            ShowSessionDetails = false;
+        }
+
+        _suppressOpenSessionDetails = true;
+        try
+        {
+            RemoveVisibleByIds(ids);
+        }
+        finally
+        {
+            _suppressOpenSessionDetails = false;
+        }
+
+        SyncViewsToTrackedSessions(ids);
+
+        if (_userRemovalDepth > 0)
+        {
+            RefreshSessionCountText();
+            return;
+        }
+
+        _retentionEvictedTotal += removed.Count;
+        RefreshSessionCountText();
+    }
+
+    /// <summary>
+    /// Retention eviction and manual delete (one row, a selection, or Clear) share one store.
+    /// Statistics, Session Diff, and an <c>ids:</c> filter have to drop those same sessions.
+    /// Pass null when every tracked session is gone.
+    /// </summary>
+    private void SyncViewsToTrackedSessions(HashSet<long>? removedIds)
+    {
+        if (!string.IsNullOrEmpty(_sessionDiffText) &&
+            (removedIds is null || removedIds.Contains(_diffLeftId) || removedIds.Contains(_diffRightId)))
+        {
+            _diffLeftId = 0;
+            _diffRightId = 0;
+            SessionDiffText = "";
+        }
+
+        RefreshStatisticsIfVisible();
+
+        var next = SessionSearch.PruneRemovedIds(SearchQuery, removedIds);
+        if (!string.Equals(next, SearchQuery, StringComparison.Ordinal))
+        {
+            SearchQuery = next;
+        }
+    }
+    private async Task LoadSelectedBodiesAsync(SessionSnapshot snap)
+    {
+        try
+        {
+            await _store.EnsureBodiesLoadedAsync(snap, _statusRevertCts?.Token ?? CancellationToken.None).ConfigureAwait(false);
+            await MarshalToUiAsync(() =>
+            {
+                if (ReferenceEquals(_selected, snap))
+                {
+                    RefreshSelectedInspectors();
+                }
+            }, StatusCancelToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            await MarshalToUiAsync(() =>
+            {
+                if (ReferenceEquals(_selected, snap))
+                {
+                    RefreshSelectedInspectors();
+                }
+            }, StatusCancelToken).ConfigureAwait(false);
+        }
+    }
+    private void RefreshSessionCountText()
+    {
+        SessionCountText = SessionSearch.BuildSessionCountText(
+            Sessions.Count,
+            _all.Count,
+            SearchQuery,
+            _retentionEvictedTotal,
+            _store.OldestStartedUtc);
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(HasSessions)));
+        RaiseSessionCommandCanExecuteChanged();
+    }
+    private void NotifyQuickFilterProperties()
+    {
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(HideTunnelsFilter)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(HideImagesFilter)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(ErrorsOnlyFilter)));
+        NotifyStatusChrome(resetFreeText: !_statusWrite);
+        SyncMethodRows();
+    }
+
+    /// <summary>Hosts hidden from the list (<c>-host:</c>), in query order. Display only.</summary>
+    public ObservableCollection<string> HiddenHostChips { get; } = new();
+
+    /// <summary>Processes hidden from the list (<c>-process:</c>), in query order. Display only.</summary>
+    public ObservableCollection<string> HiddenProcessChips { get; } = new();
+
+    /// <summary>True when at least one hide-host or hide-process chip should show.</summary>
+    public bool HasHiddenChips =>
+        HiddenHostChips.Count > 0 || HiddenProcessChips.Count > 0;
+
+    private string _relatedChipText = "";
+
+    /// <summary>Shown while an <c>ids:</c> token is active. The set is the moment Find related ran.</summary>
+    public string RelatedChipText => _relatedChipText;
+
+    public bool HasRelatedChip => _relatedChipText.Length > 0;
+
+    public bool HasFilterChips => HasHiddenChips || HasRelatedChip;
+
+    /// <summary>True when both host and process chips are present, so each chip shows its prefix.</summary>
+    public bool ShowProcessChipPrefix =>
+        HiddenHostChips.Count > 0 && HiddenProcessChips.Count > 0;
+
+    private void RefreshHiddenChips()
+    {
+        CollectHiddenChipValues(SearchQuery, out var hosts, out var processes);
+        ReplaceChipList(HiddenHostChips, hosts);
+        ReplaceChipList(HiddenProcessChips, processes);
+        var related = RelatedChipTextFromQuery(SearchQuery);
+
+        if (!string.Equals(_relatedChipText, related, StringComparison.Ordinal))
+        {
+            _relatedChipText = related;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(RelatedChipText)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(HasRelatedChip)));
+        }
+
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(HasHiddenChips)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(HasFilterChips)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(ShowProcessChipPrefix)));
+    }
+
+    private static void CollectHiddenChipValues(string query, out List<string> hosts, out List<string> processes)
+    {
+        hosts = [];
+        processes = [];
+        foreach (var token in SessionSearch.GetTokens(query))
+        {
+            if (token.Key == "-host")
+            {
+                hosts.Add(token.Value);
+            }
+            else if (token.Key == "-process")
+            {
+                processes.Add(token.Value);
+            }
+        }
+    }
+
+    private static string RelatedChipTextFromQuery(string query)
+    {
+        foreach (var token in SessionSearch.GetTokens(query))
+        {
+            if (token.Key != "ids")
+            {
+                continue;
+            }
+
+            var count = 0;
+            foreach (var part in token.Value.Split(','))
+            {
+                if (long.TryParse(part, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out _))
+                {
+                    count++;
+                }
+            }
+
+            if (count > 0)
+            {
+                return LanguageService.Format("filter.relatedChip", count);
+            }
+        }
+
+        return "";
+    }
+
+    private static void ReplaceChipList(ObservableCollection<string> chips, List<string> next)
+    {
+        if (chips.Count == next.Count)
+        {
+            var same = true;
+            for (var i = 0; i < next.Count; i++)
+            {
+                if (!string.Equals(chips[i], next[i], StringComparison.Ordinal))
+                {
+                    same = false;
+                    break;
+                }
+            }
+
+            if (same)
+            {
+                return;
+            }
+        }
+
+        chips.Clear();
+        foreach (var value in next)
+        {
+            chips.Add(value);
+        }
+    }
+
+    private Task RemoveHiddenHostAsync(object? parameter)
+    {
+        if (parameter is string host && !string.IsNullOrWhiteSpace(host))
+        {
+            SearchQuery = SessionSearch.RemoveToken(SearchQuery, "-host", host);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private Task RemoveHiddenProcessAsync(object? parameter)
+    {
+        if (parameter is string process && !string.IsNullOrWhiteSpace(process))
+        {
+            SearchQuery = SessionSearch.RemoveToken(SearchQuery, "-process", process);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private async Task OpenFiltersAsync()
+    {
+        var owner = TryGetMainWindow();
+        if (owner is null)
+        {
+            StatusText = "Advanced requires the main window";
+            return;
+        }
+
+        var applied = await SearchFiltersWindow.ShowAsync(owner, SearchQuery).ConfigureAwait(true);
+        if (applied is null)
+        {
+            return;
+        }
+
+        SearchQuery = applied;
+        StatusText = HasHiddenChips
+            ? "Advanced applied · Clear filters to show hidden rows"
+            : "Advanced applied";
+    }
+    private void ApplyFilter()
+    {
+        if (SessionSearch.HasBodyToken(SearchQuery))
+        {
+            RunBodyFilter();
+            return;
+        }
+
+        CancelBodyFilter();
+        RunWithGridEchoSuppress(() =>
+        {
+            var previouslySelected = SelectedSession;
+            var detailsWereOpen = ShowSessionDetails;
+            var matched = SessionSearch.Filter(_all, SearchQuery, bodyMatcher: null).ToList();
+            ReplaceVisibleSessions(matched);
+            RestoreSelectionAfterFilter(previouslySelected, detailsWereOpen);
+        });
+    }
+
+    private void ReplaceVisibleSessions(IReadOnlyList<SessionSnapshot> matched)
+    {
+        if (Sessions is SessionListCollection list)
+        {
+            list.ReplaceAll(matched);
+            return;
+        }
+
+        Sessions.Clear();
+        foreach (var s in matched)
+        {
+            Sessions.Add(s);
+        }
+    }
+
+    private void RestoreSelectionAfterFilter(SessionSnapshot? previouslySelected, bool detailsWereOpen)
+    {
+        // Restore single selection used by the detail pane when the row still matches the filter.
+        // Do not force the pane open — the user may have closed it, and a grid reset can
+        // briefly null SelectedSession via the DataGrid binding.
+        if (previouslySelected is not null && Sessions.Contains(previouslySelected))
+        {
+            if (!ReferenceEquals(_selected, previouslySelected))
+            {
+                _suppressOpenSessionDetails = true;
+                try
+                {
+                    SelectedSession = previouslySelected;
+                }
+                finally
+                {
+                    _suppressOpenSessionDetails = false;
+                }
+            }
+
+            ShowSessionDetails = detailsWereOpen;
+        }
+        else if (previouslySelected is not null)
+        {
+            ClearSelectionRemovedByFilter();
+        }
+    }
+
+    private void RemoveVisibleByIds(HashSet<long> ids)
+    {
+        if (ids.Count == 0 || Sessions.Count == 0)
+        {
+            return;
+        }
+
+        var removeCount = Sessions.Count(session => ids.Contains(session.Id));
+        if (removeCount == 0)
+        {
+            return;
+        }
+
+        if (removeCount == Sessions.Count)
+        {
+            Sessions.Clear();
+            return;
+        }
+
+        if (removeCount >= BulkGridEditThreshold && removeCount * 2 >= Sessions.Count)
+        {
+            ReplaceVisibleSessions(Sessions.Where(session => !ids.Contains(session.Id)).ToList());
+            return;
+        }
+
+        for (var i = Sessions.Count - 1; i >= 0; i--)
+        {
+            if (ids.Contains(Sessions[i].Id))
+            {
+                Sessions.RemoveAt(i);
+            }
+        }
+    }
+
+    private void CancelBodyFilter()
+    {
+        _bodyFilterGeneration++;
+        _bodyFilterCts?.Cancel();
+        _bodyFilterCts?.Dispose();
+        _bodyFilterCts = null;
+    }
+
+    private void RunBodyFilter()
+    {
+        _bodyFilterCts?.Cancel();
+        _bodyFilterCts?.Dispose();
+        _bodyFilterCts = new CancellationTokenSource();
+        var token = _bodyFilterCts.Token;
+        var generation = ++_bodyFilterGeneration;
+        var query = SearchQuery;
+        var sessions = _all.ToList();
+        var previouslySelected = SelectedSession;
+        var detailsWereOpen = ShowSessionDetails;
+
+        List<SessionSnapshot> Match()
+        {
+            LastBodyFilterThreadId = Environment.CurrentManagedThreadId;
+            return SessionSearch.Filter(
+                sessions,
+                query,
+                (snapshot, needle) => _store.TryMatchBodySearch(snapshot, needle)).ToList();
+        }
+
+        void Apply(List<SessionSnapshot> matched)
+        {
+            if (generation != _bodyFilterGeneration || token.IsCancellationRequested)
+            {
+                return;
+            }
+
+            RunWithGridEchoSuppress(() =>
+            {
+                ReplaceVisibleSessions(matched);
+                RestoreSelectionAfterFilter(previouslySelected, detailsWereOpen);
+            });
+            RefreshSessionCountText();
+            if (StatusText == SearchingBodiesStatus)
+            {
+                StatusText = StatusReady;
+            }
+        }
+
+        // Unit tests have no dispatcher. Match on a dedicated thread (the test thread-pool can
+        // inline Task.Run onto the caller) and apply before returning. The live UI debounces.
+        if (Application.Current is null)
+        {
+            var matched = RunOnBackgroundThread(Match);
+            Apply(matched);
+            return;
+        }
+
+        StatusText = SearchingBodiesStatus;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(200, token).ConfigureAwait(false);
+                var matched = Match();
+                await MarshalToUiAsync(() => Apply(matched), token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // A newer query replaced this scan.
+            }
+        }, token);
+    }
+    private async Task ExportHarAsync()
+    {
+        if (_all.Count == 0)
+        {
+            SetGuardStatus("No sessions to export");
+            return;
+        }
+
+        var path = await _pathPicker.PickSavePathAsync("Export all HAR", "titanium-inspector.har", "HAR", "*.har");
+        if (path is null)
+        {
+            SetTransientStatus("Export HAR cancelled", StatusSeverity.Neutral, revertMs: GuardStatusRevertMs);
+            return;
+        }
+
+        try
+        {
+            var sessions = _all.ToList();
+            await ExportSessionsOffUiAsync(
+                sessions,
+                "Exporting HAR…",
+                list => SessionArchive.ExportHarAsync(list, path, StatusCancelToken),
+                $"Exported {sessions.Count} sessions to {path}").ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            ReportExportFailure("Export HAR failed: " + Truncate(ex.Message, 160));
+        }
+    }
+    private async Task ExportSelectedHarAsync()
+    {
+        var sessions = ResolveExportSelection();
+        if (sessions.Count == 0)
+        {
+            SetGuardStatus("Select a session to export");
+            return;
+        }
+
+        var path = await _pathPicker.PickSavePathAsync("Export selected HAR", "titanium-inspector.har", "HAR", "*.har");
+        if (path is null)
+        {
+            SetTransientStatus("Export HAR cancelled", StatusSeverity.Neutral, revertMs: GuardStatusRevertMs);
+            return;
+        }
+
+        try
+        {
+            await ExportSessionsOffUiAsync(
+                sessions,
+                "Exporting HAR…",
+                list => SessionArchive.ExportHarAsync(list, path, StatusCancelToken),
+                $"Exported {sessions.Count} sessions to {path}").ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            ReportExportFailure("Export HAR failed: " + Truncate(ex.Message, 160));
+        }
+    }
+    private async Task ImportHarAsync()
+    {
+        var paths = await _pathPicker.PickOpenPathsAsync("Import HAR", "HAR", "*.har", ZipFileFilter);
+        if (paths.Count == 0)
+        {
+            SetGuardStatus("No .har or archive to import");
+            return;
+        }
+
+        SetStatus("Importing…", StatusSeverity.Busy);
+        var token = StatusCancelToken;
+        var imported = await ReadImportedSessionsAsync(paths, token).ConfigureAwait(false);
+        var label = paths.Count == 1
+            ? Path.GetFileName(paths[0])
+            : $"{paths.Count} files";
+        var count = imported.Count;
+        QueueLiveUi(() =>
+        {
+            AppendImportedSessions(imported);
+            RefreshSessionCountText();
+            PresentOutcome($"Appended {count} sessions from {label}", StatusSeverity.Success);
+        });
+    }
+    private async Task ExportArchiveAsync()
+    {
+        if (_all.Count == 0)
+        {
+            SetGuardStatus("No sessions to export");
+            return;
+        }
+
+        var path = await _pathPicker.PickSavePathAsync("Export all archive", "titanium-inspector.zip", "ZIP", ZipFileFilter);
+        if (path is null)
+        {
+            SetTransientStatus("Export archive cancelled", StatusSeverity.Neutral, revertMs: GuardStatusRevertMs);
+            return;
+        }
+
+        try
+        {
+            var sessions = _all.ToList();
+            await ExportSessionsOffUiAsync(
+                sessions,
+                "Exporting archive…",
+                list => SessionArchive.ExportNativeArchiveAsync(list, path, StatusCancelToken),
+                $"Exported {sessions.Count} sessions to {path}").ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            ReportExportFailure("Export archive failed: " + Truncate(ex.Message, 160));
+        }
+    }
+    private async Task ExportSelectedArchiveAsync()
+    {
+        var sessions = ResolveExportSelection();
+        if (sessions.Count == 0)
+        {
+            SetGuardStatus("Select a session to export");
+            return;
+        }
+
+        var path = await _pathPicker.PickSavePathAsync("Export selected archive", "titanium-inspector.zip", "ZIP", ZipFileFilter);
+        if (path is null)
+        {
+            SetTransientStatus("Export archive cancelled", StatusSeverity.Neutral, revertMs: GuardStatusRevertMs);
+            return;
+        }
+
+        try
+        {
+            await ExportSessionsOffUiAsync(
+                sessions,
+                "Exporting archive…",
+                list => SessionArchive.ExportNativeArchiveAsync(list, path, StatusCancelToken),
+                $"Exported {sessions.Count} sessions to {path}").ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            ReportExportFailure("Export archive failed: " + Truncate(ex.Message, 160));
+        }
+    }
+    private async Task ImportArchiveAsync()
+    {
+        var path = await _pathPicker.PickOpenPathAsync("Import archive", "ZIP", ZipFileFilter);
+        if (path is null)
+        {
+            SetGuardStatus("No titanium-inspector archive to import");
+            return;
+        }
+
+        SetStatus("Importing archive…", StatusSeverity.Busy);
+        try
+        {
+            var token = StatusCancelToken;
+            var imported = await ReadImportedSessionsAsync([path], token).ConfigureAwait(false);
+            var fileName = Path.GetFileName(path);
+            var count = imported.Count;
+            QueueLiveUi(() =>
+            {
+                AppendImportedSessions(imported);
+                RefreshSessionCountText();
+                PresentOutcome($"Appended {count} sessions from {fileName}", StatusSeverity.Success);
+            });
+        }
+        catch (Exception ex)
+        {
+            ReportExportFailure("Import archive failed: " + Truncate(ex.Message, 160));
+        }
+    }
+    private void ReportExportFailure(string message) =>
+        QueueLiveUi(() => PresentOutcome(message, StatusSeverity.Error));
+
+    /// <summary>
+    /// Headless <c>Dispatch</c> starts with <c>ResetForUnitTests</c>, which runs queued jobs
+    /// before <c>IGlobalClock</c> exists. <c>WindowNotificationManager.Show</c> is async void:
+    /// its card post then throws, and the later <c>Close</c> resumes on the thread pool.
+    /// Stash the outcome and present it on the next live dispatcher turn.
+    /// </summary>
+    private int _seenAvaloniaApp;
+    private int _hasDeferredUi;
+    private readonly object _deferredUiGate = new();
+    private Action? _deferredUi;
+
+    private void NoteAvaloniaApp()
+    {
+        if (Application.Current is not null)
+        {
+            Volatile.Write(ref _seenAvaloniaApp, 1);
+        }
+    }
+
+    private bool RunsWithoutAvaloniaApp =>
+        Application.Current is null && Volatile.Read(ref _seenAvaloniaApp) == 0;
+
+    private bool IsLiveDispatcherTurn()
+    {
+        NoteAvaloniaApp();
+        // ResetForUnitTests runs while the new locator scope is empty, so Current is null.
+        // A live Dispatch action runs after SetupUnsafe.
+        return Application.Current is not null && Dispatcher.UIThread.CheckAccess();
+    }
+
+    /// <summary>
+    /// Apply export/import UI updates that were queued off the dispatcher.
+    /// Headless pumps call this after the application services exist.
+    /// </summary>
+    public void FlushDeferredInspectorUi()
+    {
+        if (!IsLiveDispatcherTurn())
+        {
+            return;
+        }
+
+        Action? pending;
+        lock (_deferredUiGate)
+        {
+            pending = _deferredUi;
+            _deferredUi = null;
+            Volatile.Write(ref _hasDeferredUi, 0);
+        }
+
+        pending?.Invoke();
+    }
+
+    internal void QueueLiveUi(Action action)
+    {
+        if (IsLiveDispatcherTurn())
+        {
+            FlushDeferredInspectorUi();
+            action();
+            return;
+        }
+
+        if (RunsWithoutAvaloniaApp)
+        {
+            action();
+            return;
+        }
+
+        lock (_deferredUiGate)
+        {
+            var previous = _deferredUi;
+            _deferredUi = previous is null
+                ? action
+                : () =>
+                {
+                    previous();
+                    action();
+                };
+            Volatile.Write(ref _hasDeferredUi, 1);
+        }
+
+        // Production loop drains this. A headless reset may run it with no clock;
+        // Flush then returns and the next live turn presents the outcome.
+        if (Application.Current is not null && !Dispatcher.UIThread.CheckAccess())
+        {
+            Dispatcher.UIThread.Post(FlushDeferredInspectorUi);
+        }
+    }
+
+    private void PresentOutcome(string text, StatusSeverity severity)
+    {
+        // Show() is async void and awaits a delay before Close. With no sync context that
+        // Close runs on the thread pool and aborts the headless host. Skip the toast then;
+        // the status bar text is what the UI tests observe.
+        var toast = SynchronizationContext.Current is not null;
+        SetOutcomeStatus(text, severity, toastImportant: toast);
+        if (!toast || Application.Current is null || !Dispatcher.UIThread.CheckAccess())
+        {
+            return;
+        }
+
+        // Show() posts the card. Drain it before this dispatch resets the dispatcher,
+        // while IGlobalClock is still registered.
+        Dispatcher.UIThread.RunJobs();
+    }
+
+    private async Task ExportSessionsOffUiAsync(
+        IReadOnlyList<SessionSnapshot> sessions,
+        string busyText,
+        Func<IReadOnlyList<SessionSnapshot>, Task> write,
+        string successText)
+    {
+        NoteAvaloniaApp();
+        SetStatus(busyText, StatusSeverity.Busy);
+        var token = StatusCancelToken;
+        void Write()
+        {
+            LastExportThreadId = Environment.CurrentManagedThreadId;
+            _store.WithBodiesForExportAsync(sessions, write, token).GetAwaiter().GetResult();
+        }
+
+        if (RunsWithoutAvaloniaApp)
+        {
+            // Unit tests have no dispatcher. Finish before the command returns.
+            RunOnBackgroundThread(Write);
+            PresentOutcome(successText, StatusSeverity.Success);
+            return;
+        }
+
+        await Task.Run(Write, token).ConfigureAwait(false);
+        QueueLiveUi(() => PresentOutcome(successText, StatusSeverity.Success));
+    }
+
+    private async Task<List<SessionSnapshot>> ReadImportedSessionsAsync(
+        IReadOnlyList<string> paths,
+        CancellationToken token)
+    {
+        NoteAvaloniaApp();
+        List<SessionSnapshot> Read()
+        {
+            var list = new List<SessionSnapshot>();
+            foreach (var path in paths)
+            {
+                token.ThrowIfCancellationRequested();
+                if (path.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
+                {
+                    list.AddRange(SessionArchive.ImportNativeArchiveAsync(path, token).GetAwaiter().GetResult());
+                }
+                else
+                {
+                    list.AddRange(SessionArchive.ImportHarAsync(path, token).GetAwaiter().GetResult());
+                }
+            }
+
+            return list;
+        }
+
+        if (RunsWithoutAvaloniaApp)
+        {
+            return RunOnBackgroundThread<List<SessionSnapshot>>(Read);
+        }
+
+        return await Task.Run(Read, token).ConfigureAwait(false);
+    }
+
+    private static T RunOnBackgroundThread<T>(Func<T> work)
+    {
+        T? result = default;
+        Exception? error = null;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                result = work();
+            }
+            catch (Exception ex)
+            {
+                error = ex;
+            }
+        })
+        {
+            IsBackground = true,
+        };
+        thread.Start();
+        thread.Join();
+        if (error is not null)
+        {
+            throw error;
+        }
+
+        return result!;
+    }
+
+    private static void RunOnBackgroundThread(Action work) =>
+        RunOnBackgroundThread(() =>
+        {
+            work();
+            return true;
+        });
+
+    private void AppendImportedSessions(List<SessionSnapshot> imported)
+    {
+        _store.AddMany(imported);
+        ApplyFilter();
+    }
+
+    private IReadOnlyList<SessionSnapshot> ResolveExportSelection()
+    {
+        if (_selectedSessions.Count > 0)
+        {
+            return _selectedSessions.ToList();
+        }
+
+        return SelectedSession is null
+            ? Array.Empty<SessionSnapshot>()
+            : new List<SessionSnapshot> { SelectedSession };
+    }
+}

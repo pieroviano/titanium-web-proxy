@@ -5,22 +5,12 @@ namespace Titanium.Web.Proxy.Network.WinAuth.Security;
 
 internal class Common
 {
-    internal static uint NewContextAttributes = 0;
-    internal static SecurityInteger NewLifeTime = new(0);
-
-    #region Private constants
-
-    private const int IscReqReplayDetect = 0x00000004;
-    private const int IscReqSequenceDetect = 0x00000008;
-    private const int IscReqConfidentiality = 0x00000010;
-    private const int IscReqConnection = 0x00000800;
-
-    #endregion
-
     #region internal constants
 
-    internal const int StandardContextAttributes =
-        IscReqConfidentiality | IscReqReplayDetect | IscReqSequenceDetect | IscReqConnection;
+    internal const int IscReqReplayDetect = 0x00000004;
+    internal const int IscReqSequenceDetect = 0x00000008;
+    internal const int IscReqConfidentiality = 0x00000010;
+    internal const int IscReqConnection = 0x00000800;
 
     internal const int SecurityNativeDataRepresentation = 0x10;
     internal const int MaximumTokenSize = 12288;
@@ -35,13 +25,13 @@ internal class Common
     internal enum SecurityBufferType
     {
         SecbufferVersion = 0,
-        SecbufferEmpty = 0,
+        SecbufferEmpty = 0, // NOSONAR CA1069 -- SSPI defines both native constants as zero.
         SecbufferData = 1,
         SecbufferToken = 2
     }
 
     [Flags]
-    internal enum NtlmFlags
+    internal enum NtlmFlags // NOSONAR S2344 -- Name mirrors the native NTLM flags API.
     {
         // The client sets this flag to indicate that it supports Unicode strings.
         NegotiateUnicode = 0x00000001,
@@ -160,13 +150,13 @@ internal class Common
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    internal struct SecurityBufferDesciption
+    internal struct SecurityBufferDescription
     {
         internal int ulVersion;
         internal int cBuffers;
         internal IntPtr pBuffers; // Point to SecBuffer
 
-        internal SecurityBufferDesciption(int bufferSize)
+        internal SecurityBufferDescription(int bufferSize)
         {
             ulVersion = (int)SecurityBufferType.SecbufferVersion;
             cBuffers = 1;
@@ -175,7 +165,7 @@ internal class Common
             Marshal.StructureToPtr(thisSecBuffer, pBuffers, false);
         }
 
-        internal SecurityBufferDesciption(byte[] secBufferBytes)
+        internal SecurityBufferDescription(byte[] secBufferBytes)
         {
             ulVersion = (int)SecurityBufferType.SecbufferVersion;
             cBuffers = 1;
@@ -193,7 +183,7 @@ internal class Common
 
             if (cBuffers == 1)
             {
-                var thisSecBuffer = (SecurityBuffer)Marshal.PtrToStructure(pBuffers, typeof(SecurityBuffer));
+                var thisSecBuffer = Marshal.PtrToStructure<SecurityBuffer>(pBuffers);
 
                 if (thisSecBuffer.cbBuffer > 0)
                 {
@@ -207,12 +197,9 @@ internal class Common
 
                 for (var index = 0; index < cBuffers; index++)
                 {
-                    // The bits were written out the following order:
-                    // int cbBuffer;
-                    // int BufferType;
-                    // pvBuffer;
-                    // What we need to do here calculate the total number of bytes we need to copy...
-                    var currentOffset = index * Marshal.SizeOf(typeof(Buffer));
+                    // SecurityBuffer layout in memory: cbBuffer, BufferType, pvBuffer.
+                    // Sum cbBuffer across all entries to size the destination array.
+                    var currentOffset = index * Marshal.SizeOf<SecurityBuffer>();
                     bytesToAllocate += Marshal.ReadInt32(pBuffers, currentOffset);
                 }
 
@@ -220,16 +207,12 @@ internal class Common
 
                 for (int index = 0, bufferIndex = 0; index < cBuffers; index++)
                 {
-                    // The bits were written out the following order:
-                    // int cbBuffer;
-                    // int BufferType;
-                    // pvBuffer;
-                    // Now iterate over the individual buffers and put them together into a
-                    // byte array...
-                    var currentOffset = index * Marshal.SizeOf(typeof(Buffer));
+                    // SecurityBuffer layout in memory: cbBuffer, BufferType, pvBuffer.
+                    // Copy each native buffer into the combined byte array.
+                    var currentOffset = index * Marshal.SizeOf<SecurityBuffer>();
                     var bytesToCopy = Marshal.ReadInt32(pBuffers, currentOffset);
                     var secBufferpvBuffer = Marshal.ReadIntPtr(pBuffers,
-                        currentOffset + Marshal.SizeOf(typeof(int)) + Marshal.SizeOf(typeof(int)));
+                        currentOffset + Marshal.SizeOf<int>() + Marshal.SizeOf<int>());
                     Marshal.Copy(secBufferpvBuffer, buffer, bufferIndex, bytesToCopy);
                     bufferIndex += bytesToCopy;
                 }

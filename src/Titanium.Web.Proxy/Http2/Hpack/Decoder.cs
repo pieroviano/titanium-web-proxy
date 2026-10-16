@@ -23,6 +23,7 @@ namespace Titanium.Web.Proxy.Http2.Hpack;
 
 internal class Decoder
 {
+    private const string DecompressionFailure = "decompression failure";
     private readonly DynamicTable dynamicTable;
 
     private readonly int maxHeaderSize;
@@ -34,7 +35,7 @@ internal class Decoder
     private HpackUtil.IndexType indexType;
     private int maxDynamicTableSize;
     private bool maxDynamicTableSizeChangeRequired;
-    private ByteString name;
+    private ByteString name = ByteString.Empty;
     private int nameLength;
     private int skipLength;
     private State state;
@@ -67,13 +68,14 @@ internal class Decoder
     /// </summary>
     /// <param name="input">Input.</param>
     /// <param name="headerListener">Header listener.</param>
-    public void Decode(BinaryReader input, IHeaderListener headerListener)
+    public void Decode(ReadOnlySpan<byte> input, IHeaderListener headerListener) // NOSONAR S3776 -- This protocol/state-machine path shares mutable parsing or transport state; splitting it further would create disproportionate regression risk.
     {
-        while (input.BaseStream.Length - input.BaseStream.Position > 0)
+        var pos = 0;
+        while (input.Length - pos > 0)
             switch (state)
             {
                 case State.ReadHeaderRepresentation:
-                    var b = input.ReadSByte();
+                    var b = (sbyte)input[pos++];
                     if (maxDynamicTableSizeChangeRequired && (b & 0xE0) != 0x20)
                         // Encoder MUST signal maximum dynamic table size change
                         throw new IOException("max dynamic table size change required");
@@ -147,22 +149,22 @@ internal class Decoder
                     break;
 
                 case State.ReadMaxDynamicTableSize:
-                    var maxSize = DecodeUle128(input);
+                    var maxSize = DecodeUle128(input, ref pos);
                     if (maxSize == -1) return;
 
                     // Check for numerical overflow
-                    if (maxSize > int.MaxValue - index) throw new IOException("decompression failure");
+                    if (maxSize > int.MaxValue - index) throw new IOException(DecompressionFailure);
 
                     SetDynamicTableSize(index + maxSize);
                     state = State.ReadHeaderRepresentation;
                     break;
 
                 case State.ReadIndexedHeader:
-                    var headerIndex = DecodeUle128(input);
+                    var headerIndex = DecodeUle128(input, ref pos);
                     if (headerIndex == -1) return;
 
                     // Check for numerical overflow
-                    if (headerIndex > int.MaxValue - index) throw new IOException("decompression failure");
+                    if (headerIndex > int.MaxValue - index) throw new IOException(DecompressionFailure);
 
                     IndexHeader(index + headerIndex, headerListener);
                     state = State.ReadHeaderRepresentation;
@@ -170,18 +172,18 @@ internal class Decoder
 
                 case State.ReadIndexedHeaderName:
                     // Header Name matches an entry in the Header Table
-                    var nameIndex = DecodeUle128(input);
+                    var nameIndex = DecodeUle128(input, ref pos);
                     if (nameIndex == -1) return;
 
                     // Check for numerical overflow
-                    if (nameIndex > int.MaxValue - index) throw new IOException("decompression failure");
+                    if (nameIndex > int.MaxValue - index) throw new IOException(DecompressionFailure);
 
                     ReadName(index + nameIndex);
                     state = State.ReadLiteralHeaderValueLengthPrefix;
                     break;
 
                 case State.ReadLiteralHeaderNameLengthPrefix:
-                    b = input.ReadSByte();
+                    b = (sbyte)input[pos++];
                     huffmanEncoded = (b & 0x80) == 0x80;
                     index = b & 0x7F;
                     if (index == 0x7f)
@@ -193,7 +195,7 @@ internal class Decoder
                         nameLength = index;
 
                         // Disallow empty names -- they cannot be represented in HTTP/1.x
-                        if (nameLength == 0) throw new IOException("decompression failure");
+                        if (nameLength == 0) throw new IOException(DecompressionFailure);
 
                         // Check name length against max header size
                         if (ExceedsMaxHeaderSize(nameLength))
@@ -214,7 +216,7 @@ internal class Decoder
 #if NET451 || NET45
                                 name = Net45Compatibility.EmptyArray;
 #else
-                                    name = Array.Empty<byte>();
+                                name = Array.Empty<byte>();
 #endif
                                 skipLength = nameLength;
                                 state = State.SkipLiteralHeaderName;
@@ -229,11 +231,11 @@ internal class Decoder
 
                 case State.ReadLiteralHeaderNameLength:
                     // Header Name is a Literal String
-                    nameLength = DecodeUle128(input);
+                    nameLength = DecodeUle128(input, ref pos);
                     if (nameLength == -1) return;
 
                     // Check for numerical overflow
-                    if (nameLength > int.MaxValue - index) throw new IOException("decompression failure");
+                    if (nameLength > int.MaxValue - index) throw new IOException(DecompressionFailure);
 
                     nameLength += index;
 
@@ -265,23 +267,24 @@ internal class Decoder
 
                 case State.ReadLiteralHeaderName:
                     // Wait until entire name is readable
-                    if (input.BaseStream.Length - input.BaseStream.Position < nameLength) return;
+                    if (input.Length - pos < nameLength) return;
 
-                    name = ReadStringLiteral(input, nameLength);
+                    name = ReadStringLiteral(input, ref pos, nameLength);
                     state = State.ReadLiteralHeaderValueLengthPrefix;
                     break;
 
                 case State.SkipLiteralHeaderName:
 
-                    skipLength -= (int)input.BaseStream.Seek(skipLength, SeekOrigin.Current);
-                    if (skipLength < 0) skipLength = 0;
+                    var skippedNameLength = Math.Min(skipLength, input.Length - pos);
+                    pos += skippedNameLength;
+                    skipLength -= skippedNameLength;
 
                     if (skipLength == 0) state = State.ReadLiteralHeaderValueLengthPrefix;
 
                     break;
 
                 case State.ReadLiteralHeaderValueLengthPrefix:
-                    b = input.ReadSByte();
+                    b = (sbyte)input[pos++];
                     huffmanEncoded = (b & 0x80) == 0x80;
                     index = b & 0x7F;
                     if (index == 0x7f)
@@ -317,11 +320,15 @@ internal class Decoder
 
                         if (valueLength == 0)
                         {
-#if NET451 || NET45
-                            InsertHeader(headerListener, name, Net45Compatibility.EmptyArray, indexType);
-#else
-                                name = Array.Empty<byte>();
-#endif
+                            // Empty value: there are no value bytes to wait for, so the field is
+                            // already complete here. It still MUST be emitted and, for incremental
+                            // indexing, inserted into the dynamic table exactly like any other field -
+                            // skipping InsertHeader() here (as this branch previously did by jumping
+                            // straight back to ReadHeaderRepresentation) silently drops the header from
+                            // the decoded list AND desyncs the dynamic table from the encoder's, which
+                            // then causes "illegal index" failures on any later reference to this or any
+                            // subsequently-inserted entry.
+                            InsertHeader(headerListener, name, ByteString.Empty, indexType);
                             state = State.ReadHeaderRepresentation;
                         }
                         else
@@ -334,11 +341,11 @@ internal class Decoder
 
                 case State.ReadLiteralHeaderValueLength:
                     // Header Value is a Literal String
-                    valueLength = DecodeUle128(input);
+                    valueLength = DecodeUle128(input, ref pos);
                     if (valueLength == -1) return;
 
                     // Check for numerical overflow
-                    if (valueLength > int.MaxValue - index) throw new IOException("decompression failure");
+                    if (valueLength > int.MaxValue - index) throw new IOException(DecompressionFailure);
 
                     valueLength += index;
 
@@ -370,23 +377,24 @@ internal class Decoder
 
                 case State.ReadLiteralHeaderValue:
                     // Wait until entire value is readable
-                    if (input.BaseStream.Length - input.BaseStream.Position < valueLength) return;
+                    if (input.Length - pos < valueLength) return;
 
-                    var value = ReadStringLiteral(input, valueLength);
+                    var value = ReadStringLiteral(input, ref pos, valueLength);
                     InsertHeader(headerListener, name, value, indexType);
                     state = State.ReadHeaderRepresentation;
                     break;
 
                 case State.SkipLiteralHeaderValue:
-                    valueLength -= (int)input.BaseStream.Seek(valueLength, SeekOrigin.Current);
-                    if (valueLength < 0) valueLength = 0;
+                    var skippedValueLength = Math.Min(valueLength, input.Length - pos);
+                    pos += skippedValueLength;
+                    valueLength -= skippedValueLength;
 
                     if (valueLength == 0) state = State.ReadHeaderRepresentation;
 
                     break;
 
                 default:
-                    throw new Exception("should not reach here");
+                    throw new InvalidOperationException("should not reach here");
             }
     }
 
@@ -464,7 +472,29 @@ internal class Decoder
     private void IndexHeader(int index, IHeaderListener headerListener)
     {
         var headerField = GetHeaderField(index);
-        AddHeader(headerListener, headerField.NameData, headerField.ValueData, false);
+        // Static-table rows are immutable shared instances — avoid per-stream HttpHeader alloc.
+        if (index <= StaticTable.Length)
+            AddHeader(headerListener, headerField, sensitive: false);
+        else
+            AddHeader(headerListener, headerField.NameData, headerField.ValueData, false);
+    }
+
+    private void AddHeader(IHeaderListener headerListener, HttpHeader header, bool sensitive) // NOSONAR S4136 -- Overloads stay next to the decode step that uses them; moving would scramble the HPACK state machine.
+    {
+        if (header.NameData.Length == 0) throw new ArgumentException("name is empty");
+
+        var newSize = headerSize + header.NameData.Length + header.ValueData.Length;
+        if (newSize <= maxHeaderSize)
+        {
+            headerSize = (int)newSize;
+            headerListener.AddHeader(header, sensitive);
+        }
+        else
+        {
+            // truncation always fails for now (RFC 7540 / 7541).
+            // mark as truncated; EndHeaderBlock will report.
+            headerSize = maxHeaderSize + 1;
+        }
     }
 
     private void InsertHeader(IHeaderListener headerListener, ByteString name, ByteString value,
@@ -483,7 +513,7 @@ internal class Decoder
                 break;
 
             default:
-                throw new Exception("should not reach here");
+                throw new InvalidOperationException("should not reach here");
         }
     }
 
@@ -514,36 +544,31 @@ internal class Decoder
         return true;
     }
 
-    private ByteString ReadStringLiteral(BinaryReader input, int length)
+    private ByteString ReadStringLiteral(ReadOnlySpan<byte> input, ref int pos, int length)
     {
-        var buf = new byte[length];
-        var lengthToRead = length;
-        if (input.BaseStream.Length - input.BaseStream.Position < length)
-            lengthToRead = (int)input.BaseStream.Length - (int)input.BaseStream.Position;
-
-        var readBytes = input.Read(buf, 0, lengthToRead);
-        if (readBytes != length) throw new IOException("decompression failure");
+        var buf = input.Slice(pos, length).ToArray();
+        pos += length;
 
         return new ByteString(huffmanEncoded ? HuffmanDecoder.Instance.Decode(buf) : buf);
     }
 
     // Unsigned Little Endian Base 128 Variable-Length Integer Encoding
-    private static int DecodeUle128(BinaryReader input)
+    private static int DecodeUle128(ReadOnlySpan<byte> input, ref int pos)
     {
-        var markedPosition = input.BaseStream.Position;
+        var markedPosition = pos;
         var result = 0;
         var shift = 0;
         while (shift < 32)
         {
-            if (input.BaseStream.Length - input.BaseStream.Position == 0)
+            if (input.Length - pos == 0)
             {
                 // Buffer does not contain entire integer,
                 // reset reader index and return -1.
-                input.BaseStream.Position = markedPosition;
+                pos = markedPosition;
                 return -1;
             }
 
-            var b = input.ReadSByte();
+            var b = (sbyte)input[pos++];
             if (shift == 28 && (b & 0xF8) != 0) break;
 
             result |= (b & 0x7F) << shift;
@@ -553,8 +578,8 @@ internal class Decoder
         }
 
         // Value exceeds Integer.MAX_VALUE
-        input.BaseStream.Position = markedPosition;
-        throw new IOException("decompression failure");
+        pos = markedPosition;
+        throw new IOException(DecompressionFailure);
     }
 
     private enum State

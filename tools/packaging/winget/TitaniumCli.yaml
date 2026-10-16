@@ -1,0 +1,23 @@
+# justcoding121.TitaniumCli
+# Submit a PR to microsoft/winget-pkgs after a *signed* stable GitHub Release.
+# Authenticode publisher: Jehonathan Thomas.
+PackageIdentifier: justcoding121.TitaniumCli
+PackageVersion: 7.0.21
+PackageLocale: en-US
+Publisher: justcoding121
+PackageName: Titanium CLI
+License: MIT
+ShortDescription: Titanium Web Proxy command-line daemon (titanium / twp).
+Installers:
+  - Architecture: x64
+    InstallerType: zip
+    NestedInstallerType: portable
+    NestedInstallerFiles:
+      - RelativeFilePath: titanium.exe
+        PortableCommandAlias: titanium
+      - RelativeFilePath: twp.exe
+        PortableCommandAlias: twp
+    InstallerUrl: https://github.com/justcoding121/titanium-web-proxy/releases/download/v7.0.21/Titanium.Cli-win-x64.zip
+    InstallerSha256: A860D20B84FA404A842DABC866F8A06C743B9DE833ECE0009C0E2A3687B406B3
+ManifestType: singleton
+ManifestVersion: 1.6.0

@@ -1,8 +1,11 @@
 ﻿using System;
 using Titanium.Web.Proxy.Http;
+using Titanium.Web.Proxy.Models;
 using Titanium.Web.Proxy.Network.WinAuth.Security;
 
 namespace Titanium.Web.Proxy.Network.WinAuth;
+
+using static Common;
 
 /// <summary>
 ///     A handler for NTLM/Kerberos windows authentication challenge from server
@@ -12,16 +15,23 @@ namespace Titanium.Web.Proxy.Network.WinAuth;
 internal static class WinAuthHandler
 {
     /// <summary>
-    ///     Get the initial client token for server
-    ///     using credentials of user running the proxy server process
+    ///     Get the initial client token for server.
+    ///     When <paramref name="credentials" /> is null, uses the process identity; otherwise SSPI
+    ///     acquires a handle for the supplied credentials (Windows only).
     /// </summary>
     /// <param name="serverHostname"></param>
     /// <param name="authScheme"></param>
     /// <param name="data"></param>
+    /// <param name="credentials">Optional alternate credentials from <c>WinAuthCredentialsProvider</c>.</param>
     /// <returns></returns>
-    internal static string GetInitialAuthToken(string serverHostname, string authScheme, InternalDataStore data)
+    internal static string GetInitialAuthToken(string serverHostname, string authScheme, InternalDataStore data,
+        WinAuthCredentials? credentials = null, int maxTokenBytes = 0)
     {
-        var tokenBytes = WinAuthEndPoint.AcquireInitialSecurityToken(serverHostname, authScheme, data);
+        var tokenBytes = WinAuthEndPoint.AcquireInitialSecurityToken(serverHostname, authScheme, data,
+            IscReqConfidentiality | IscReqReplayDetect | IscReqSequenceDetect | IscReqConnection, credentials,
+            maxTokenBytes);
+        if (tokenBytes == null) throw new InvalidOperationException("Failed to acquire the initial authentication token.");
+
         return string.Concat(" ", Convert.ToBase64String(tokenBytes));
     }
 
@@ -32,11 +42,40 @@ internal static class WinAuthHandler
     /// <param name="serverToken"></param>
     /// <param name="data"></param>
     /// <returns></returns>
-    internal static string GetFinalAuthToken(string serverHostname, string serverToken, InternalDataStore data)
+    internal static string GetFinalAuthToken(string serverHostname, string serverToken, InternalDataStore data,
+        int maxTokenBytes = 0)
     {
         var tokenBytes =
             WinAuthEndPoint.AcquireFinalSecurityToken(serverHostname, Convert.FromBase64String(serverToken),
-                data);
+                data, IscReqConfidentiality | IscReqReplayDetect | IscReqSequenceDetect | IscReqConnection,
+                maxTokenBytes);
+        if (tokenBytes == null) throw new InvalidOperationException("Failed to acquire the final authentication token.");
+
+        return string.Concat(" ", Convert.ToBase64String(tokenBytes));
+    }
+
+    /// <summary>
+    ///     Get the initial authentication token for an upstream proxy using the current process identity.
+    /// </summary>
+    internal static string GetInitialProxyAuthToken(string proxyHostname, string authScheme, InternalDataStore data,
+        int maxTokenBytes = 0)
+    {
+        var tokenBytes = WinAuthEndPoint.AcquireInitialSecurityToken(proxyHostname, authScheme, data, 0,
+            maxTokenBytes: maxTokenBytes);
+        if (tokenBytes == null) throw new InvalidOperationException("Failed to acquire the initial proxy authentication token.");
+
+        return string.Concat(" ", Convert.ToBase64String(tokenBytes));
+    }
+
+    /// <summary>
+    ///     Get the response token for an upstream proxy challenge.
+    /// </summary>
+    internal static string GetFinalProxyAuthToken(string proxyHostname, string serverToken, InternalDataStore data,
+        int maxTokenBytes = 0)
+    {
+        var tokenBytes = WinAuthEndPoint.AcquireFinalSecurityToken(proxyHostname,
+            Convert.FromBase64String(serverToken), data, 0, maxTokenBytes);
+        if (tokenBytes == null) throw new InvalidOperationException("Failed to acquire the final proxy authentication token.");
 
         return string.Concat(" ", Convert.ToBase64String(tokenBytes));
     }

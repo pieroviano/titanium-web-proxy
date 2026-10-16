@@ -1,0 +1,1432 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:Titanium.Inspector.ViewModels"
+        xmlns:views="using:Titanium.Inspector.Views"
+        xmlns:svc="using:Titanium.Inspector.Services"
+        xmlns:loc="using:Titanium.Inspector.Localization"
+        xmlns:conv="using:Titanium.Inspector.Converters"
+        x:Class="Titanium.Inspector.Views.MainWindow"
+        x:DataType="vm:MainWindowViewModel"
+        Title="Titanium Inspector"
+        Icon="/Assets/app.ico"
+        Width="1280" Height="800">
+  <DockPanel>
+    <Menu DockPanel.Dock="Top" x:Name="MainMenu" AutomationProperties.AutomationId="MainMenu">
+      <MenuItem Header="{loc:Loc menu.file}" AutomationProperties.AutomationId="MenuFile">
+        <MenuItem Header="{loc:Loc menu.exportAllHar}" Command="{Binding ExportHarCommand}" AutomationProperties.AutomationId="MenuExportHar" />
+        <MenuItem Header="{loc:Loc menu.exportSelectedHar}" Command="{Binding ExportSelectedHarCommand}" AutomationProperties.AutomationId="MenuExportSelectedHar" />
+        <MenuItem Header="{loc:Loc menu.importHar}" Command="{Binding ImportHarCommand}" AutomationProperties.AutomationId="MenuImportHar" />
+        <MenuItem Header="{loc:Loc menu.exportAllArchive}" Command="{Binding ExportArchiveCommand}" AutomationProperties.AutomationId="MenuExportArchive" />
+        <MenuItem Header="{loc:Loc menu.exportSelectedArchive}" Command="{Binding ExportSelectedArchiveCommand}" AutomationProperties.AutomationId="MenuExportSelectedArchive" />
+        <MenuItem Header="{loc:Loc menu.importArchive}" Command="{Binding ImportArchiveCommand}" AutomationProperties.AutomationId="MenuImportArchive" />
+        <Separator />
+        <MenuItem Header="{loc:Loc menu.exit}" Command="{Binding ExitCommand}" AutomationProperties.AutomationId="MenuExit" />
+      </MenuItem>
+      <MenuItem Header="{loc:Loc menu.capture}" AutomationProperties.AutomationId="MenuCapture">
+        <MenuItem Header="{loc:Loc menu.startProxy}" Command="{Binding StartCaptureCommand}" AutomationProperties.AutomationId="MenuStartCapture" />
+        <MenuItem Header="{loc:Loc menu.stopProxy}" Command="{Binding StopCaptureCommand}" AutomationProperties.AutomationId="MenuStopCapture" />
+        <!-- Mode=OneWay + Command: Avalonia MenuItem CheckBox TwoWay can write false during init and persist it. -->
+        <MenuItem x:Name="MenuToggleCapturing" Header="{loc:Loc menu.capturing}" ToggleType="CheckBox"
+                  IsChecked="{Binding Capturing, Mode=OneWay}"
+                  Command="{Binding ToggleCapturingCommand}"
+                  AutomationProperties.AutomationId="MenuToggleCapturing" />
+        <MenuItem x:Name="MenuClearSessions" Header="{loc:Loc menu.clearSessions}" Command="{Binding ClearSessionsCommand}" AutomationProperties.AutomationId="MenuClearSessions" />
+        <MenuItem x:Name="MenuRemoveSelected" Header="{loc:Loc menu.removeSelected}" Command="{Binding RemoveSelectedSessionsCommand}" AutomationProperties.AutomationId="MenuRemoveSelected" />
+        <MenuItem Header="{loc:Loc menu.keepOnly}" Command="{Binding KeepOnlySelectedCommand}" AutomationProperties.AutomationId="MenuKeepOnlySelected" />
+        <MenuItem Header="{loc:Loc menu.removeMatching}" Command="{Binding RemoveMatchingFilterCommand}"
+                  ToolTip.Tip="{loc:Loc menu.removeMatchingTip}"
+                  AutomationProperties.AutomationId="MenuRemoveMatching" />
+        <Separator />
+        <MenuItem Header="{loc:Loc menu.autoStartCapture}" ToggleType="CheckBox"
+                  IsChecked="{Binding AutoStartCapture, Mode=OneWay}"
+                  Command="{Binding ToggleAutoStartCaptureCommand}"
+                  AutomationProperties.AutomationId="AutoStartCaptureCheck" />
+        <MenuItem Header="{loc:Loc menu.autoSystemProxy}" ToggleType="CheckBox"
+                  IsChecked="{Binding AutoSystemProxyOnStart, Mode=OneWay}"
+                  Command="{Binding ToggleAutoSystemProxyOnStartCommand}"
+                  AutomationProperties.AutomationId="AutoSystemProxyCheck" />
+        <Separator />
+        <MenuItem Header="{loc:Loc menu.disableCaching}" ToggleType="CheckBox"
+                  IsChecked="{Binding DisableCaching, Mode=OneWay}"
+                  Command="{Binding ToggleDisableCachingCommand}"
+                  ToolTip.Tip="{loc:Loc menu.disableCachingTip}"
+                  AutomationProperties.AutomationId="MenuDisableCaching" />
+        <MenuItem Header="{loc:Loc menu.forceUncompressed}" ToggleType="CheckBox"
+                  IsChecked="{Binding ForceUncompressed, Mode=OneWay}"
+                  Command="{Binding ToggleForceUncompressedCommand}"
+                  ToolTip.Tip="{loc:Loc menu.forceUncompressedTip}"
+                  AutomationProperties.AutomationId="MenuForceUncompressed" />
+        <Separator />
+        <MenuItem x:Name="MenuProxyLocalhost" Header="{loc:Loc menu.captureLocal}" ToggleType="CheckBox"
+                  IsChecked="{Binding ProxyLoopback, Mode=OneWay}"
+                  Command="{Binding ToggleProxyLocalhostCommand}"
+                  ToolTip.Tip="{Binding ProxyLocalhostTip}"
+                  AutomationProperties.AutomationId="MenuProxyLocalhost" />
+        <MenuItem Header="{loc:Loc menu.allowStoreApps}" Command="{Binding OpenLoopbackExemptCommand}"
+                  IsVisible="{Binding ShowLoopbackExemptMenu}"
+                  AutomationProperties.AutomationId="MenuLoopbackExempt" />
+        <Separator />
+        <MenuItem Header="{loc:Loc menu.rootCa}" AutomationProperties.AutomationId="MenuRootCertificate">
+          <MenuItem Header="{loc:Loc menu.installCa}" Command="{Binding InstallCaCommand}" AutomationProperties.AutomationId="MenuInstallCa" />
+          <MenuItem Header="{loc:Loc menu.removeCa}" Command="{Binding UntrustCaCommand}" AutomationProperties.AutomationId="MenuRemoveCa" />
+          <MenuItem Header="{loc:Loc menu.rotateCa}" Command="{Binding RotateCaCommand}" AutomationProperties.AutomationId="MenuRotateCa" />
+          <MenuItem Header="{loc:Loc menu.removeOldCas}" Command="{Binding RemoveOldRootCasCommand}" AutomationProperties.AutomationId="MenuRemoveOldRootCas" />
+          <MenuItem Header="{loc:Loc menu.exportCa}" Command="{Binding ExportCaCommand}" AutomationProperties.AutomationId="MenuExportCa" />
+          <MenuItem Header="{loc:Loc menu.trustFirefox}" Command="{Binding TrustFirefoxCaCommand}"
+                    AutomationProperties.AutomationId="MenuTrustFirefoxCa" />
+          <MenuItem Header="{loc:Loc menu.deviceCa}" Command="{Binding DeviceCaSetupCommand}" AutomationProperties.AutomationId="MenuDeviceCa" />
+        </MenuItem>
+      </MenuItem>
+      <MenuItem Header="{loc:Loc menu.tools}" AutomationProperties.AutomationId="MenuTools">
+        <MenuItem Header="{loc:Loc menu.composer}" Command="{Binding OpenToolsComposerCommand}" AutomationProperties.AutomationId="MenuToolsComposer" />
+        <MenuItem Header="{loc:Loc menu.breakpoints}" Command="{Binding OpenToolsBreakpointsCommand}" AutomationProperties.AutomationId="MenuToolsBreakpoints" />
+        <MenuItem Header="{loc:Loc menu.autoResponder}" Command="{Binding OpenToolsAutoResponderCommand}" AutomationProperties.AutomationId="MenuToolsAutoResponder" />
+        <MenuItem Header="{loc:Loc menu.scripts}" Command="{Binding OpenToolsScriptsCommand}" AutomationProperties.AutomationId="MenuToolsScripts" />
+        <MenuItem Header="{loc:Loc menu.mapRemote}" Command="{Binding OpenToolsMapRemoteCommand}" AutomationProperties.AutomationId="MenuToolsMapRemote" />
+        <Separator />
+        <MenuItem Header="{loc:Loc menu.timeline}" Command="{Binding OpenTimelineCommand}" AutomationProperties.AutomationId="MenuTimeline" />
+        <MenuItem Header="{loc:Loc menu.runLog}" Command="{Binding OpenRunLogCommand}" AutomationProperties.AutomationId="MenuRunLog" />
+      </MenuItem>
+      <MenuItem Header="{loc:Loc menu.options}" AutomationProperties.AutomationId="MenuOptions">
+        <MenuItem Header="{loc:Loc menu.theme}" AutomationProperties.AutomationId="MenuTheme">
+          <MenuItem Header="{loc:Loc menu.themeLight}" ToggleType="Radio"
+                    IsChecked="{Binding ThemeModeIsLight, Mode=OneWay}"
+                    Command="{Binding SetThemeLightCommand}"
+                    AutomationProperties.AutomationId="MenuThemeLight" />
+          <MenuItem Header="{loc:Loc menu.themeDark}" ToggleType="Radio"
+                    IsChecked="{Binding ThemeModeIsDark, Mode=OneWay}"
+                    Command="{Binding SetThemeDarkCommand}"
+                    AutomationProperties.AutomationId="MenuThemeDark" />
+          <MenuItem Header="{loc:Loc menu.themeAutomatic}" ToggleType="Radio"
+                    IsChecked="{Binding ThemeModeIsAutomatic, Mode=OneWay}"
+                    Command="{Binding SetThemeAutomaticCommand}"
+                    AutomationProperties.AutomationId="MenuThemeAutomatic" />
+        </MenuItem>
+        <MenuItem Header="{loc:Loc menu.language}" AutomationProperties.AutomationId="MenuLanguage">
+          <MenuItem Header="{loc:Loc menu.languageAutomatic}" ToggleType="Radio"
+                    IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={x:Static conv:LanguageMatchConverter.Instance}, ConverterParameter=auto}"
+                    Command="{Binding SetUiLanguageCommand}" CommandParameter="auto"
+                    AutomationProperties.AutomationId="MenuLanguageAutomatic" />
+          <MenuItem Header="English" ToggleType="Radio"
+                    IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={x:Static conv:LanguageMatchConverter.Instance}, ConverterParameter=en}"
+                    Command="{Binding SetUiLanguageCommand}" CommandParameter="en"
+                    AutomationProperties.AutomationId="MenuLanguage_en" />
+          <MenuItem Header="العربية" ToggleType="Radio"
+                    IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={x:Static conv:LanguageMatchConverter.Instance}, ConverterParameter=ar}"
+                    Command="{Binding SetUiLanguageCommand}" CommandParameter="ar"
+                    AutomationProperties.AutomationId="MenuLanguage_ar" />
+          <MenuItem Header="简体中文" ToggleType="Radio"
+                    IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={x:Static conv:LanguageMatchConverter.Instance}, ConverterParameter=zh-Hans}"
+                    Command="{Binding SetUiLanguageCommand}" CommandParameter="zh-Hans"
+                    AutomationProperties.AutomationId="MenuLanguage_zh-Hans" />
+          <MenuItem Header="繁體中文" ToggleType="Radio"
+                    IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={x:Static conv:LanguageMatchConverter.Instance}, ConverterParameter=zh-Hant}"
+                    Command="{Binding SetUiLanguageCommand}" CommandParameter="zh-Hant"
+                    AutomationProperties.AutomationId="MenuLanguage_zh-Hant" />
+          <MenuItem Header="Čeština" ToggleType="Radio"
+                    IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={x:Static conv:LanguageMatchConverter.Instance}, ConverterParameter=cs}"
+                    Command="{Binding SetUiLanguageCommand}" CommandParameter="cs"
+                    AutomationProperties.AutomationId="MenuLanguage_cs" />
+          <MenuItem Header="Dansk" ToggleType="Radio"
+                    IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={x:Static conv:LanguageMatchConverter.Instance}, ConverterParameter=da}"
+                    Command="{Binding SetUiLanguageCommand}" CommandParameter="da"
+                    AutomationProperties.AutomationId="MenuLanguage_da" />
+          <MenuItem Header="Nederlands" ToggleType="Radio"
+                    IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={x:Static conv:LanguageMatchConverter.Instance}, ConverterParameter=nl}"
+                    Command="{Binding SetUiLanguageCommand}" CommandParameter="nl"
+                    AutomationProperties.AutomationId="MenuLanguage_nl" />
+          <MenuItem Header="Suomi" ToggleType="Radio"
+                    IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={x:Static conv:LanguageMatchConverter.Instance}, ConverterParameter=fi}"
+                    Command="{Binding SetUiLanguageCommand}" CommandParameter="fi"
+                    AutomationProperties.AutomationId="MenuLanguage_fi" />
+          <MenuItem Header="Français" ToggleType="Radio"
+                    IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={x:Static conv:LanguageMatchConverter.Instance}, ConverterParameter=fr}"
+                    Command="{Binding SetUiLanguageCommand}" CommandParameter="fr"
+                    AutomationProperties.AutomationId="MenuLanguage_fr" />
+          <MenuItem Header="Deutsch" ToggleType="Radio"
+                    IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={x:Static conv:LanguageMatchConverter.Instance}, ConverterParameter=de}"
+                    Command="{Binding SetUiLanguageCommand}" CommandParameter="de"
+                    AutomationProperties.AutomationId="MenuLanguage_de" />
+          <MenuItem Header="Ελληνικά" ToggleType="Radio"
+                    IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={x:Static conv:LanguageMatchConverter.Instance}, ConverterParameter=el}"
+                    Command="{Binding SetUiLanguageCommand}" CommandParameter="el"
+                    AutomationProperties.AutomationId="MenuLanguage_el" />
+          <MenuItem Header="עברית" ToggleType="Radio"
+                    IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={x:Static conv:LanguageMatchConverter.Instance}, ConverterParameter=he}"
+                    Command="{Binding SetUiLanguageCommand}" CommandParameter="he"
+                    AutomationProperties.AutomationId="MenuLanguage_he" />
+          <MenuItem Header="हिन्दी" ToggleType="Radio"
+                    IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={x:Static conv:LanguageMatchConverter.Instance}, ConverterParameter=hi}"
+                    Command="{Binding SetUiLanguageCommand}" CommandParameter="hi"
+                    AutomationProperties.AutomationId="MenuLanguage_hi" />
+          <MenuItem Header="Magyar" ToggleType="Radio"
+                    IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={x:Static conv:LanguageMatchConverter.Instance}, ConverterParameter=hu}"
+                    Command="{Binding SetUiLanguageCommand}" CommandParameter="hu"
+                    AutomationProperties.AutomationId="MenuLanguage_hu" />
+          <MenuItem Header="Bahasa Indonesia" ToggleType="Radio"
+                    IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={x:Static conv:LanguageMatchConverter.Instance}, ConverterParameter=id}"
+                    Command="{Binding SetUiLanguageCommand}" CommandParameter="id"
+                    AutomationProperties.AutomationId="MenuLanguage_id" />
+          <MenuItem Header="Italiano" ToggleType="Radio"
+                    IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={x:Static conv:LanguageMatchConverter.Instance}, ConverterParameter=it}"
+                    Command="{Binding SetUiLanguageCommand}" CommandParameter="it"
+                    AutomationProperties.AutomationId="MenuLanguage_it" />
+          <MenuItem Header="日本語" ToggleType="Radio"
+                    IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={x:Static conv:LanguageMatchConverter.Instance}, ConverterParameter=ja}"
+                    Command="{Binding SetUiLanguageCommand}" CommandParameter="ja"
+                    AutomationProperties.AutomationId="MenuLanguage_ja" />
+          <MenuItem Header="한국어" ToggleType="Radio"
+                    IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={x:Static conv:LanguageMatchConverter.Instance}, ConverterParameter=ko}"
+                    Command="{Binding SetUiLanguageCommand}" CommandParameter="ko"
+                    AutomationProperties.AutomationId="MenuLanguage_ko" />
+          <MenuItem Header="Norsk bokmål" ToggleType="Radio"
+                    IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={x:Static conv:LanguageMatchConverter.Instance}, ConverterParameter=nb}"
+                    Command="{Binding SetUiLanguageCommand}" CommandParameter="nb"
+                    AutomationProperties.AutomationId="MenuLanguage_nb" />
+          <MenuItem Header="Polski" ToggleType="Radio"
+                    IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={x:Static conv:LanguageMatchConverter.Instance}, ConverterParameter=pl}"
+                    Command="{Binding SetUiLanguageCommand}" CommandParameter="pl"
+                    AutomationProperties.AutomationId="MenuLanguage_pl" />
+          <MenuItem Header="Português (Brasil)" ToggleType="Radio"
+                    IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={x:Static conv:LanguageMatchConverter.Instance}, ConverterParameter=pt-BR}"
+                    Command="{Binding SetUiLanguageCommand}" CommandParameter="pt-BR"
+                    AutomationProperties.AutomationId="MenuLanguage_pt-BR" />
+          <MenuItem Header="Português (Portugal)" ToggleType="Radio"
+                    IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={x:Static conv:LanguageMatchConverter.Instance}, ConverterParameter=pt-PT}"
+                    Command="{Binding SetUiLanguageCommand}" CommandParameter="pt-PT"
+                    AutomationProperties.AutomationId="MenuLanguage_pt-PT" />
+          <MenuItem Header="Русский" ToggleType="Radio"
+                    IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={x:Static conv:LanguageMatchConverter.Instance}, ConverterParameter=ru}"
+                    Command="{Binding SetUiLanguageCommand}" CommandParameter="ru"
+                    AutomationProperties.AutomationId="MenuLanguage_ru" />
+          <MenuItem Header="Español" ToggleType="Radio"
+                    IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={x:Static conv:LanguageMatchConverter.Instance}, ConverterParameter=es}"
+                    Command="{Binding SetUiLanguageCommand}" CommandParameter="es"
+                    AutomationProperties.AutomationId="MenuLanguage_es" />
+          <MenuItem Header="Svenska" ToggleType="Radio"
+                    IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={x:Static conv:LanguageMatchConverter.Instance}, ConverterParameter=sv}"
+                    Command="{Binding SetUiLanguageCommand}" CommandParameter="sv"
+                    AutomationProperties.AutomationId="MenuLanguage_sv" />
+          <MenuItem Header="ไทย" ToggleType="Radio"
+                    IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={x:Static conv:LanguageMatchConverter.Instance}, ConverterParameter=th}"
+                    Command="{Binding SetUiLanguageCommand}" CommandParameter="th"
+                    AutomationProperties.AutomationId="MenuLanguage_th" />
+          <MenuItem Header="Türkçe" ToggleType="Radio"
+                    IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={x:Static conv:LanguageMatchConverter.Instance}, ConverterParameter=tr}"
+                    Command="{Binding SetUiLanguageCommand}" CommandParameter="tr"
+                    AutomationProperties.AutomationId="MenuLanguage_tr" />
+          <MenuItem Header="Українська" ToggleType="Radio"
+                    IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={x:Static conv:LanguageMatchConverter.Instance}, ConverterParameter=uk}"
+                    Command="{Binding SetUiLanguageCommand}" CommandParameter="uk"
+                    AutomationProperties.AutomationId="MenuLanguage_uk" />
+          <MenuItem Header="Tiếng Việt" ToggleType="Radio"
+                    IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={x:Static conv:LanguageMatchConverter.Instance}, ConverterParameter=vi}"
+                    Command="{Binding SetUiLanguageCommand}" CommandParameter="vi"
+                    AutomationProperties.AutomationId="MenuLanguage_vi" />
+          <MenuItem Header="فارسی" ToggleType="Radio"
+                    IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={x:Static conv:LanguageMatchConverter.Instance}, ConverterParameter=fa}"
+                    Command="{Binding SetUiLanguageCommand}" CommandParameter="fa"
+                    AutomationProperties.AutomationId="MenuLanguage_fa" />
+        </MenuItem>
+        <!-- Static items with constant CommandParameter: the macOS native menu clones MainMenu once and does not
+             follow ItemsSource. Check marks are synced from code (OneWayToggleVisualSync), not bound. -->
+        <MenuItem x:Name="MenuColumns" Header="{loc:Loc menu.columns}" AutomationProperties.AutomationId="MenuColumns">
+          <MenuItem Header="{loc:Loc menu.col.id}" ToggleType="CheckBox" Command="{Binding ToggleGridColumnCommand}"
+                    CommandParameter="Id" AutomationProperties.AutomationId="MenuColumn_Id" />
+          <MenuItem Header="{loc:Loc menu.col.method}" ToggleType="CheckBox" Command="{Binding ToggleGridColumnCommand}"
+                    CommandParameter="Method" AutomationProperties.AutomationId="MenuColumn_Method" />
+          <MenuItem Header="{loc:Loc menu.col.status}" ToggleType="CheckBox" Command="{Binding ToggleGridColumnCommand}"
+                    CommandParameter="Status" AutomationProperties.AutomationId="MenuColumn_Status" />
+          <MenuItem Header="{loc:Loc menu.col.host}" ToggleType="CheckBox" IsChecked="True" IsEnabled="False"
+                    Command="{Binding ToggleGridColumnCommand}"
+                    CommandParameter="Host" AutomationProperties.AutomationId="MenuColumn_Host" />
+          <MenuItem Header="{loc:Loc menu.col.url}" ToggleType="CheckBox" IsChecked="True" IsEnabled="False"
+                    Command="{Binding ToggleGridColumnCommand}"
+                    CommandParameter="URL" AutomationProperties.AutomationId="MenuColumn_URL" />
+          <MenuItem Header="{loc:Loc menu.col.protocol}" ToggleType="CheckBox" Command="{Binding ToggleGridColumnCommand}"
+                    CommandParameter="Protocol" AutomationProperties.AutomationId="MenuColumn_Protocol" />
+          <MenuItem Header="{loc:Loc menu.col.duration}" ToggleType="CheckBox" Command="{Binding ToggleGridColumnCommand}"
+                    CommandParameter="Duration" AutomationProperties.AutomationId="MenuColumn_Duration" />
+          <MenuItem Header="{loc:Loc menu.col.ttfb}" ToggleType="CheckBox" Command="{Binding ToggleGridColumnCommand}"
+                    CommandParameter="TTFB" AutomationProperties.AutomationId="MenuColumn_TTFB" />
+          <MenuItem Header="{loc:Loc menu.col.size}" ToggleType="CheckBox" Command="{Binding ToggleGridColumnCommand}"
+                    CommandParameter="Size" AutomationProperties.AutomationId="MenuColumn_Size" />
+          <MenuItem Header="{loc:Loc menu.col.process}" ToggleType="CheckBox" Command="{Binding ToggleGridColumnCommand}"
+                    CommandParameter="Process" IsVisible="{Binding ShowProcessColumn}"
+                    AutomationProperties.AutomationId="MenuColumn_Process" />
+          <Separator />
+          <MenuItem Header="{loc:Loc menu.col.started}" ToggleType="CheckBox" Command="{Binding ToggleGridColumnCommand}"
+                    CommandParameter="Started" AutomationProperties.AutomationId="MenuColumn_Started" />
+          <MenuItem Header="{loc:Loc menu.col.scheme}" ToggleType="CheckBox" Command="{Binding ToggleGridColumnCommand}"
+                    CommandParameter="Scheme" AutomationProperties.AutomationId="MenuColumn_Scheme" />
+          <MenuItem Header="{loc:Loc menu.col.contentType}" ToggleType="CheckBox" Command="{Binding ToggleGridColumnCommand}"
+                    CommandParameter="Content-Type" AutomationProperties.AutomationId="MenuColumn_ContentType" />
+          <MenuItem Header="{loc:Loc menu.col.comment}" ToggleType="CheckBox" Command="{Binding ToggleGridColumnCommand}"
+                    CommandParameter="Comment" AutomationProperties.AutomationId="MenuColumn_Comment" />
+          <Separator />
+          <MenuItem Header="{loc:Loc menu.resetColumns}" Command="{Binding ResetGridColumnsCommand}"
+                    AutomationProperties.AutomationId="MenuColumnsReset" />
+        </MenuItem>
+        <Separator />
+        <MenuItem Header="{loc:Loc menu.sessionRetention}" Command="{Binding OpenSessionRetentionCommand}"
+                  AutomationProperties.AutomationId="MenuSessionRetention" />
+        <MenuItem Header="{loc:Loc menu.excludedHosts}" Command="{Binding OpenHttpsDecryptHostsCommand}"
+                  ToolTip.Tip="{loc:Loc menu.excludedHostsTip}"
+                  AutomationProperties.AutomationId="MenuHttpsDecryptHosts" />
+        <MenuItem Header="{loc:Loc menu.ignoreCerts}" ToggleType="CheckBox"
+                  IsChecked="{Binding IgnoreServerCertificateErrors, Mode=OneWay}"
+                  Command="{Binding ToggleIgnoreServerCertificateErrorsCommand}"
+                  AutomationProperties.AutomationId="MenuIgnoreServerCertErrors" />
+        <MenuItem Header="{loc:Loc menu.addVia}" ToggleType="CheckBox"
+                  IsChecked="{Binding AddViaHeader, Mode=OneWay}"
+                  Command="{Binding ToggleAddViaHeaderCommand}"
+                  ToolTip.Tip="{loc:Loc menu.addViaTip}"
+                  AutomationProperties.AutomationId="MenuAddViaHeader" />
+        <Separator />
+        <MenuItem Header="{loc:Loc menu.network}" Command="{Binding OpenNetworkSettingsCommand}"
+                  AutomationProperties.AutomationId="MenuNetwork" />
+        <MenuItem Header="{loc:Loc menu.logging}" Command="{Binding OpenLoggingSettingsCommand}"
+                  AutomationProperties.AutomationId="MenuLogging" />
+        <MenuItem Header="{loc:Loc menu.alwaysOnTop}" ToggleType="CheckBox"
+                  IsChecked="{Binding AlwaysOnTop, Mode=OneWay}"
+                  Command="{Binding ToggleAlwaysOnTopCommand}"
+                  ToolTip.Tip="{loc:Loc menu.alwaysOnTopTip}"
+                  AutomationProperties.AutomationId="MenuAlwaysOnTop" />
+        <Separator />
+        <MenuItem Header="{loc:Loc menu.resetSettings}" Command="{Binding ResetSettingsCommand}"
+                  AutomationProperties.AutomationId="MenuResetSettings" />
+      </MenuItem>
+      <MenuItem Header="{loc:Loc menu.help}" AutomationProperties.AutomationId="MenuHelp">
+        <MenuItem Header="{loc:Loc menu.checkUpdates}" Command="{Binding CheckForUpdatesCommand}"
+                  AutomationProperties.AutomationId="MenuCheckForUpdates" />
+        <MenuItem Header="{loc:Loc menu.checkUpdatesStartup}" ToggleType="CheckBox"
+                  IsChecked="{Binding CheckForUpdatesOnStartup, Mode=OneWay}"
+                  Command="{Binding ToggleCheckForUpdatesOnStartupCommand}"
+                  AutomationProperties.AutomationId="MenuCheckUpdatesOnStartup" />
+        <MenuItem Header="{loc:Loc menu.updateChannel}" AutomationProperties.AutomationId="MenuUpdateChannel">
+          <MenuItem Header="{loc:Loc menu.channelStable}" ToggleType="CheckBox"
+                    IsChecked="{Binding UpdateChannelIsStable, Mode=OneWay}"
+                    Command="{Binding SetUpdateChannelStableCommand}"
+                    AutomationProperties.AutomationId="MenuUpdateChannelStable" />
+          <MenuItem Header="{loc:Loc menu.channelBeta}" ToggleType="CheckBox"
+                    IsChecked="{Binding UpdateChannelIsBeta, Mode=OneWay}"
+                    Command="{Binding SetUpdateChannelBetaCommand}"
+                    AutomationProperties.AutomationId="MenuUpdateChannelBeta" />
+        </MenuItem>
+        <Separator />
+        <MenuItem Header="{loc:Loc menu.documentation}" Command="{Binding OpenDocumentationCommand}"
+                  AutomationProperties.AutomationId="MenuDocumentation" />
+        <MenuItem Header="{loc:Loc menu.reportIssue}" Command="{Binding OpenReportIssueCommand}"
+                  AutomationProperties.AutomationId="MenuReportIssue" />
+        <MenuItem Header="{loc:Loc menu.keyboardShortcuts}" Command="{Binding OpenKeyboardShortcutsCommand}"
+                  AutomationProperties.AutomationId="MenuKeyboardShortcuts" />
+        <MenuItem Header="{loc:Loc menu.about}" Command="{Binding OpenAboutCommand}"
+                  AutomationProperties.AutomationId="MenuAbout" />
+      </MenuItem>
+    </Menu>
+    <Grid RowDefinitions="Auto,*,Auto">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="*" MinWidth="180" />
+        <ColumnDefinition Width="Auto" />
+        <ColumnDefinition Width="{Binding SessionDetailsPaneWidth}" MinWidth="{Binding SessionDetailsPaneMinWidth}" />
+        <ColumnDefinition Width="56" MinWidth="56" MaxWidth="56" />
+      </Grid.ColumnDefinitions>
+      <StackPanel Grid.Row="0" Grid.ColumnSpan="4" Margin="8" Spacing="8"
+                  AutomationProperties.AutomationId="ToolbarPanel">
+        <!-- Search + Filters strip: outline-only group (no fill) so it matches the toolbar surface. -->
+        <WrapPanel x:Name="ToolbarSearchFilters" Orientation="Horizontal" AutomationProperties.AutomationId="ToolbarSearchFilters">
+          <!-- Height tracks the Filters border. A bottom margin is added only when that border wraps underneath. -->
+          <views:SearchQueryTextBox x:Name="SearchBox" Classes="searchQuery" MinWidth="200" MaxWidth="480" Width="320"
+                   MinHeight="{DynamicResource SearchQueryBoxHeight}" Margin="0,0,12,0"
+                   VerticalAlignment="Top"
+                   Watermark="{loc:Loc toolbar.searchWatermark}"
+                   ToolTip.Tip="{loc:Loc toolbar.searchTip}"
+                   Text="{Binding SearchQuery}" AutomationProperties.AutomationId="SearchBox" />
+          <Border x:Name="ToolbarFilterGroup" Margin="0,0,12,0" Padding="10,6" CornerRadius="6"
+                  BorderThickness="1"
+                  BorderBrush="{DynamicResource SystemControlForegroundBaseMediumLowBrush}"
+                  Background="Transparent"
+                  AutomationProperties.AutomationId="ToolbarFilterGroup">
+            <StackPanel Orientation="Vertical" Spacing="4">
+              <TextBlock Text="{loc:Loc toolbar.filtersGroup}" Opacity="0.65" FontSize="11" />
+              <!-- Bottom margin on each child keeps a clear gap when Status/Clear wraps to a new line. -->
+              <WrapPanel Orientation="Horizontal">
+                <DropDownButton Classes="filterDropdown"
+                        Classes.active="{Binding StatusFilterActive}"
+                        VerticalAlignment="Center" Margin="0,0,8,4"
+                        ToolTip.Tip="{Binding StatusFilterTip}"
+                        AutomationProperties.AutomationId="StatusFilterButton">
+                  <StackPanel Orientation="Horizontal">
+                    <TextBlock Text="{loc:Loc toolbar.status}" VerticalAlignment="Center" />
+                    <Border Classes="filterBadge">
+                      <TextBlock Text="{Binding StatusFilterBadge}" />
+                    </Border>
+                  </StackPanel>
+                  <DropDownButton.Flyout>
+                    <Flyout Placement="Bottom">
+                      <StackPanel Spacing="6" Width="240">
+                        <CheckBox Content="2xx" IsChecked="{Binding StatusClass2xx}"
+                                  AutomationProperties.AutomationId="StatusFilter2xx" />
+                        <CheckBox Content="3xx" IsChecked="{Binding StatusClass3xx}"
+                                  AutomationProperties.AutomationId="StatusFilter3xx" />
+                        <CheckBox Content="4xx" IsChecked="{Binding StatusClass4xx}"
+                                  AutomationProperties.AutomationId="StatusFilter4xx" />
+                        <CheckBox Content="5xx" IsChecked="{Binding StatusClass5xx}"
+                                  AutomationProperties.AutomationId="StatusFilter5xx" />
+                        <TextBox Text="{Binding StatusFreeText}"
+                                 Watermark="{loc:Loc filter.statusFree}"
+                                 AutomationProperties.AutomationId="StatusFilterFree" />
+                        <TextBlock Text="{Binding StatusFilterError}" TextWrapping="Wrap"
+                                   IsVisible="{Binding HasStatusFilterError}"
+                                   AutomationProperties.AutomationId="StatusFilterError" />
+                      </StackPanel>
+                    </Flyout>
+                  </DropDownButton.Flyout>
+                </DropDownButton>
+                <DropDownButton Classes="filterDropdown"
+                        Classes.active="{Binding MethodFilterActive}"
+                        VerticalAlignment="Center" Margin="0,0,8,4"
+                        ToolTip.Tip="{Binding MethodFilterTip}"
+                        AutomationProperties.AutomationId="MethodFilterButton">
+                  <StackPanel Orientation="Horizontal">
+                    <TextBlock Text="{loc:Loc toolbar.method}" VerticalAlignment="Center" />
+                    <Border Classes="filterBadge">
+                      <TextBlock Text="{Binding MethodFilterBadge}" />
+                    </Border>
+                  </StackPanel>
+                  <DropDownButton.Flyout>
+                    <Flyout Placement="Bottom">
+                      <StackPanel Spacing="6" Width="300">
+                        <Button Classes="methodLink" HorizontalAlignment="Left"
+                                Content="{loc:Loc filter.methodSelectAll}"
+                                Command="{Binding SelectAllMethodsCommand}"
+                                AutomationProperties.AutomationId="MethodFilterSelectAll" />
+                        <ItemsControl ItemsSource="{Binding MethodFilterRows}">
+                          <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="vm:MethodFilterRow">
+                              <StackPanel>
+                                <Separator IsVisible="{Binding IsTunnel}" Margin="0,4,0,2" />
+                                <Grid Classes="methodFilterRow" ColumnDefinitions="*,Auto">
+                                  <CheckBox IsChecked="{Binding IsChecked}"
+                                            AutomationProperties.AutomationId="{Binding RowAutomationId}">
+                                    <StackPanel Orientation="Horizontal" Spacing="0">
+                                      <TextBlock Text="{Binding Name}" IsVisible="{Binding !IsTunnel}" />
+                                      <TextBlock Text="{loc:Loc filter.methodTunnels}" IsVisible="{Binding IsTunnel}" />
+                                    </StackPanel>
+                                  </CheckBox>
+                                  <Button Grid.Column="1" Classes="methodOnly"
+                                          Content="{loc:Loc filter.methodOnly}"
+                                          Command="{Binding OnlyCommand}"
+                                          AutomationProperties.AutomationId="{Binding OnlyAutomationId}" />
+                                </Grid>
+                              </StackPanel>
+                            </DataTemplate>
+                          </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                        <TextBlock Text="{loc:Loc filter.methodTypedNote}" TextWrapping="Wrap"
+                                   IsVisible="{Binding MethodFilterShowsTypedNote}"
+                                   Opacity="0.75" FontSize="11"
+                                   AutomationProperties.AutomationId="MethodFilterTypedNote" />
+                      </StackPanel>
+                    </Flyout>
+                  </DropDownButton.Flyout>
+                </DropDownButton>
+                <CheckBox Content="{loc:Loc toolbar.hideImages}" IsChecked="{Binding HideImagesFilter}"
+                          VerticalAlignment="Center" Margin="0,0,8,4"
+                          AutomationProperties.AutomationId="HideImagesFilterCheck" />
+                <CheckBox Content="{loc:Loc toolbar.errorsOnly}" IsChecked="{Binding ErrorsOnlyFilter}"
+                          VerticalAlignment="Center" Margin="0,0,8,4"
+                          AutomationProperties.AutomationId="ErrorsOnlyFilterCheck" />
+                <Button Content="{loc:Loc toolbar.filters}" Command="{Binding OpenFiltersCommand}"
+                        VerticalAlignment="Center" Margin="0,0,8,4"
+                        ToolTip.Tip="{loc:Loc toolbar.filtersTip}"
+                        AutomationProperties.AutomationId="OpenFiltersButton" />
+                <Button Content="{loc:Loc toolbar.clearFilters}" Command="{Binding ClearFiltersCommand}"
+                        VerticalAlignment="Center" Margin="0,0,0,4"
+                        IsEnabled="{Binding HasActiveSearch}"
+                        AutomationProperties.AutomationId="ClearFiltersButton" />
+              </WrapPanel>
+            </StackPanel>
+          </Border>
+        </WrapPanel>
+        <WrapPanel Orientation="Horizontal" IsVisible="{Binding HasFilterChips}"
+                   AutomationProperties.AutomationId="SearchHideChips">
+          <TextBlock Text="{loc:Loc toolbar.hidden}" VerticalAlignment="Center" Margin="0,0,8,6" Opacity="0.65"
+                     IsVisible="{Binding HasHiddenChips}" />
+          <Border IsVisible="{Binding HasRelatedChip}" CornerRadius="10" Padding="8,2" Margin="0,0,6,6"
+                  BorderThickness="1" BorderBrush="{DynamicResource SystemControlForegroundBaseMediumLowBrush}"
+                  Background="{DynamicResource SystemControlBackgroundAltHighBrush}">
+            <TextBlock Text="{Binding RelatedChipText}" VerticalAlignment="Center" />
+          </Border>
+          <ItemsControl ItemsSource="{Binding HiddenHostChips}">
+            <ItemsControl.ItemsPanel>
+              <ItemsPanelTemplate>
+                <WrapPanel />
+              </ItemsPanelTemplate>
+            </ItemsControl.ItemsPanel>
+            <ItemsControl.ItemTemplate>
+              <DataTemplate>
+                <Border CornerRadius="10" Padding="8,2" Margin="0,0,6,6"
+                        BorderThickness="1" BorderBrush="{DynamicResource SystemControlForegroundBaseMediumLowBrush}"
+                        Background="{DynamicResource SystemControlBackgroundAltHighBrush}">
+                  <StackPanel Orientation="Horizontal" Spacing="4">
+                    <TextBlock VerticalAlignment="Center" IsVisible="{Binding DataContext.ShowProcessChipPrefix, RelativeSource={RelativeSource AncestorType=Window}}"
+                               Text="{loc:Loc chip.host}" Opacity="0.65" Margin="0,0,2,0" />
+                    <TextBlock Text="{Binding}" VerticalAlignment="Center" />
+                    <Button Content="×" Padding="4,0" MinWidth="0"
+                            Command="{Binding DataContext.RemoveHiddenHostCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                            CommandParameter="{Binding}"
+                            AutomationProperties.AutomationId="SearchHideChipRemoveHost" />
+                  </StackPanel>
+                </Border>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+          <ItemsControl ItemsSource="{Binding HiddenProcessChips}">
+            <ItemsControl.ItemsPanel>
+              <ItemsPanelTemplate>
+                <WrapPanel />
+              </ItemsPanelTemplate>
+            </ItemsControl.ItemsPanel>
+            <ItemsControl.ItemTemplate>
+              <DataTemplate>
+                <Border CornerRadius="10" Padding="8,2" Margin="0,0,6,6"
+                        BorderThickness="1" BorderBrush="{DynamicResource SystemControlForegroundBaseMediumLowBrush}"
+                        Background="{DynamicResource SystemControlBackgroundAltHighBrush}">
+                  <StackPanel Orientation="Horizontal" Spacing="4">
+                    <TextBlock VerticalAlignment="Center" IsVisible="{Binding DataContext.ShowProcessChipPrefix, RelativeSource={RelativeSource AncestorType=Window}}"
+                               Text="{loc:Loc chip.process}" Opacity="0.65" Margin="0,0,2,0" />
+                    <TextBlock Text="{Binding}" VerticalAlignment="Center" />
+                    <Button Content="×" Padding="4,0" MinWidth="0"
+                            Command="{Binding DataContext.RemoveHiddenProcessCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                            CommandParameter="{Binding}"
+                            AutomationProperties.AutomationId="SearchHideChipRemoveProcess" />
+                  </StackPanel>
+                </Border>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+        </WrapPanel>
+        <!-- Capture toggles on their own wrapping row (separate from filters). -->
+        <WrapPanel Orientation="Horizontal" AutomationProperties.AutomationId="ToolbarCaptureToggles">
+          <CheckBox Content="{loc:Loc menu.capturing}" IsChecked="{Binding Capturing}"
+                    VerticalAlignment="Center" Margin="0,0,12,6"
+                    AutomationProperties.AutomationId="CapturingCheck" />
+          <!-- OneWay + Command: TwoWay leaves the box ticked when CryptUI/install is rejected. -->
+          <CheckBox x:Name="DecryptHttpsCheck" Content="{loc:Loc menu.decryptHttps}"
+                    IsChecked="{Binding DecryptHttps, Mode=OneWay}"
+                    Command="{Binding ToggleDecryptHttpsCommand}"
+                    VerticalAlignment="Center" Margin="0,0,12,6"
+                    AutomationProperties.AutomationId="DecryptHttpsCheck" />
+          <CheckBox x:Name="SystemProxyCheck" Content="{loc:Loc menu.systemProxy}"
+                    IsChecked="{Binding SystemProxy, Mode=OneWay}"
+                    Command="{Binding ToggleSystemProxyCommand}"
+                    VerticalAlignment="Center" Margin="0,0,12,6"
+                    AutomationProperties.AutomationId="SystemProxyCheck" />
+          <TextBlock Text="{loc:Loc toolbar.throttle}" VerticalAlignment="Center" Margin="0,0,6,6" Opacity="0.85" />
+          <ComboBox Width="110" Margin="0,0,12,6" VerticalAlignment="Center"
+                    ItemsSource="{Binding NetworkThrottleProfileNames}"
+                    SelectedItem="{Binding NetworkThrottleProfile}"
+                    ToolTip.Tip="{loc:Loc toolbar.throttleTip}"
+                    AutomationProperties.AutomationId="ComboNetworkThrottle" />
+        </WrapPanel>
+        <!-- Bind / intercept controls wrap independently of the rows above. -->
+        <WrapPanel Orientation="Horizontal" AutomationProperties.AutomationId="ToolbarEndpoint">
+          <TextBox Width="150" Watermark="{loc:Loc toolbar.bindWatermark}" Text="{Binding BindAddress}"
+                   IsEnabled="{Binding BindFieldsEnabled}"
+                   VerticalAlignment="Center" Margin="0,0,12,6"
+                   ToolTip.Tip="{loc:Loc toolbar.bindTip}"
+                   FlowDirection="LeftToRight"
+                   AutomationProperties.AutomationId="ToolbarBindAddress" />
+          <TextBox Width="90" Watermark="{loc:Loc toolbar.portWatermark}" Text="{Binding BindPortText}"
+                   IsEnabled="{Binding BindFieldsEnabled}"
+                   VerticalAlignment="Center" Margin="0,0,12,6"
+                   ToolTip.Tip="{loc:Loc toolbar.portTip}"
+                   AutomationProperties.AutomationId="ToolbarBindPort" />
+          <!-- Accent while idle (Start); quieter default while listening (Stop). Live pip shows running state. -->
+          <Button Content="{Binding InterceptToggleText}" Command="{Binding ToggleInterceptCommand}"
+                  Classes.accent="{Binding BindFieldsEnabled}"
+                  VerticalAlignment="Center" Margin="0,0,12,6"
+                  AutomationProperties.AutomationId="ToggleInterceptButton" />
+          <Ellipse Width="8" Height="8" Margin="0,0,6,6"
+                   VerticalAlignment="Center"
+                   Fill="{DynamicResource SessionStatusSuccessBrush}"
+                   IsVisible="{Binding IsIntercepting}"
+                   ToolTip.Tip="{loc:Loc toolbar.listeningTip}"
+                   AutomationProperties.AutomationId="ListeningIndicator" />
+          <TextBlock Text="{Binding EndpointStatusText}" VerticalAlignment="Center" Opacity="0.85"
+                     TextWrapping="Wrap" MaxWidth="420" Margin="0,0,12,6"
+                     AutomationProperties.AutomationId="EndpointStatusText" />
+          <TextBlock Text="{Binding DecryptTrustHealthText}" VerticalAlignment="Center"
+                     IsVisible="{Binding ShowDecryptTrustHealth}"
+                     Opacity="0.85" Margin="0,0,12,6" FontSize="11"
+                     ToolTip.Tip="{loc:Loc toolbar.trustHealthTip}"
+                     AutomationProperties.AutomationId="DecryptTrustHealthText" />
+        </WrapPanel>
+      </StackPanel>
+      <DataGrid Grid.Row="1" Grid.Column="0" Margin="8,8,4,8"
+                x:Name="SessionsGrid"
+                FlowDirection="LeftToRight"
+                AutomationProperties.AutomationId="SessionsGrid"
+                ItemsSource="{Binding Sessions}"
+                SelectedItem="{Binding SelectedSession}"
+                SelectionMode="Extended"
+                RowHeight="32"
+                IsReadOnly="True"
+                CanUserResizeColumns="True"
+                CanUserReorderColumns="True"
+                CanUserSortColumns="True"
+                GridLinesVisibility="Horizontal"
+                HorizontalScrollBarVisibility="Auto"
+                VerticalScrollBarVisibility="Auto"
+                AutoGenerateColumns="False">
+        <DataGrid.ContextMenu>
+          <ContextMenu AutomationProperties.AutomationId="SessionsContextMenu">
+            <!-- Single-session actions -->
+            <MenuItem Header="{loc:Loc ctx.replay}" Command="{Binding ReplayCommand}"
+                      IsVisible="{Binding HasSingleSelectedSession}"
+                      AutomationProperties.AutomationId="CtxReplay" />
+            <MenuItem Header="{loc:Loc ctx.loadComposer}" Command="{Binding LoadIntoComposerCommand}"
+                      IsVisible="{Binding HasSingleSelectedSession}"
+                      AutomationProperties.AutomationId="CtxLoadComposer" />
+            <MenuItem Header="{loc:Loc ctx.saveAs}" IsVisible="{Binding CanSaveSessionMenu}"
+                      AutomationProperties.AutomationId="CtxSaveAs">
+              <MenuItem Header="{loc:Loc ctx.saveRequest}" Command="{Binding SaveRequestBodyCommand}"
+                        IsVisible="{Binding CanSaveRequestBody}"
+                        AutomationProperties.AutomationId="CtxSaveRequestBody" />
+              <MenuItem Header="{loc:Loc ctx.saveResponse}" Command="{Binding SaveResponseBodyCommand}"
+                        IsVisible="{Binding CanSaveResponseBody}"
+                        AutomationProperties.AutomationId="CtxSaveResponseBody" />
+              <MenuItem Header="{loc:Loc ctx.saveRaw}" Command="{Binding SaveRawHttpCommand}"
+                        IsVisible="{Binding CanSaveRawHttp}"
+                        AutomationProperties.AutomationId="CtxSaveRawHttp" />
+            </MenuItem>
+            <MenuItem Header="{loc:Loc ctx.export}" IsVisible="{Binding HasSelectedSessions}"
+                      AutomationProperties.AutomationId="CtxExport">
+              <MenuItem Header="{loc:Loc menu.exportSelectedHar}" Command="{Binding ExportSelectedHarCommand}"
+                        AutomationProperties.AutomationId="CtxExportSelectedHar" />
+              <MenuItem Header="{loc:Loc menu.exportSelectedArchive}" Command="{Binding ExportSelectedArchiveCommand}"
+                        AutomationProperties.AutomationId="CtxExportSelectedArchive" />
+            </MenuItem>
+            <Separator IsVisible="{Binding HasSelectedSessions}" />
+            <!-- Copy: URL works for multi-select; codegen items need exactly one session. -->
+            <MenuItem Header="{loc:Loc ctx.copyAs}" IsVisible="{Binding CanCopySessionMenu}"
+                      AutomationProperties.AutomationId="CtxCopyAs">
+              <MenuItem Header="{loc:Loc ctx.copyUrl}" Command="{Binding CopyUrlCommand}"
+                        IsVisible="{Binding CanCopyUrl}"
+                        AutomationProperties.AutomationId="CtxCopyUrl" />
+              <MenuItem Header="{loc:Loc ctx.copyCurl}" Command="{Binding CopyAsCurlCommand}"
+                        IsVisible="{Binding CanCopyAsCurl}"
+                        AutomationProperties.AutomationId="CtxCopyAsCurl" />
+              <MenuItem Header="{loc:Loc ctx.copyFetch}" Command="{Binding CopyAsFetchCommand}"
+                        IsVisible="{Binding CanCopyAsCurl}"
+                        AutomationProperties.AutomationId="CtxCopyAsFetch" />
+              <MenuItem Header="{loc:Loc ctx.copyPowerShell}" Command="{Binding CopyAsPowerShellCommand}"
+                        IsVisible="{Binding CanCopyAsCurl}"
+                        AutomationProperties.AutomationId="CtxCopyAsPowerShell" />
+              <MenuItem Header="{loc:Loc ctx.copyPython}" Command="{Binding CopyAsPythonCommand}"
+                        IsVisible="{Binding CanCopyAsCurl}"
+                        AutomationProperties.AutomationId="CtxCopyAsPython" />
+              <Separator IsVisible="{Binding CanCopyAsTable}" />
+              <MenuItem Header="{loc:Loc ctx.copyTable}" Command="{Binding CopyAsTableCommand}"
+                        IsVisible="{Binding CanCopyAsTable}"
+                        AutomationProperties.AutomationId="CtxCopyAsTable" />
+            </MenuItem>
+            <MenuItem Header="{loc:Loc ctx.diff}" Command="{Binding DiffSessionsCommand}"
+                      IsVisible="{Binding CanDiffSessions}"
+                      AutomationProperties.AutomationId="CtxDiffSessions" />
+            <!-- Filter / hide: only when the selection shares one host, status, or process. -->
+            <MenuItem Header="{loc:Loc ctx.filterMenu}" IsVisible="{Binding CanFilterSessionMenu}"
+                      AutomationProperties.AutomationId="CtxFilterMenu">
+              <MenuItem Header="{loc:Loc ctx.filterHost}" Command="{Binding FilterByHostCommand}"
+                        IsVisible="{Binding CanFilterByHost}"
+                        AutomationProperties.AutomationId="CtxFilterByHost" />
+              <MenuItem Header="{loc:Loc ctx.filterStatus}" Command="{Binding FilterByStatusCommand}"
+                        IsVisible="{Binding CanFilterByStatus}"
+                        AutomationProperties.AutomationId="CtxFilterByStatus" />
+              <MenuItem Header="{loc:Loc ctx.filterProcess}" Command="{Binding FilterByProcessCommand}"
+                        IsVisible="{Binding CanFilterByProcess}"
+                        AutomationProperties.AutomationId="CtxFilterByProcess" />
+              <Separator IsVisible="{Binding CanFilterByHost}" />
+              <MenuItem Header="{loc:Loc ctx.hideHost}" Command="{Binding HideHostCommand}"
+                        IsVisible="{Binding CanFilterByHost}"
+                        AutomationProperties.AutomationId="CtxHideHost" />
+              <MenuItem Header="{loc:Loc ctx.hideProcess}" Command="{Binding HideProcessCommand}"
+                        IsVisible="{Binding CanFilterByProcess}"
+                        AutomationProperties.AutomationId="CtxHideProcess" />
+              <!-- Exclude changes MITM decrypt; Hide only changes the list. -->
+              <Separator IsVisible="{Binding CanExcludeHost}" />
+              <MenuItem Header="{loc:Loc ctx.excludeHost}" Command="{Binding ExcludeHostCommand}"
+                        IsVisible="{Binding CanExcludeHost}"
+                        ToolTip.Tip="{loc:Loc ctx.excludeHostTip}"
+                        AutomationProperties.AutomationId="CtxExcludeHost" />
+            </MenuItem>
+            <MenuItem Header="{loc:Loc ctx.mark}" IsVisible="{Binding HasSelectedSessions}"
+                      AutomationProperties.AutomationId="CtxMark">
+              <MenuItem Header="{loc:Loc ctx.markRed}" Command="{Binding SetMarkCommand}" CommandParameter="Red"
+                        AutomationProperties.AutomationId="CtxMarkRed" />
+              <MenuItem Header="{loc:Loc ctx.markOrange}" Command="{Binding SetMarkCommand}" CommandParameter="Orange"
+                        AutomationProperties.AutomationId="CtxMarkOrange" />
+              <MenuItem Header="{loc:Loc ctx.markYellow}" Command="{Binding SetMarkCommand}" CommandParameter="Yellow"
+                        AutomationProperties.AutomationId="CtxMarkYellow" />
+              <MenuItem Header="{loc:Loc ctx.markGreen}" Command="{Binding SetMarkCommand}" CommandParameter="Green"
+                        AutomationProperties.AutomationId="CtxMarkGreen" />
+              <MenuItem Header="{loc:Loc ctx.markBlue}" Command="{Binding SetMarkCommand}" CommandParameter="Blue"
+                        AutomationProperties.AutomationId="CtxMarkBlue" />
+              <MenuItem Header="{loc:Loc ctx.markPurple}" Command="{Binding SetMarkCommand}" CommandParameter="Purple"
+                        AutomationProperties.AutomationId="CtxMarkPurple" />
+              <MenuItem Header="{loc:Loc ctx.markClear}" Command="{Binding SetMarkCommand}" CommandParameter="None"
+                        AutomationProperties.AutomationId="CtxMarkClear" />
+            </MenuItem>
+            <MenuItem Header="{loc:Loc ctx.comment}" Command="{Binding CommentCommand}"
+                      IsVisible="{Binding HasSelectedSessions}"
+                      AutomationProperties.AutomationId="CtxComment" />
+            <MenuItem Header="{loc:Loc ctx.findRelated}" IsVisible="{Binding HasSingleSelectedSession}"
+                      AutomationProperties.AutomationId="CtxFindRelated">
+              <MenuItem Header="{loc:Loc ctx.findRelatedUrl}" Command="{Binding FindRelatedCommand}"
+                        CommandParameter="url" />
+              <MenuItem Header="{loc:Loc ctx.findRelatedConnection}" Command="{Binding FindRelatedCommand}"
+                        CommandParameter="connection" />
+              <MenuItem Header="{loc:Loc ctx.findRelatedReferer}" Command="{Binding FindRelatedCommand}"
+                        CommandParameter="referer" />
+              <MenuItem Header="{loc:Loc ctx.findRelatedRedirect}" Command="{Binding FindRelatedCommand}"
+                        CommandParameter="redirect" />
+            </MenuItem>
+            <Separator IsVisible="{Binding HasSelectedSessions}" />
+            <MenuItem Header="{loc:Loc menu.removeSelected}" Command="{Binding RemoveSelectedSessionsCommand}"
+                      IsVisible="{Binding HasSelectedSessions}"
+                      AutomationProperties.AutomationId="CtxRemoveSelected" />
+            <MenuItem Header="{loc:Loc menu.keepOnly}" Command="{Binding KeepOnlySelectedCommand}"
+                      IsVisible="{Binding CanKeepOnlySelected}"
+                      AutomationProperties.AutomationId="CtxKeepOnlySelected" />
+            <MenuItem Header="{loc:Loc menu.removeMatching}" Command="{Binding RemoveMatchingFilterCommand}"
+                      IsVisible="{Binding CanRemoveMatchingFilter}"
+                      ToolTip.Tip="{loc:Loc menu.removeMatchingTip}"
+                      AutomationProperties.AutomationId="CtxRemoveMatching" />
+          </ContextMenu>
+        </DataGrid.ContextMenu>
+        <DataGrid.Columns>
+          <DataGridTextColumn Header="{loc:Loc menu.col.id}" Binding="{Binding Id}" Width="55" MinWidth="50"
+                              CustomSortComparer="{x:Static svc:SessionIdComparer.Instance}" />
+          <DataGridTextColumn Header="{loc:Loc menu.col.method}" Binding="{Binding Method}" Width="75" MinWidth="60" />
+          <DataGridTemplateColumn Header="{loc:Loc menu.col.status}" Width="65" MinWidth="55" SortMemberPath="StatusCode">
+            <DataGridTemplateColumn.CellTemplate>
+              <DataTemplate x:DataType="svc:SessionSnapshot">
+                <TextBlock Text="{Binding StatusCode}"
+                           FontWeight="{Binding StatusCode, Converter={StaticResource StatusCodeFontWeightConverter}}"
+                           VerticalAlignment="Center">
+                  <TextBlock.Foreground>
+                    <MultiBinding Converter="{StaticResource StatusCodeBrushConverter}">
+                      <Binding Path="StatusCode" />
+                      <Binding Path="DataContext.ThemeRefreshTick" RelativeSource="{RelativeSource AncestorType=Window}" />
+                    </MultiBinding>
+                  </TextBlock.Foreground>
+                </TextBlock>
+              </DataTemplate>
+            </DataGridTemplateColumn.CellTemplate>
+          </DataGridTemplateColumn>
+          <DataGridTemplateColumn Header="{loc:Loc menu.col.host}" Width="210" MinWidth="120" SortMemberPath="Host">
+            <DataGridTemplateColumn.CellTemplate>
+              <DataTemplate x:DataType="svc:SessionSnapshot">
+                <TextBlock Text="{Binding Host}" VerticalAlignment="Center"
+                           ToolTip.Tip="{Binding OpaqueReasonDisplay}" />
+              </DataTemplate>
+            </DataGridTemplateColumn.CellTemplate>
+          </DataGridTemplateColumn>
+          <!-- Path + query: the Host column already shows the host. Tooltip and Ctrl+C keep the full URL. -->
+          <DataGridTemplateColumn Header="{loc:Loc menu.col.url}" Width="320" MinWidth="160" SortMemberPath="Url"
+                                  ClipboardContentBinding="{Binding Url}">
+            <DataGridTemplateColumn.CellTemplate>
+              <DataTemplate x:DataType="svc:SessionSnapshot">
+                <!-- Transparent background keeps the tooltip hoverable when the text is empty (CONNECT). -->
+                <TextBlock Text="{Binding UrlDisplay}" VerticalAlignment="Center"
+                           HorizontalAlignment="Stretch" Background="Transparent"
+                           TextTrimming="CharacterEllipsis"
+                           ToolTip.Tip="{Binding Url}" />
+              </DataTemplate>
+            </DataGridTemplateColumn.CellTemplate>
+          </DataGridTemplateColumn>
+          <DataGridTextColumn Header="{loc:Loc menu.col.protocol}" Binding="{Binding Protocol}" Width="130" MinWidth="120" />
+          <DataGridTextColumn Header="{loc:Loc grid.duration}" Binding="{Binding DurationMs, StringFormat={}{0:0}}"
+                              Width="120" MinWidth="120" SortMemberPath="DurationMs" />
+          <DataGridTextColumn Header="{loc:Loc grid.wait}" Binding="{Binding TtfbMs, StringFormat={}{0:0}}"
+                              Width="100" MinWidth="100" SortMemberPath="TtfbMs" />
+          <DataGridTextColumn Header="{loc:Loc menu.col.size}" Binding="{Binding BodySizeDisplay}"
+                              Width="80" MinWidth="70" SortMemberPath="BodySize" />
+          <DataGridTextColumn Header="{loc:Loc menu.col.process}" Binding="{Binding ProcessDisplay}" Width="140" MinWidth="100" />
+          <!-- Optional columns (hidden until chosen from Options > Columns or the header menu). Appended last so
+               saved DisplayIndex values keep restoring unchanged. Keys: SessionGridColumnCatalog. -->
+          <DataGridTemplateColumn Header="{loc:Loc menu.col.started}" Width="110" MinWidth="80" IsVisible="False"
+                                  SortMemberPath="StartedUtc"
+                                  ClipboardContentBinding="{Binding StartedFullDisplay}">
+            <DataGridTemplateColumn.CellTemplate>
+              <DataTemplate x:DataType="svc:SessionSnapshot">
+                <TextBlock Text="{Binding StartedDisplay}" VerticalAlignment="Center"
+                           TextTrimming="CharacterEllipsis"
+                           ToolTip.Tip="{Binding StartedFullDisplay}" />
+              </DataTemplate>
+            </DataGridTemplateColumn.CellTemplate>
+          </DataGridTemplateColumn>
+          <DataGridTemplateColumn Header="{loc:Loc menu.col.scheme}" Width="70" MinWidth="55" IsVisible="False"
+                                  SortMemberPath="Scheme"
+                                  ClipboardContentBinding="{Binding Scheme}">
+            <DataGridTemplateColumn.CellTemplate>
+              <DataTemplate x:DataType="svc:SessionSnapshot">
+                <TextBlock Text="{Binding Scheme}" VerticalAlignment="Center" />
+              </DataTemplate>
+            </DataGridTemplateColumn.CellTemplate>
+          </DataGridTemplateColumn>
+          <DataGridTemplateColumn Header="{loc:Loc menu.col.contentType}" Width="160" MinWidth="90" IsVisible="False"
+                                  SortMemberPath="ContentType"
+                                  ClipboardContentBinding="{Binding ContentType}">
+            <DataGridTemplateColumn.CellTemplate>
+              <DataTemplate x:DataType="svc:SessionSnapshot">
+                <TextBlock Text="{Binding ContentTypeDisplay}" VerticalAlignment="Center"
+                           TextTrimming="CharacterEllipsis"
+                           ToolTip.Tip="{Binding ContentType}" />
+              </DataTemplate>
+            </DataGridTemplateColumn.CellTemplate>
+          </DataGridTemplateColumn>
+          <DataGridTextColumn Width="160" MinWidth="80" IsVisible="False"
+                              Binding="{Binding Comment}" SortMemberPath="Comment">
+            <DataGridTextColumn.Header>
+              <TextBlock Tag="Comment" Text="{loc:Loc menu.col.comment}" />
+            </DataGridTextColumn.Header>
+          </DataGridTextColumn>
+        </DataGrid.Columns>
+      </DataGrid>
+      <GridSplitter Grid.Row="1" Grid.Column="1" Width="4" ResizeDirection="Columns"
+                    IsVisible="{Binding ShowSessionDetails}" />
+      <DockPanel Grid.Row="1" Grid.Column="2" Margin="4,8,0,8"
+                 IsVisible="{Binding ShowSessionDetails}"
+                 MinWidth="360"
+                 ClipToBounds="True">
+        <DockPanel DockPanel.Dock="Top" Margin="0,0,0,4" LastChildFill="True">
+          <Button DockPanel.Dock="Right"
+                  Classes="paneCloseBtn"
+                  Content="✕"
+                  ToolTip.Tip="{loc:Loc pane.closeTip}"
+                  Command="{Binding CloseSessionDetailsCommand}"
+                  AutomationProperties.AutomationId="CloseDetailsButton" />
+          <TextBlock Text="{Binding PaneContentTitle}" VerticalAlignment="Center" FontWeight="SemiBold" FontSize="15"
+                     AutomationProperties.AutomationId="PaneContentTitle" />
+        </DockPanel>
+        <Grid ClipToBounds="True" MinWidth="160">
+            <Grid IsVisible="{Binding ShowInspectPane}"
+                  FlowDirection="LeftToRight"
+                  SizeChanged="OnInspectHostSizeChanged"
+                  AutomationProperties.AutomationId="TabInspectHost">
+              <TextBlock Text="{loc:Loc inspect.empty}"
+                         Margin="12" TextWrapping="Wrap" Opacity="0.75"
+                         IsVisible="{Binding ShowInspectEmpty}"
+                         AutomationProperties.AutomationId="InspectEmptyHint" />
+              <TabControl x:Name="InspectTabs"
+                          AutomationProperties.AutomationId="InspectTabs"
+                          IsVisible="{Binding HasSelectedSession}"
+                          ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                          SelectedIndex="{Binding SelectedInspectTabIndex}">
+                <TabItem Header="{loc:Loc inspect.request}" ToolTip.Tip="{loc:Loc inspect.requestTip}"
+                         AutomationProperties.AutomationId="TabRequest">
+                  <Grid x:Name="RequestInspectSplit" ClipToBounds="True">
+                    <Grid.RowDefinitions>
+                      <RowDefinition Height="Auto"/>
+                      <RowDefinition Height="Auto"/>
+                      <RowDefinition Height="*" MinHeight="56"/>
+                      <RowDefinition Height="Auto"/>
+                      <RowDefinition Height="2*" MinHeight="96"/>
+                    </Grid.RowDefinitions>
+                    <TextBlock Grid.Row="0" Text="{Binding SelectedOpaqueHint}" Margin="0,0,0,8"
+                               TextWrapping="Wrap" Opacity="0.85" FontSize="12"
+                               IsVisible="{Binding ShowSelectedOpaqueHint}"
+                               AutomationProperties.AutomationId="SelectedOpaqueHint" />
+                    <Grid Grid.Row="1" ColumnDefinitions="Auto,*,Auto" Margin="0,0,0,4">
+                      <Button Grid.Column="0" MinWidth="28" MinHeight="28" Padding="4,0"
+                              Content="{Binding InspectHeadersToggleGlyph}"
+                              ToolTip.Tip="{Binding InspectHeadersToggleTip}"
+                              Command="{Binding ToggleInspectHeadersCommand}"
+                              AutomationProperties.AutomationId="ToggleReqHeadersPane" />
+                      <TextBlock Grid.Column="1" Text="{Binding RequestHeadersCaption}"
+                                 VerticalAlignment="Center" Margin="8,0" FontWeight="SemiBold" />
+                      <Button Grid.Column="2" Content="{loc:Loc inspect.copyHeaders}" Command="{Binding CopyRequestHeadersCommand}"
+                              AutomationProperties.AutomationId="CopyReqHeaders" />
+                    </Grid>
+                    <TextBox Grid.Row="2" IsReadOnly="True" Text="{Binding SelectedRequestHeaders}"
+                             AcceptsReturn="True" TextWrapping="Wrap"
+                             IsVisible="{Binding ShowInspectHeadersPane}"
+                             VerticalAlignment="Stretch" HorizontalAlignment="Stretch"
+                             FontFamily="Consolas,Courier New,monospace"
+                             AutomationProperties.AutomationId="ReqHeadersText" />
+                    <GridSplitter Grid.Row="3" Height="6" HorizontalAlignment="Stretch"
+                                  ResizeDirection="Rows"
+                                  IsVisible="{Binding ShowInspectHeadersPane}"
+                                  DragCompleted="OnInspectHeadersSplitterDragCompleted"
+                                  DoubleTapped="OnInspectHeadersSplitterDoubleTapped"
+                                  ToolTip.Tip="{loc:Loc inspect.resizeTip}"
+                                  AutomationProperties.AutomationId="ReqHeadersSplitter" />
+                    <Grid Grid.Row="4" RowDefinitions="Auto,Auto,*">
+                      <TextBlock Grid.Row="0" Text="{Binding RequestBodyCaptureHint}" Margin="0,0,0,8"
+                                 TextWrapping="Wrap" Opacity="0.85" FontSize="12"
+                                 IsVisible="{Binding ShowRequestBodyCaptureHint}"
+                                 AutomationProperties.AutomationId="ReqBodyCaptureHint" />
+                      <Grid Grid.Row="1" ColumnDefinitions="*,Auto" Margin="0,0,0,8">
+                        <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="16" VerticalAlignment="Center"
+                                    IsVisible="{Binding ShowBodyModeToggles}">
+                          <Border Background="Transparent" ToolTip.Tip="{Binding BodyPrettyToolTip}">
+                            <CheckBox Content="{loc:Loc inspect.pretty}" IsChecked="{Binding BodyPrettyMode}"
+                                      IsEnabled="{Binding BodyPrettyEnabled}"
+                                      AutomationProperties.AutomationId="BodyPretty" />
+                          </Border>
+                          <CheckBox Content="{loc:Loc inspect.hex}" IsChecked="{Binding BodyHexMode}"
+                                    ToolTip.Tip="{loc:Loc inspect.hexTip}"
+                                    AutomationProperties.AutomationId="BodyHex" />
+                        </StackPanel>
+                        <Button Grid.Column="1" Content="{loc:Loc inspect.saveRequest}" Command="{Binding SaveRequestBodyCommand}"
+                                IsEnabled="{Binding CanSaveRequestBody}"
+                                AutomationProperties.AutomationId="SaveRequestBody" />
+                      </Grid>
+                      <Grid Grid.Row="2">
+                        <Grid.RowDefinitions>
+                          <RowDefinition Height="{Binding RequestBodyImageRowHeight}"/>
+                          <RowDefinition Height="*"/>
+                        </Grid.RowDefinitions>
+                        <Image Grid.Row="0" Source="{Binding RequestBodyPreviewBitmap}"
+                               Stretch="Uniform" Margin="0,0,0,8"
+                               IsVisible="{Binding ShowRequestBodyPreviewImage}"
+                               AutomationProperties.AutomationId="ReqBodyPreviewImage" />
+                        <TextBox Grid.Row="1" IsReadOnly="True" Text="{Binding SelectedRequestBody}"
+                                 Opacity="{Binding RequestBodyOpacity}"
+                                 AcceptsReturn="True" TextWrapping="Wrap"
+                                 VerticalAlignment="Stretch" HorizontalAlignment="Stretch"
+                                 FontFamily="Consolas,Courier New,monospace"
+                                 AutomationProperties.AutomationId="ReqBodyText" />
+                      </Grid>
+                    </Grid>
+                  </Grid>
+                </TabItem>
+                <TabItem Header="{loc:Loc inspect.response}" ToolTip.Tip="{loc:Loc inspect.responseTip}"
+                         AutomationProperties.AutomationId="TabResponse">
+                  <Grid x:Name="ResponseInspectSplit" ClipToBounds="True">
+                    <Grid.RowDefinitions>
+                      <RowDefinition Height="Auto"/>
+                      <RowDefinition Height="Auto"/>
+                      <RowDefinition Height="*" MinHeight="56"/>
+                      <RowDefinition Height="Auto"/>
+                      <RowDefinition Height="2*" MinHeight="96"/>
+                    </Grid.RowDefinitions>
+                    <TextBlock Grid.Row="0" Text="{Binding SelectedOpaqueHint}" Margin="0,0,0,8"
+                               TextWrapping="Wrap" Opacity="0.85" FontSize="12"
+                               IsVisible="{Binding ShowSelectedOpaqueHint}"
+                               AutomationProperties.AutomationId="RespOpaqueHint" />
+                    <Grid Grid.Row="1" ColumnDefinitions="Auto,*,Auto" Margin="0,0,0,4">
+                      <Button Grid.Column="0" MinWidth="28" MinHeight="28" Padding="4,0"
+                              Content="{Binding InspectHeadersToggleGlyph}"
+                              ToolTip.Tip="{Binding InspectHeadersToggleTip}"
+                              Command="{Binding ToggleInspectHeadersCommand}"
+                              AutomationProperties.AutomationId="ToggleRespHeadersPane" />
+                      <TextBlock Grid.Column="1" Text="{Binding ResponseHeadersCaption}"
+                                 VerticalAlignment="Center" Margin="8,0" FontWeight="SemiBold" />
+                      <Button Grid.Column="2" Content="{loc:Loc inspect.copyHeaders}" Command="{Binding CopyResponseHeadersCommand}"
+                              AutomationProperties.AutomationId="CopyRespHeaders" />
+                    </Grid>
+                    <TextBox Grid.Row="2" IsReadOnly="True" Text="{Binding SelectedResponseHeaders}"
+                             Opacity="{Binding ResponseHeadersOpacity}"
+                             AcceptsReturn="True" TextWrapping="Wrap"
+                             IsVisible="{Binding ShowInspectHeadersPane}"
+                             VerticalAlignment="Stretch" HorizontalAlignment="Stretch"
+                             FontFamily="Consolas,Courier New,monospace"
+                             AutomationProperties.AutomationId="RespHeadersText" />
+                    <GridSplitter Grid.Row="3" Height="6" HorizontalAlignment="Stretch"
+                                  ResizeDirection="Rows"
+                                  IsVisible="{Binding ShowInspectHeadersPane}"
+                                  DragCompleted="OnInspectHeadersSplitterDragCompleted"
+                                  DoubleTapped="OnInspectHeadersSplitterDoubleTapped"
+                                  ToolTip.Tip="{loc:Loc inspect.resizeTip}"
+                                  AutomationProperties.AutomationId="RespHeadersSplitter" />
+                    <Grid Grid.Row="4" RowDefinitions="Auto,Auto,*">
+                      <TextBlock Grid.Row="0" Text="{Binding ResponseBodyCaptureHint}" Margin="0,0,0,8"
+                                 TextWrapping="Wrap" Opacity="0.85" FontSize="12"
+                                 IsVisible="{Binding ShowResponseBodyCaptureHint}"
+                                 AutomationProperties.AutomationId="RespBodyCaptureHint" />
+                      <Grid Grid.Row="1" ColumnDefinitions="*,Auto" Margin="0,0,0,8">
+                        <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="16" VerticalAlignment="Center"
+                                    IsVisible="{Binding ShowBodyModeToggles}">
+                          <Border Background="Transparent" ToolTip.Tip="{Binding BodyPrettyToolTip}">
+                            <CheckBox Content="{loc:Loc inspect.pretty}" IsChecked="{Binding BodyPrettyMode}"
+                                      IsEnabled="{Binding BodyPrettyEnabled}"
+                                      AutomationProperties.AutomationId="RespBodyPretty" />
+                          </Border>
+                          <CheckBox Content="{loc:Loc inspect.hex}" IsChecked="{Binding BodyHexMode}"
+                                    ToolTip.Tip="{loc:Loc inspect.hexTip}"
+                                    AutomationProperties.AutomationId="RespBodyHex" />
+                        </StackPanel>
+                        <Button Grid.Column="1" Content="{loc:Loc inspect.saveResponse}" Command="{Binding SaveResponseBodyCommand}"
+                                IsEnabled="{Binding CanSaveResponseBody}"
+                                AutomationProperties.AutomationId="SaveResponseBody" />
+                      </Grid>
+                      <Grid Grid.Row="2">
+                        <Grid.RowDefinitions>
+                          <RowDefinition Height="{Binding ResponseBodyImageRowHeight}"/>
+                          <RowDefinition Height="*"/>
+                        </Grid.RowDefinitions>
+                        <Image Grid.Row="0" Source="{Binding ResponseBodyPreviewBitmap}"
+                               Stretch="Uniform" Margin="0,0,0,8"
+                               IsVisible="{Binding ShowResponseBodyPreviewImage}"
+                               AutomationProperties.AutomationId="BodyPreviewImage" />
+                        <TextBox Grid.Row="1" IsReadOnly="True" Text="{Binding SelectedResponseBody}"
+                                 Opacity="{Binding ResponseBodyOpacity}"
+                                 AcceptsReturn="True" TextWrapping="Wrap"
+                                 VerticalAlignment="Stretch" HorizontalAlignment="Stretch"
+                                 FontFamily="Consolas,Courier New,monospace"
+                                 AutomationProperties.AutomationId="RespBodyText" />
+                      </Grid>
+                    </Grid>
+                  </Grid>
+                </TabItem>
+                <TabItem Header="{loc:Loc inspect.diff}" AutomationProperties.AutomationId="TabDiff"
+                         IsVisible="{Binding CanShowSessionDiffTab}">
+                  <TextBox IsReadOnly="True" Text="{Binding SessionDiffText}" AcceptsReturn="True" TextWrapping="Wrap"
+                           FontFamily="Consolas,Courier New,monospace" AutomationProperties.AutomationId="DiffText" />
+                </TabItem>
+                <TabItem Header="{loc:Loc inspect.frames}" AutomationProperties.AutomationId="TabFrames"
+                         IsVisible="{Binding ShowWsFramesTab}">
+                  <DockPanel>
+                    <TextBlock DockPanel.Dock="Top" Margin="8,8,8,0" Opacity="0.75" TextWrapping="Wrap"
+                               Text="{loc:Loc inspect.framesHelp}" />
+                    <TextBox IsReadOnly="True" Text="{Binding SelectedFrames}" AcceptsReturn="True" TextWrapping="Wrap"
+                             Margin="0,4,0,0"
+                             FontFamily="Consolas,Courier New,monospace" AutomationProperties.AutomationId="FramesText" />
+                  </DockPanel>
+                </TabItem>
+                <TabItem Header="{loc:Loc inspect.sse}" AutomationProperties.AutomationId="TabSse"
+                         IsVisible="{Binding ShowSseTab}">
+                  <DockPanel>
+                    <TextBlock DockPanel.Dock="Top" Margin="8,8,8,0" Opacity="0.75" TextWrapping="Wrap"
+                               Text="{loc:Loc inspect.sseHelp}" />
+                    <TextBox IsReadOnly="True" Text="{Binding SelectedSseEvents}" AcceptsReturn="True" TextWrapping="Wrap"
+                             Margin="0,4,0,0"
+                             FontFamily="Consolas,Courier New,monospace" AutomationProperties.AutomationId="SseText" />
+                  </DockPanel>
+                </TabItem>
+                <TabItem Header="{loc:Loc inspect.protobuf}" AutomationProperties.AutomationId="TabProtobuf"
+                         IsVisible="{Binding ShowProtobufTab}">
+                  <TextBox IsReadOnly="True" Text="{Binding SelectedProtobufDecoded}" AcceptsReturn="True" TextWrapping="Wrap"
+                           FontFamily="Consolas,Courier New,monospace" AutomationProperties.AutomationId="ProtobufText" />
+                </TabItem>
+                <TabItem Header="{loc:Loc inspect.statistics}" AutomationProperties.AutomationId="TabStatistics">
+                  <ScrollViewer HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto">
+                    <StackPanel Margin="12" Spacing="8">
+                      <TextBlock Text="{Binding StatisticsSummary}" TextWrapping="Wrap"
+                                 AutomationProperties.AutomationId="StatisticsSummary" />
+                      <ItemsControl ItemsSource="{Binding StatisticsPhases}"
+                                    IsVisible="{Binding ShowStatisticsBar}"
+                                    AutomationProperties.AutomationId="StatisticsBar"
+                                    AutomationProperties.Name="{Binding StatisticsBarName}">
+                        <ItemsControl.ItemsPanel>
+                          <ItemsPanelTemplate>
+                            <StackPanel Orientation="Horizontal" Spacing="1" />
+                          </ItemsPanelTemplate>
+                        </ItemsControl.ItemsPanel>
+                        <ItemsControl.ItemTemplate>
+                          <DataTemplate x:DataType="vm:StatisticsPhaseRow">
+                            <Border Width="{Binding BarWidth}" Height="12" Opacity="{Binding Opacity}"
+                                    Background="{DynamicResource SystemControlForegroundBaseHighBrush}"
+                                    ToolTip.Tip="{Binding ToolTip}" />
+                          </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                      </ItemsControl>
+                      <ItemsControl ItemsSource="{Binding StatisticsPhases}"
+                                    IsVisible="{Binding ShowStatisticsBar}">
+                        <ItemsControl.ItemTemplate>
+                          <DataTemplate x:DataType="vm:StatisticsPhaseRow">
+                            <Grid ColumnDefinitions="168,*,72" Margin="0,2,0,2">
+                              <TextBlock Text="{Binding Label}" VerticalAlignment="Center" />
+                              <Border Grid.Column="1" Height="8" HorizontalAlignment="Left"
+                                      Width="{Binding BarWidth}" Opacity="{Binding Opacity}"
+                                      Background="{DynamicResource SystemControlForegroundBaseHighBrush}"
+                                      VerticalAlignment="Center" ToolTip.Tip="{Binding ToolTip}" />
+                              <TextBlock Grid.Column="2" Text="{Binding MillisecondsText}"
+                                         HorizontalAlignment="Right" VerticalAlignment="Center" />
+                            </Grid>
+                          </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                      </ItemsControl>
+                      <ItemsControl ItemsSource="{Binding StatisticsEvents}"
+                                    IsVisible="{Binding ShowStatisticsEvents}">
+                        <ItemsControl.ItemTemplate>
+                          <DataTemplate x:DataType="vm:StatisticsEventRow">
+                            <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,2,0,2">
+                              <TextBlock Text="{Binding TimeText}" MinWidth="72" Opacity="0.75" />
+                              <TextBlock Text="{Binding Text}" TextWrapping="Wrap"
+                                         Foreground="{DynamicResource InspectorErrorTextBrush}"
+                                         IsVisible="{Binding IsFailure}" />
+                              <TextBlock Text="{Binding Text}" TextWrapping="Wrap"
+                                         IsVisible="{Binding ShowPlain}" />
+                            </StackPanel>
+                          </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                      </ItemsControl>
+                      <Button Content="{loc:Loc stats.copy}" Command="{Binding CopyStatisticsCommand}"
+                              HorizontalAlignment="Left"
+                              AutomationProperties.AutomationId="StatisticsCopy" />
+                    </StackPanel>
+                  </ScrollViewer>
+                </TabItem>
+              </TabControl>
+            </Grid>
+            <ScrollViewer IsVisible="{Binding ShowComposerPane}"
+                          FlowDirection="LeftToRight"
+                          HorizontalScrollBarVisibility="Disabled"
+                          VerticalScrollBarVisibility="Auto"
+                          AutomationProperties.AutomationId="TabComposer">
+              <StackPanel Margin="8" Spacing="8">
+                <TextBlock Opacity="0.75" TextWrapping="Wrap"
+                           Text="{loc:Loc composer.help}" />
+                <Grid ColumnDefinitions="Auto,*" Margin="0">
+                  <TextBox Grid.Column="0" Width="80" MinWidth="64" Watermark="{loc:Loc composer.method}" Text="{Binding ComposerMethod}" Margin="0,0,8,0"
+                           AutomationProperties.AutomationId="ComposerMethod" />
+                  <TextBox Grid.Column="1" Watermark="{loc:Loc composer.url}" Text="{Binding ComposerUrl}"
+                           MinWidth="80"
+                           AutomationProperties.AutomationId="ComposerUrl" />
+                </Grid>
+                <TextBox Watermark="{loc:Loc composer.headers}" Text="{Binding ComposerHeaders}"
+                         AcceptsReturn="True" Height="100" FontFamily="Consolas,Courier New,monospace"
+                         AutomationProperties.AutomationId="ComposerHeaders" />
+                <TextBox Watermark="{loc:Loc composer.body}" Text="{Binding ComposerBody}"
+                         AcceptsReturn="True" Height="120" FontFamily="Consolas,Courier New,monospace"
+                         IsEnabled="{Binding ComposerBodyEditorEnabled}"
+                         AutomationProperties.AutomationId="ComposerBody" />
+                <TextBlock Text="{Binding ComposerBodyFromFileHint}" Opacity="0.85" TextWrapping="Wrap"
+                           IsVisible="{Binding HasComposerBodyFile}"
+                           AutomationProperties.AutomationId="ComposerBodyFromFileHint" />
+                <WrapPanel>
+                  <Button Content="{loc:Loc composer.loadSelected}" Command="{Binding LoadFromSelectedCommand}" Margin="0,0,8,8"
+                          AutomationProperties.AutomationId="ComposerLoad" />
+                  <Button Content="{loc:Loc composer.loadBody}" Command="{Binding LoadComposerBodyFileCommand}" Margin="0,0,8,8"
+                          AutomationProperties.AutomationId="ComposerLoadBodyFile" />
+                  <Button Content="{loc:Loc composer.send}" Command="{Binding SendComposerCommand}" Margin="0,0,8,8"
+                          AutomationProperties.AutomationId="ComposerSend" />
+                </WrapPanel>
+              </StackPanel>
+            </ScrollViewer>
+            <ScrollViewer IsVisible="{Binding ShowBreakpointsPane}"
+                          FlowDirection="LeftToRight"
+                          HorizontalScrollBarVisibility="Disabled"
+                          VerticalScrollBarVisibility="Auto"
+                          AutomationProperties.AutomationId="TabBreakpoints">
+            <StackPanel Margin="8" Spacing="8">
+              <TextBlock Opacity="0.75" TextWrapping="Wrap"
+                         Text="{loc:Loc bp.help}" />
+              <Border IsVisible="{Binding HasActiveBreakpoint}" Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}"
+                      CornerRadius="4" Padding="8,6" AutomationProperties.AutomationId="BreakpointHitBanner">
+                <TextBlock Text="{Binding BreakpointHitBanner}" TextWrapping="Wrap" FontWeight="SemiBold" />
+              </Border>
+              <CheckBox Content="{loc:Loc bp.enabled}" IsChecked="{Binding Breakpoints.Enabled}"
+                        AutomationProperties.AutomationId="BreakpointEnabled" />
+              <CheckBox Content="{loc:Loc bp.breakOnResponse}" IsChecked="{Binding BreakpointOnResponse}"
+                        AutomationProperties.AutomationId="BreakpointOnResponse" />
+              <TextBlock Text="{loc:Loc bp.match}" />
+              <TextBox Watermark="{loc:Loc bp.urlWatermark}" Text="{Binding Breakpoints.UrlFilter}"
+                       AutomationProperties.AutomationId="BreakpointUrlFilter" />
+              <TextBox Watermark="{loc:Loc bp.graphqlWatermark}"
+                       Text="{Binding Breakpoints.GraphQlOperationName}"
+                       ToolTip.Tip="{loc:Loc bp.graphqlTip}"
+                       AutomationProperties.AutomationId="BreakpointGraphQlOperation" />
+              <Button Content="{loc:Loc bp.fromSelected}"
+                      HorizontalAlignment="Left"
+                      Command="{Binding FillGraphQlFromSelectedCommand}"
+                      ToolTip.Tip="{loc:Loc bp.fromSelectedTip}"
+                      AutomationProperties.AutomationId="BreakpointGraphQlFromSelected" />
+              <TextBlock Opacity="0.75" FontSize="12" TextWrapping="Wrap"
+                         Text="{loc:Loc bp.graphqlHelp}" />
+              <TextBox Watermark="{loc:Loc bp.editWatermark}" Text="{Binding BreakpointEditBody}"
+                       AcceptsReturn="True" Height="80" FontFamily="Consolas,Courier New,monospace"
+                       AutomationProperties.AutomationId="BreakpointEditBody" />
+              <WrapPanel>
+                <Button Content="{loc:Loc bp.applyEdit}" Command="{Binding ApplyEditBodyCommand}" Margin="0,0,8,8"
+                        AutomationProperties.AutomationId="BreakpointApply" />
+                <Button Content="{loc:Loc bp.continue}" Command="{Binding ContinueBreakpointCommand}" Margin="0,0,8,8"
+                        AutomationProperties.AutomationId="BreakpointContinue" />
+                <Button Content="{loc:Loc bp.abort}" Command="{Binding AbortBreakpointCommand}" Margin="0,0,8,8"
+                        AutomationProperties.AutomationId="BreakpointAbort" />
+              </WrapPanel>
+            </StackPanel>
+            </ScrollViewer>
+          <ScrollViewer IsVisible="{Binding ShowAutoResponderPane}"
+                        FlowDirection="LeftToRight"
+                        HorizontalScrollBarVisibility="Disabled"
+                        VerticalScrollBarVisibility="Auto"
+                        AutomationProperties.AutomationId="TabAutoResponder">
+            <StackPanel Margin="8" Spacing="8">
+              <TextBlock Opacity="0.75" TextWrapping="Wrap"
+                         Text="{loc:Loc ar.help}" />
+              <CheckBox Content="{loc:Loc ar.enabled}" IsChecked="{Binding AutoResponder.Enabled}"
+                        AutomationProperties.AutomationId="AutoResponderEnabled" />
+              <ListBox ItemsSource="{Binding AutoResponder.Rules}"
+                       SelectedItem="{Binding AutoResponder.SelectedRule}"
+                       Height="120"
+                       MinHeight="80"
+                       AutomationProperties.AutomationId="AutoResponderRules">
+                <ListBox.ItemTemplate>
+                  <DataTemplate>
+                    <TextBlock Text="{Binding Display}" />
+                  </DataTemplate>
+                </ListBox.ItemTemplate>
+              </ListBox>
+              <TextBlock Text="{loc:Loc bp.match}" />
+              <TextBox Watermark="{loc:Loc ar.urlWatermark}" Text="{Binding AutoResponderMatch}"
+                       AutomationProperties.AutomationId="AutoResponderMatch" />
+              <TextBox Watermark="{loc:Loc bp.graphqlWatermark}"
+                       Text="{Binding AutoResponderGraphQlOperation}"
+                       ToolTip.Tip="{loc:Loc bp.graphqlTip}"
+                       AutomationProperties.AutomationId="AutoResponderGraphQlOperation" />
+              <Button Content="{loc:Loc bp.fromSelected}"
+                      HorizontalAlignment="Left"
+                      Command="{Binding FillGraphQlFromSelectedCommand}"
+                      ToolTip.Tip="{loc:Loc bp.fromSelectedTip}"
+                      AutomationProperties.AutomationId="AutoResponderGraphQlFromSelected" />
+              <TextBlock Opacity="0.75" FontSize="12" TextWrapping="Wrap"
+                         Text="{loc:Loc ar.graphqlHelp}" />
+              <TextBlock Text="{loc:Loc ar.respondWith}" />
+              <WrapPanel>
+                <TextBox Watermark="100–599" Text="{Binding AutoResponderStatusText}" Width="80" Margin="0,0,8,8"
+                         ToolTip.Tip="{loc:Loc ar.statusTip}"
+                         AutomationProperties.AutomationId="AutoResponderStatus" />
+                <TextBox Watermark="{loc:Loc ar.contentType}" Text="{Binding AutoResponderContentType}" Width="160" Margin="0,0,8,8"
+                         AutomationProperties.AutomationId="AutoResponderContentType" />
+              </WrapPanel>
+              <Grid ColumnDefinitions="*,Auto">
+                <TextBox Grid.Column="0" Watermark="{loc:Loc ar.mapLocal}" Text="{Binding AutoResponderLocalFilePath}"
+                         Margin="0,0,8,0"
+                         AutomationProperties.AutomationId="AutoResponderLocalFile" />
+                <Button Grid.Column="1" Content="{loc:Loc common.browse}" Command="{Binding BrowseAutoResponderLocalFileCommand}"
+                        AutomationProperties.AutomationId="AutoResponderBrowseLocal" />
+              </Grid>
+              <TextBox Watermark="{loc:Loc ar.bodyWatermark}" Text="{Binding AutoResponderBody}" AcceptsReturn="True" Height="80"
+                       AutomationProperties.AutomationId="AutoResponderBody" />
+              <WrapPanel>
+                <Button Content="{loc:Loc ar.add}" Command="{Binding AddAutoResponderRuleCommand}" Margin="0,0,8,8"
+                        AutomationProperties.AutomationId="AutoResponderAdd" />
+                <Button Content="{loc:Loc ar.update}" Command="{Binding UpdateAutoResponderRuleCommand}" Margin="0,0,8,8"
+                        AutomationProperties.AutomationId="AutoResponderUpdate" />
+                <Button Content="{loc:Loc ar.delete}" Command="{Binding DeleteAutoResponderRuleCommand}" Margin="0,0,8,8"
+                        AutomationProperties.AutomationId="AutoResponderDelete" />
+              </WrapPanel>
+              <TextBlock Text="{Binding PlusPanelsSummary}" TextWrapping="Wrap" Opacity="0.7" />
+            </StackPanel>
+          </ScrollViewer>
+          <ScrollViewer IsVisible="{Binding ShowScriptsPane}"
+                        FlowDirection="LeftToRight"
+                        HorizontalScrollBarVisibility="Disabled"
+                        VerticalScrollBarVisibility="Auto"
+                        AutomationProperties.AutomationId="TabScripts">
+            <StackPanel Margin="8" Spacing="8">
+              <TextBlock Opacity="0.75" TextWrapping="Wrap"
+                         Text="{loc:Loc script.intro}" />
+              <Border Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}"
+                      CornerRadius="4" Padding="8,6"
+                      AutomationProperties.AutomationId="ScriptSyntaxHelp">
+                <StackPanel Spacing="6">
+                  <TextBlock FontWeight="SemiBold" Text="{loc:Loc script.what}" />
+                  <StackPanel Spacing="2">
+                    <TextBlock FontFamily="Consolas,Courier New,monospace" Text="set-header Name: Value" />
+                    <TextBlock Opacity="0.8" FontSize="12" TextWrapping="Wrap"
+                               Text="{loc:Loc script.setHeaderHelp}" />
+                  </StackPanel>
+                  <StackPanel Spacing="2">
+                    <TextBlock FontFamily="Consolas,Courier New,monospace" Text="set-status 404" />
+                    <TextBlock Opacity="0.8" FontSize="12" TextWrapping="Wrap"
+                               Text="{loc:Loc script.setStatusHelp}" />
+                  </StackPanel>
+                  <StackPanel Spacing="2">
+                    <TextBlock FontFamily="Consolas,Courier New,monospace" Text="abort" />
+                    <TextBlock Opacity="0.8" FontSize="12" TextWrapping="Wrap"
+                               Text="{loc:Loc script.abortHelp}" />
+                  </StackPanel>
+                  <TextBlock Opacity="0.75" FontSize="12" TextWrapping="Wrap"
+                             Text="{loc:Loc script.comment}" />
+                </StackPanel>
+              </Border>
+              <TextBlock Text="{loc:Loc script.onRequest}" />
+              <TextBox Text="{Binding ScriptOnRequest}" AcceptsReturn="True" Height="100"
+                       FontFamily="Consolas,Courier New,monospace"
+                       Watermark="Example: set-header X-Debug: 1"
+                       ToolTip.Tip="One command per line. Example:&#x0a;set-header X-Debug: 1&#x0a;set-status 404&#x0a;abort"
+                       AutomationProperties.AutomationId="ScriptOnRequest" />
+              <TextBlock Opacity="0.75" FontSize="12" TextWrapping="Wrap"
+                         Text="{loc:Loc script.requestSkips}" />
+              <TextBlock Text="{loc:Loc script.onResponse}" />
+              <TextBox Text="{Binding ScriptOnResponse}" AcceptsReturn="True" Height="100"
+                       FontFamily="Consolas,Courier New,monospace"
+                       Watermark="Example: set-header Cache-Control: no-store"
+                       ToolTip.Tip="One command per line. Example:&#x0a;set-header Cache-Control: no-store&#x0a;set-status 418"
+                       AutomationProperties.AutomationId="ScriptOnResponse" />
+            </StackPanel>
+          </ScrollViewer>
+          <ScrollViewer IsVisible="{Binding ShowMapRemotePane}"
+                        FlowDirection="LeftToRight"
+                        HorizontalScrollBarVisibility="Disabled"
+                        VerticalScrollBarVisibility="Auto"
+                        AutomationProperties.AutomationId="TabMapRemote">
+            <StackPanel Margin="8" Spacing="8">
+              <TextBlock Opacity="0.75" TextWrapping="Wrap"
+                         Text="{loc:Loc map.help}" />
+              <CheckBox Content="{loc:Loc bp.enabled}" IsChecked="{Binding MapRemote.Enabled}"
+                        AutomationProperties.AutomationId="MapRemoteEnabled" />
+              <ListBox ItemsSource="{Binding MapRemote.Rules}"
+                       SelectedItem="{Binding MapRemote.SelectedRule}"
+                       Height="120"
+                       MinHeight="80"
+                       AutomationProperties.AutomationId="MapRemoteRules">
+                <ListBox.ItemTemplate>
+                  <DataTemplate>
+                    <TextBlock Text="{Binding Display}" />
+                  </DataTemplate>
+                </ListBox.ItemTemplate>
+              </ListBox>
+              <TextBlock Text="{loc:Loc bp.match}" />
+              <TextBox Watermark="{loc:Loc ar.urlWatermark}" Text="{Binding MapRemoteMatch}"
+                       AutomationProperties.AutomationId="MapRemoteMatch" />
+              <TextBox Watermark="{loc:Loc bp.graphqlWatermark}"
+                       Text="{Binding MapRemoteGraphQlOperation}"
+                       ToolTip.Tip="{loc:Loc bp.graphqlTip}"
+                       AutomationProperties.AutomationId="MapRemoteGraphQlOperation" />
+              <Button Content="{loc:Loc bp.fromSelected}"
+                      HorizontalAlignment="Left"
+                      Command="{Binding FillGraphQlFromSelectedCommand}"
+                      ToolTip.Tip="{loc:Loc bp.fromSelectedTip}"
+                      AutomationProperties.AutomationId="MapRemoteGraphQlFromSelected" />
+              <TextBlock Opacity="0.75" FontSize="12" TextWrapping="Wrap"
+                         Text="{loc:Loc map.graphqlHelp}" />
+              <TextBlock Text="{loc:Loc map.rewriteTo}" />
+              <TextBox Watermark="{loc:Loc map.targetWatermark}" Text="{Binding MapRemoteTarget}"
+                       AutomationProperties.AutomationId="MapRemoteTarget" />
+              <WrapPanel>
+                <Button Content="{loc:Loc ar.add}" Command="{Binding AddMapRemoteRuleCommand}" Margin="0,0,8,8"
+                        AutomationProperties.AutomationId="MapRemoteAdd" />
+                <Button Content="{loc:Loc ar.update}" Command="{Binding UpdateMapRemoteRuleCommand}" Margin="0,0,8,8"
+                        AutomationProperties.AutomationId="MapRemoteUpdate" />
+                <Button Content="{loc:Loc ar.delete}" Command="{Binding DeleteMapRemoteRuleCommand}" Margin="0,0,8,8"
+                        AutomationProperties.AutomationId="MapRemoteDelete" />
+              </WrapPanel>
+            </StackPanel>
+          </ScrollViewer>
+        </Grid>
+      </DockPanel>
+      <!-- Always-on far-right icon rail (content opens to its left and pushes the grid). -->
+      <Border Grid.Row="1" Grid.Column="3" Margin="0,8,4,8"
+              BorderThickness="1,0,0,0"
+              BorderBrush="{DynamicResource SystemControlForegroundBaseLowBrush}"
+              Background="Transparent">
+        <StackPanel x:Name="PaneNavList"
+                    Classes="iconRail"
+                    Spacing="2"
+                    Margin="0,4"
+                    AutomationProperties.AutomationId="PaneNavList">
+          <Button Classes="iconRailBtn"
+                  Classes.railActive="{Binding IsInspectRailPressed}"
+                  Command="{Binding TogglePaneNavInspectCommand}"
+                  ToolTip.Tip="{loc:Loc pane.inspect}"
+                  AutomationProperties.Name="{loc:Loc pane.inspect}"
+                  AutomationProperties.AutomationId="TabOuterInspect">
+            <Path Width="20" Height="20" Stretch="Uniform"
+                  Data="M3,2 H11 L15,6 V18 H3 Z M11,2 V6 H15 M5,10 H13 M5,13 H13 M5,16 H10" />
+          </Button>
+          <Button Classes="iconRailBtn"
+                  Classes.railActive="{Binding IsComposerRailPressed}"
+                  Command="{Binding TogglePaneNavComposerCommand}"
+                  ToolTip.Tip="{loc:Loc pane.composer}"
+                  AutomationProperties.Name="{loc:Loc pane.composer}"
+                  AutomationProperties.AutomationId="PaneNavComposer">
+            <Path Width="20" Height="20" Stretch="Uniform"
+                  Data="M2,14 L2,18 H6 L16,8 L12,4 Z M13.5,5.5 L15.5,7.5" />
+          </Button>
+          <Button Classes="iconRailBtn"
+                  Classes.railActive="{Binding IsBreakpointsRailPressed}"
+                  Command="{Binding TogglePaneNavBreakpointsCommand}"
+                  ToolTip.Tip="{loc:Loc pane.breakpoints}"
+                  AutomationProperties.Name="{loc:Loc pane.breakpoints}"
+                  AutomationProperties.AutomationId="PaneNavBreakpoints">
+            <Path Width="20" Height="20" Stretch="Uniform"
+                  Data="M10,2 A8,8 0 1 0 10,18 A8,8 0 1 0 10,2 M10,6 A4,4 0 1 0 10,14 A4,4 0 1 0 10,6" />
+          </Button>
+          <Button Classes="iconRailBtn"
+                  Classes.railActive="{Binding IsAutoResponderRailPressed}"
+                  Command="{Binding TogglePaneNavAutoResponderCommand}"
+                  ToolTip.Tip="{loc:Loc pane.autoResponder}"
+                  AutomationProperties.Name="{loc:Loc pane.autoResponder}"
+                  AutomationProperties.AutomationId="PaneNavAutoResponder">
+            <Path Width="20" Height="20" Stretch="Uniform"
+                  Data="M3,10 H13 M9,6 L13,10 L9,14 M5,4 V8 M5,12 V16" />
+          </Button>
+          <Button Classes="iconRailBtn"
+                  Classes.railActive="{Binding IsScriptsRailPressed}"
+                  Command="{Binding TogglePaneNavScriptsCommand}"
+                  ToolTip.Tip="{loc:Loc pane.scripts}"
+                  AutomationProperties.Name="{loc:Loc pane.scripts}"
+                  AutomationProperties.AutomationId="PaneNavScripts">
+            <Path Width="20" Height="20" Stretch="Uniform"
+                  Data="M6,4 L2,10 L6,16 M14,4 L18,10 L14,16 M11,3 L9,17" />
+          </Button>
+          <Button Classes="iconRailBtn"
+                  Classes.railActive="{Binding IsMapRemoteRailPressed}"
+                  Command="{Binding TogglePaneNavMapRemoteCommand}"
+                  ToolTip.Tip="{loc:Loc pane.mapRemote}"
+                  AutomationProperties.Name="{loc:Loc pane.mapRemote}"
+                  AutomationProperties.AutomationId="PaneNavMapRemote">
+            <Path Width="20" Height="20" Stretch="Uniform"
+                  Data="M2,10 H18 M14,6 L18,10 L14,14 M6,6 L2,10 L6,14" />
+          </Button>
+        </StackPanel>
+      </Border>
+      <Grid Grid.Row="2" Grid.ColumnSpan="4" Margin="8" ColumnDefinitions="Auto,*,Auto,Auto,Auto"
+            x:Name="StatusBarPanel" AutomationProperties.AutomationId="StatusBarPanel">
+        <ProgressBar Grid.Column="0" Width="72" Height="4" Margin="0,0,8,0"
+                     IsIndeterminate="True" VerticalAlignment="Center"
+                     IsVisible="{Binding IsStatusBusy}"
+                     AutomationProperties.AutomationId="StatusBusyProgress" />
+        <Border Grid.Column="1" x:Name="StatusTextHost" Background="Transparent" CornerRadius="3" Padding="4,2">
+          <TextBlock x:Name="StatusTextBlock" Text="{Binding StatusText}" TextWrapping="Wrap" VerticalAlignment="Center"
+                     Foreground="{Binding StatusSeverity, Converter={StaticResource StatusSeverityBrushConverter}}"
+                     AutomationProperties.AutomationId="StatusText" />
+        </Border>
+        <Button Grid.Column="2" Margin="12,0,0,0" VerticalAlignment="Center" Padding="4,2"
+                Background="Transparent" BorderThickness="0"
+                Command="{Binding OpenSessionRetentionCommand}"
+                Opacity="0.8"
+                AutomationProperties.AutomationId="SessionCountLink">
+          <TextBlock Text="{Binding SessionCountText}" AutomationProperties.AutomationId="SessionCountText" />
+        </Button>
+        <Button Grid.Column="3" Content="{Binding CustomSettingsLabel}" Margin="8,0,0,0"
+                VerticalAlignment="Center" Padding="4,0" Background="Transparent" BorderThickness="0"
+                IsVisible="{Binding HasCustomSettings}"
+                Opacity="0.85" FontSize="11"
+                ToolTip.Tip="{Binding CustomSettingsDetail}"
+                AutomationProperties.AutomationId="CustomSettingsLink">
+          <Button.Flyout>
+            <Flyout Placement="Top">
+              <StackPanel MinWidth="220" MaxWidth="360">
+                <ItemsControl ItemsSource="{Binding CustomSettingLines}">
+                  <ItemsControl.ItemTemplate>
+                    <DataTemplate>
+                      <TextBlock Text="{Binding}" TextWrapping="Wrap" Margin="0,0,0,4" />
+                    </DataTemplate>
+                  </ItemsControl.ItemTemplate>
+                </ItemsControl>
+                <Button Content="{loc:Loc network.reset}"
+                        HorizontalAlignment="Left" Margin="0,8,0,0"
+                        Command="{Binding ResetCustomSettingsCommand}"
+                        AutomationProperties.AutomationId="CustomSettingsReset" />
+              </StackPanel>
+            </Flyout>
+          </Button.Flyout>
+        </Button>
+        <Button Grid.Column="4" Content="{Binding ExclusionSummaryText}" Margin="8,0,0,0"
+                VerticalAlignment="Center" Padding="4,0" Background="Transparent" BorderThickness="0"
+                Command="{Binding OpenExclusionSummaryCommand}"
+                IsVisible="{Binding HasExclusionSummary}"
+                Opacity="0.85" FontSize="11"
+                AutomationProperties.AutomationId="ExclusionSummaryLink" />
+      </Grid>
+    </Grid>
+  </DockPanel>
+</Window>

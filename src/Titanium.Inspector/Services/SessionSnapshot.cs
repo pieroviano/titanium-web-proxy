@@ -1,0 +1,512 @@
+using System.ComponentModel;
+using System.Runtime.CompilerServices;
+using System.Text.Json.Serialization;
+
+namespace Titanium.Inspector.Services;
+
+/// <summary>Mutable session capture used by inspectors, archive, search, and the grid.</summary>
+public sealed class SessionSnapshot : INotifyPropertyChanged
+{
+    private int? _statusCode;
+    private string? _failureReason;
+    private SessionMark _mark;
+    private string? _comment;
+    private string? _requestHeadersText;
+    private string? _responseHeadersText;
+    private string? _requestBodyText;
+    private string? _responseBodyText;
+    private byte[]? _requestBodyBytes;
+    private byte[]? _responseBodyBytes;
+    private string? _contentType;
+    private string? _protocol;
+    private string? _host;
+    private long? _bodySize;
+    private int _processId;
+    private long _receivedBytes;
+    private long _sentBytes;
+    private string? _processName;
+    private double? _durationMs;
+    private double? _ttfbMs;
+    private BodyCaptureState _requestBodyCapture;
+    private BodyCaptureState _responseBodyCapture;
+    private long? _requestBodyOriginalSize;
+    private long? _responseBodyOriginalSize;
+    private bool _responseBodyStreamOpen;
+    private bool _isWebSocket;
+    private OpaqueTunnelReason _opaqueReason;
+
+    public long Id { get; set; }
+
+    /// <summary>
+    /// Client connection id for this process only. Counters restart at 1, so the value is not
+    /// written to HAR or archives and is cleared on import.
+    /// </summary>
+    [JsonIgnore]
+    public long ConnectionId { get; set; }
+    public string Method { get; set; } = "GET";
+    public string Url { get; set; } = "";
+    public DateTimeOffset StartedUtc { get; set; } = DateTimeOffset.UtcNow;
+
+    /// <summary>
+    /// When true, request/response body bytes and text were spilled to the session disk cache
+    /// and must be reloaded via <see cref="SessionStore.EnsureBodiesLoadedAsync"/>.
+    /// </summary>
+    public bool BodiesOnDisk { get; set; }
+
+    /// <summary>
+    /// Body file was removed by the disk-cache budget (or is otherwise unavailable).
+    /// Headers and metadata remain; Inspect should explain the missing body.
+    /// </summary>
+    public bool BodiesMissingFromDisk { get; set; }
+    public bool IsWebSocket
+    {
+        get => _isWebSocket;
+        set => SetField(ref _isWebSocket, value);
+    }
+    public bool IsGrpc { get; set; }
+    public bool IsTranscoded { get; set; }
+    public bool IsTunnel { get; set; }
+    public OpaqueTunnelReason OpaqueReason
+    {
+        get => _opaqueReason;
+        set
+        {
+            if (!SetField(ref _opaqueReason, value))
+                return;
+            RaiseChanged(nameof(OpaqueReasonDisplay));
+        }
+    }
+
+    /// <summary>Client-facing HTTP method before gRPC-JSON rewrite (when <see cref="IsTranscoded"/>).</summary>
+    public string? ClientMethod { get; set; }
+
+    /// <summary>Client-facing path/query before gRPC-JSON rewrite (when <see cref="IsTranscoded"/>).</summary>
+    public string? ClientPathAndQuery { get; set; }
+
+    /// <summary>Client Content-Type before gRPC-JSON rewrite (when <see cref="IsTranscoded"/>).</summary>
+    public string? ClientContentType { get; set; }
+
+    /// <summary>Upstream gRPC method (usually POST) after rewrite.</summary>
+    public string? UpstreamMethod { get; set; }
+
+    /// <summary>Upstream gRPC path (/package.Service/Method).</summary>
+    public string? UpstreamPath { get; set; }
+
+    /// <summary>Upstream Content-Type (application/grpc).</summary>
+    public string? UpstreamContentType { get; set; }
+
+    /// <summary>Framed protobuf request bytes sent upstream (Inspector hex/frames).</summary>
+    public byte[]? UpstreamRequestBodyBytes { get; set; }
+
+    /// <summary>Framed protobuf response bytes from upstream before JSON rewrite.</summary>
+    public byte[]? UpstreamResponseBodyBytes { get; set; }
+
+    /// <summary>Human-readable opaque tunnel explanation for tooltips and inspect pane.</summary>
+    public string OpaqueReasonDisplay => ExclusionPreview.DescribeOpaqueReason(OpaqueReason);
+
+    public bool IsMultipart { get; set; }
+    public bool IsServerSentEvents { get; set; }
+    public IReadOnlyList<WebSocketFrameSnapshot>? WebSocketFrames { get; set; }
+    public IReadOnlyList<SseEventSnapshot>? SseEvents { get; set; }
+    public IReadOnlyList<GrpcFrameSnapshot>? GrpcFrames { get; set; }
+    public IReadOnlyList<MultipartPartSnapshot>? MultipartParts { get; set; }
+    /// <summary>Optional protobuf wire-format or descriptor decode text for inspect.</summary>
+    public string? ProtobufDecodedText { get; set; }
+
+    public int? StatusCode
+    {
+        get => _statusCode;
+        set => SetField(ref _statusCode, value);
+    }
+
+    /// <summary>
+    /// Why the session ended without any response (origin refused / reset, client gave up, capture stopped).
+    /// Null while the session is in flight or when a response (even a synthetic 502/504) was recorded.
+    /// </summary>
+    public string? FailureReason
+    {
+        get => _failureReason;
+        set => SetField(ref _failureReason, value);
+    }
+
+    public const int CommentMaxLength = 2000;
+
+    /// <summary>User mark. None leaves the row style unchanged.</summary>
+    public SessionMark Mark
+    {
+        get => _mark;
+        set => SetField(ref _mark, value);
+    }
+
+    /// <summary>User comment, capped at <see cref="CommentMaxLength"/> characters.</summary>
+    public string? Comment
+    {
+        get => _comment;
+        set => SetField(ref _comment, CapComment(value));
+    }
+
+    private static string? CapComment(string? value)
+    {
+        if (string.IsNullOrEmpty(value))
+        {
+            return string.IsNullOrEmpty(value) ? null : value;
+        }
+
+        return value.Length <= CommentMaxLength ? value : value[..CommentMaxLength];
+    }
+
+    public string? RequestHeadersText
+    {
+        get => _requestHeadersText;
+        set => SetField(ref _requestHeadersText, value);
+    }
+
+    public string? ResponseHeadersText
+    {
+        get => _responseHeadersText;
+        set => SetField(ref _responseHeadersText, value);
+    }
+
+    public string? RequestBodyText
+    {
+        get => _requestBodyText;
+        set => SetField(ref _requestBodyText, value);
+    }
+
+    public string? ResponseBodyText
+    {
+        get => _responseBodyText;
+        set => SetField(ref _responseBodyText, value);
+    }
+
+    public byte[]? RequestBodyBytes
+    {
+        get => _requestBodyBytes;
+        set => SetField(ref _requestBodyBytes, value);
+    }
+
+    public byte[]? ResponseBodyBytes
+    {
+        get => _responseBodyBytes;
+        set => SetField(ref _responseBodyBytes, value);
+    }
+
+    public string? ContentType
+    {
+        get => _contentType;
+        set => SetField(ref _contentType, value);
+    }
+
+    public string? Protocol
+    {
+        get => _protocol;
+        set => SetField(ref _protocol, value);
+    }
+
+    public string? Host
+    {
+        get => _host;
+        set => SetField(ref _host, value);
+    }
+
+    /// <summary>
+    /// Size column value: larger of request/response HTTP body sizes, or CONNECT tunnel
+    /// wire bytes (sent+received). Not always equal to Inspect body text length.
+    /// </summary>
+    public long? BodySize
+    {
+        get => _bodySize;
+        set => SetField(ref _bodySize, value);
+    }
+
+    /// <summary>
+    /// URL column text: path + query when the Host column already shows the host
+    /// (see <see cref="SessionDisplayFormat.FormatUrlForGrid"/>). <see cref="Url"/> stays the full URL.
+    /// </summary>
+    public string UrlDisplay => SessionDisplayFormat.FormatUrlForGrid(Url, Host);
+
+    /// <summary>Started column text (<see cref="StartedUtc"/> in local time).</summary>
+    public string StartedDisplay => SessionDisplayFormat.FormatStarted(StartedUtc, DateTimeOffset.UtcNow);
+
+    /// <summary>Full local date-time for the Started tooltip.</summary>
+    public string StartedFullDisplay => SessionDisplayFormat.FormatStartedFull(StartedUtc);
+
+    /// <summary>Scheme column text (<c>https</c>, <c>wss</c>, …); empty for CONNECT targets.</summary>
+    public string Scheme => SessionDisplayFormat.GetScheme(Url);
+
+    /// <summary>Content-Type column text without parameters; <see cref="ContentType"/> stays the raw value.</summary>
+    public string ContentTypeDisplay => SessionDisplayFormat.FormatContentType(ContentType);
+
+    /// <summary>Grid display for <see cref="BodySize"/> (B / KB / MB).</summary>
+    public string BodySizeDisplay => SessionDisplayFormat.FormatByteSize(BodySize);
+
+    /// <summary>How the request body was retained for Inspect.</summary>
+    public BodyCaptureState RequestBodyCapture
+    {
+        get => _requestBodyCapture;
+        set => SetField(ref _requestBodyCapture, value);
+    }
+
+    /// <summary>How the response body was retained for Inspect.</summary>
+    public BodyCaptureState ResponseBodyCapture
+    {
+        get => _responseBodyCapture;
+        set => SetField(ref _responseBodyCapture, value);
+    }
+
+    /// <summary>Original request body size when known (Content-Length or pre-truncate length).</summary>
+    public long? RequestBodyOriginalSize
+    {
+        get => _requestBodyOriginalSize;
+        set => SetField(ref _requestBodyOriginalSize, value);
+    }
+
+    /// <summary>Original response body size when known (Content-Length or pre-truncate / bytes-seen).</summary>
+    public long? ResponseBodyOriginalSize
+    {
+        get => _responseBodyOriginalSize;
+        set => SetField(ref _responseBodyOriginalSize, value);
+    }
+
+    /// <summary>True while an unknown-length response stream (SSE, chunked) is still open.</summary>
+    public bool ResponseBodyStreamOpen
+    {
+        get => _responseBodyStreamOpen;
+        set => SetField(ref _responseBodyStreamOpen, value);
+    }
+
+    /// <summary>In-flight response tee buffer of wire bytes (not spilled; cleared when finalized).</summary>
+    internal MemoryStream? ResponseTeeStream { get; set; }
+
+    /// <summary>Bytes seen on the response wire while teeing (may exceed preview).</summary>
+    internal long ResponseBytesSeen { get; set; }
+
+    /// <summary>UTC ticks of last coalesced SessionUpdated from the tee.</summary>
+    internal long LastTeeUiUtcTicks { get; set; }
+
+    /// <summary>Response <c>Content-Encoding</c>, used to decode the tee preview.</summary>
+    internal string? ResponseContentEncoding { get; set; }
+
+    /// <summary>In-flight request tee buffer of wire bytes (unknown-length uploads).</summary>
+    internal MemoryStream? RequestTeeStream { get; set; }
+
+    /// <summary>Bytes seen on the request wire while teeing (may exceed preview).</summary>
+    internal long RequestBytesSeen { get; set; }
+
+    /// <summary>UTC ticks of last coalesced SessionUpdated from the request tee.</summary>
+    internal long LastRequestTeeUiUtcTicks { get; set; }
+
+    /// <summary>Request <c>Content-Encoding</c>, used to decode the tee preview.</summary>
+    internal string? RequestContentEncoding { get; set; }
+
+    public int ProcessId
+    {
+        get => _processId;
+        set => SetField(ref _processId, value);
+    }
+
+    public string? ProcessName
+    {
+        get => _processName;
+        set => SetField(ref _processName, value);
+    }
+
+    public long ReceivedBytes
+    {
+        get => Volatile.Read(ref _receivedBytes);
+        set => SetField(ref _receivedBytes, value);
+    }
+
+    public long SentBytes
+    {
+        get => Volatile.Read(ref _sentBytes);
+        set => SetField(ref _sentBytes, value);
+    }
+
+    /// <summary>
+    /// Atomically add to <see cref="SentBytes"/> from a concurrent I/O thread
+    /// (tunnel <c>DataSent</c> / <c>DataReceived</c> can fire on separate threads).
+    /// </summary>
+    internal long AddSentBytes(long delta)
+    {
+        var total = Interlocked.Add(ref _sentBytes, delta);
+        RaiseChanged(nameof(SentBytes));
+        return total;
+    }
+
+    /// <summary>
+    /// Atomically add to <see cref="ReceivedBytes"/> from a concurrent I/O thread.
+    /// </summary>
+    internal long AddReceivedBytes(long delta)
+    {
+        var total = Interlocked.Add(ref _receivedBytes, delta);
+        RaiseChanged(nameof(ReceivedBytes));
+        return total;
+    }
+
+    public double? DurationMs
+    {
+        get => _durationMs;
+        set => SetField(ref _durationMs, value);
+    }
+
+    public double? TtfbMs
+    {
+        get => _ttfbMs;
+        set => SetField(ref _ttfbMs, value);
+    }
+
+    /// <summary>HAR phases in milliseconds. Null means the phase does not apply. Not notified per property.</summary>
+    public double? BlockedMs { get; set; }
+
+    public double? DnsMs { get; set; }
+
+    public double? ConnectMs { get; set; }
+
+    public double? TlsMs { get; set; }
+
+    public double? SendMs { get; set; }
+
+    public double? WaitMs { get; set; }
+
+    public double? ReceiveMs { get; set; }
+
+    public bool ConnectionReused { get; set; }
+
+    /// <summary>True when phases were guessed by an older HAR file. The grid Duration and TTFB are still set.</summary>
+    public bool TimingEstimated { get; set; }
+
+    /// <summary>True when <see cref="HarTimingMap"/> filled the phase fields for this session.</summary>
+    public bool TimingRecorded { get; set; }
+
+    /// <summary>
+    /// Decision notes frozen once at completion. Null when nothing unusual happened.
+    /// The list is a copy; callers do not mutate it.
+    /// </summary>
+    public IReadOnlyList<SessionEventNote>? Events { get; set; }
+
+    /// <summary>Upstream attempts. Above one means earlier attempts were folded into <see cref="BlockedMs"/>.</summary>
+    public int TimingAttempts { get; set; }
+
+    public string ProcessDisplay
+    {
+        get
+        {
+            if (!string.IsNullOrEmpty(ProcessName))
+            {
+                return $"{ProcessName}:{ProcessId}";
+            }
+
+            return ProcessId > 0 ? ProcessId.ToString() : "";
+        }
+    }
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+
+    private readonly object _dirtyGate = new();
+    private HashSet<string?>? _dirtyNames;
+    private int _dirtyQueued;
+
+    /// <summary>
+    /// Raises <see cref="PropertyChanged"/>. Proxy threads mutate snapshots that the grid binds to; each
+    /// raise there would marshal a binding update (and a cell re-layout) to the UI thread per property, per
+    /// row, per update. Off the UI thread the names are collected and raised together on the UI thread by
+    /// <see cref="SessionSnapshotNotifier"/>, at most once per name per flush.
+    /// </summary>
+    private void RaiseChanged(string? name)
+    {
+        if (!SessionSnapshotNotifier.ShouldDefer)
+        {
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+            return;
+        }
+
+        lock (_dirtyGate)
+        {
+            (_dirtyNames ??= new HashSet<string?>()).Add(name);
+        }
+
+        if (Interlocked.Exchange(ref _dirtyQueued, 1) == 0)
+        {
+            SessionSnapshotNotifier.Enqueue(this);
+        }
+    }
+
+    /// <summary>Raises the deferred notifications; call on the UI thread.</summary>
+    internal void RaiseDeferredChanges()
+    {
+        string?[] names;
+        lock (_dirtyGate)
+        {
+            // Clear the queued flag under the gate so a concurrent setter either lands in this batch
+            // or re-enqueues the snapshot.
+            Volatile.Write(ref _dirtyQueued, 0);
+            if (_dirtyNames is null || _dirtyNames.Count == 0)
+            {
+                return;
+            }
+
+            names = _dirtyNames.ToArray();
+            _dirtyNames.Clear();
+        }
+
+        foreach (var name in names)
+        {
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+        }
+    }
+
+    /// <returns>True when the value changed.</returns>
+    private bool SetField<T>(ref T field, T value, [CallerMemberName] string? name = null)
+    {
+        if (Equals(field, value))
+        {
+            return false;
+        }
+
+        field = value;
+        RaiseChanged(name);
+        if (name is nameof(ProcessId) or nameof(ProcessName))
+        {
+            RaiseChanged(nameof(ProcessDisplay));
+        }
+
+        if (name is nameof(ContentType))
+        {
+            RaiseChanged(nameof(ContentTypeDisplay));
+        }
+
+        if (name is nameof(Host))
+        {
+            RaiseChanged(nameof(UrlDisplay));
+        }
+
+        if (name is nameof(BodySize))
+        {
+            RaiseChanged(nameof(BodySizeDisplay));
+        }
+
+        return true;
+    }
+}
+
+public sealed class WebSocketFrameSnapshot
+{
+    public string Direction { get; init; } = "Client";
+    public string Opcode { get; init; } = "Text";
+    public string? PayloadPreview { get; init; }
+}
+
+public sealed class GrpcFrameSnapshot
+{
+    public bool Compressed { get; init; }
+    public int Length { get; init; }
+    public string? HexPreview { get; init; }
+}
+
+public sealed class MultipartPartSnapshot
+{
+    public string? Name { get; init; }
+    public string? ContentType { get; init; }
+    public string? Preview { get; init; }
+}

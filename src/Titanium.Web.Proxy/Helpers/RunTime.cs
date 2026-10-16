@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
@@ -9,7 +9,7 @@ namespace Titanium.Web.Proxy.Helpers;
 /// <summary>
 ///     Run time helpers
 /// </summary>
-public static class RunTime
+internal static class RunTime
 {
     private static readonly Lazy<bool> isRunningOnMono = new(() => Type.GetType("Mono.Runtime") != null);
 
@@ -52,16 +52,30 @@ public static class RunTime
 #endif
 
     /// <summary>
+    ///     Test-only override for <see cref="IsWindows" />. Null restores the real OS check.
+    /// </summary>
+    private static bool? isWindowsOverride;
+
+    /// <summary>
     ///     Is running on Mono?
     /// </summary>
     internal static bool IsRunningOnMono => isRunningOnMono.Value;
 
     public static bool IsLinux => IsRunningOnLinux;
 
-    public static bool IsWindows => IsRunningOnWindows;
+    [SupportedOSPlatformGuard("windows")]
+    public static bool IsWindows => isWindowsOverride ?? IsRunningOnWindows;
 
+    /// <summary>
+    ///     Forces <see cref="IsWindows" /> for unit tests that need to cover non-Windows (or Windows)
+    ///     branches on a machine of the opposite OS. Pass <see langword="null" /> to clear.
+    /// </summary>
+    internal static void SetIsWindowsForTests(bool? value) => isWindowsOverride = value;
+
+    [SupportedOSPlatformGuard("windows")]
     public static bool IsUwpOnWindows => IsWindows && UwpHelper.IsRunningAsUwp();
 
+    [SupportedOSPlatformGuard("macos")]
     public static bool IsMac => IsRunningOnMac;
 
     private static bool? _isSocketReuseAvailable;
@@ -119,7 +133,7 @@ public static class RunTime
     }
 
     // https://github.com/qmatteoq/DesktopBridgeHelpers/blob/master/DesktopBridge.Helpers/Helpers.cs
-    private class UwpHelper
+    private static class UwpHelper
     {
         private const long AppmodelErrorNoPackage = 15700L;
 
@@ -147,10 +161,10 @@ public static class RunTime
 
             var length = 0;
             var sb = new StringBuilder(0);
-            var result = GetCurrentPackageFullName(ref length, sb);
+            _ = GetCurrentPackageFullName(ref length, sb);
 
             sb = new StringBuilder(length);
-            result = GetCurrentPackageFullName(ref length, sb);
+            var result = GetCurrentPackageFullName(ref length, sb);
 
             return result != AppmodelErrorNoPackage;
         }

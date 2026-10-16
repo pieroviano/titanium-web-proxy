@@ -1,0 +1,37 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:loc="using:Titanium.Inspector.Localization"
+        x:Class="Titanium.Inspector.Views.AboutWindow"
+        AutomationProperties.AutomationId="AboutWindow"
+        Title="{loc:Loc window.about}"
+        Width="420" Height="280"
+        WindowStartupLocation="CenterOwner"
+        CanResize="False"
+        ShowInTaskbar="False">
+  <DockPanel Margin="16">
+    <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,0,0">
+      <Button x:Name="OkButton" Content="{loc:Loc common.ok}" MinWidth="88" IsDefault="True" IsCancel="True"
+              AutomationProperties.AutomationId="AboutOk" />
+    </StackPanel>
+    <ScrollViewer Classes="dialogBody">
+    <StackPanel Spacing="12">
+      <StackPanel Orientation="Horizontal" Spacing="12">
+        <Image Source="/Assets/app.ico" Width="48" Height="48" />
+        <StackPanel VerticalAlignment="Center" Spacing="4">
+          <TextBlock Text="{loc:Loc about.product}" FontSize="18" FontWeight="SemiBold" />
+          <TextBlock x:Name="VersionText" Opacity="0.85" />
+        </StackPanel>
+      </StackPanel>
+      <TextBlock Text="{loc:Loc about.copyright}" Opacity="0.85" />
+      <TextBlock TextWrapping="Wrap" Opacity="0.85"
+                 Text="{loc:Loc about.license}" />
+      <StackPanel Orientation="Horizontal" Spacing="16">
+        <TextBlock x:Name="LicenseLink" Text="{loc:Loc about.licenseLink}" Cursor="Hand"
+                   TextDecorations="Underline" Foreground="{DynamicResource InspectorLinkBrush}" />
+        <TextBlock x:Name="WebsiteLink" Text="{loc:Loc about.website}" Cursor="Hand"
+                   TextDecorations="Underline" Foreground="{DynamicResource InspectorLinkBrush}" />
+      </StackPanel>
+    </StackPanel>
+    </ScrollViewer>
+  </DockPanel>
+</Window>

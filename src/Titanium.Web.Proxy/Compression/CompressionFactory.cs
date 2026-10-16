@@ -15,8 +15,11 @@ namespace Titanium.Web.Proxy.Compression
             {
                 HttpCompression.Gzip => new GZipStream(stream, CompressionMode.Compress, leaveOpen),
                 HttpCompression.Deflate => new DeflateStream(stream, CompressionMode.Compress, leaveOpen),
-                HttpCompression.Brotli => new BrotliSharpLib.BrotliStream(stream, CompressionMode.Compress, leaveOpen),
-                _ => throw new Exception($"Unsupported compression mode: {type}")
+                // System.IO.Compression.BrotliStream (not BrotliSharpLib) for the same reason as
+                // DecompressionFactory: it has genuine async Read/Write support, unlike
+                // BrotliSharpLib which falls back to synchronous calls on the wrapped stream.
+                HttpCompression.Brotli => new BrotliStream(stream, CompressionMode.Compress, leaveOpen),
+                _ => throw new NotSupportedException($"Unsupported compression mode: {type}")
             };
         }
     }

@@ -1,6 +1,8 @@
-﻿using System.Diagnostics;
+﻿using System;
+using System.Diagnostics;
 using System.Net;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
 using Titanium.Web.Proxy.EventArguments;
 using Titanium.Web.Proxy.Extensions;
 
@@ -32,14 +34,29 @@ public class SocksProxyEndPoint : TransparentBaseProxyEndPoint
     public override string GenericCertificateName { get; set; }
 
     /// <summary>
+    ///     Endpoint-scoped SOCKS5 username/password authenticator (RFC 1929).
+    ///     When set, this takes precedence over <see cref="ProxyServer.ProxyBasicAuthenticateFunc" />
+    ///     for clients on this endpoint. Username/password method is only offered during the SOCKS5
+    ///     greeting when this callback or the global <see cref="ProxyServer.ProxyBasicAuthenticateFunc" />
+    ///     is configured. SOCKS4 has no password authentication; when either callback is configured,
+    ///     SOCKS4 CONNECT is rejected.
+    /// </summary>
+    public Func<SocksAuthenticateEventArgs, Task<bool>>? AuthenticateUserFunc { get; set; }
+
+    /// <summary>
     ///     Before Ssl authentication this event is fired.
     /// </summary>
-    public event AsyncEventHandler<BeforeSslAuthenticateEventArgs>? BeforeSslAuthenticate;
+    public event AsyncEventHandler<BeforeSslAuthenticateEventArgs>? BeforeSslAuthenticate; // NOSONAR S3264 -- Public extension event invoked by the proxy pipeline.
+
+    internal override bool HasBeforeSslAuthenticateHandlers => BeforeSslAuthenticate != null;
 
     internal override async Task InvokeBeforeSslAuthenticate(ProxyServer proxyServer,
-        BeforeSslAuthenticateEventArgs connectArgs, ExceptionHandler? exceptionFunc)
+        BeforeSslAuthenticateEventArgs connectArgs, ILogger logger)
     {
         if (BeforeSslAuthenticate != null)
-            await BeforeSslAuthenticate.InvokeAsync(proxyServer, connectArgs, exceptionFunc);
+            await BeforeSslAuthenticate.InvokeAsync(proxyServer, connectArgs, logger);
     }
+
+    internal override Task InvokeBeforeHttpAuthenticate(ProxyServer proxyServer,
+        BeforeHttpAuthenticateEventArgs args, ILogger logger) => Task.CompletedTask;
 }

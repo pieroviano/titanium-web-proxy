@@ -1,0 +1,1056 @@
+using System.Net;
+using System.Runtime.InteropServices;
+using Microsoft.Extensions.Logging;
+using Titanium.Cli.AccessLog;
+using Titanium.Cli;
+using Titanium.Cli.Certificates;
+using Titanium.Cli.Parsers;
+using Titanium.Cli.StaticFiles;
+using Titanium.Web.Proxy;
+using Titanium.Web.Proxy.Abstractions;
+using Titanium.Web.Proxy.Abstractions.Clusters;
+using Titanium.Web.Proxy.Abstractions.Middleware;
+using Titanium.Web.Proxy.Abstractions.Plugins;
+using Titanium.Web.Proxy.Abstractions.Routing;
+using Titanium.Web.Proxy.Caching;
+using Titanium.Web.Proxy.Clusters;
+using Titanium.Web.Proxy.Configuration;
+using Titanium.Web.Proxy.Configuration.Models;
+using Titanium.Web.Proxy.Models;
+using Titanium.Web.Proxy.Routing;
+using Titanium.Web.Proxy.Transforms;
+
+namespace Titanium.Cli.Config;
+
+internal static class RunCommand
+{
+    private static readonly string[] PlusRelativePathKeys =
+    [
+        "grpc.transcode.descriptorSet",
+        "waf.rulesFile",
+        "discovery.file",
+    ];
+
+    public static async Task<int> ExecuteAsync(string[] args)
+    {
+        if (CliHelp.RequestsHelp(args.AsSpan(1)))
+        {
+            return PrintHelp();
+        }
+
+        var configPath = ParseConfigPath(args);
+        var verbose = ParseVerbose(args);
+        var serviceMode = ParseServiceMode(args);
+        var watch = ParseWatch(args);
+        var serviceName = ParseServiceName(args) ?? Service.ServiceDefaults.DefaultServiceName;
+
+        if (serviceMode && OperatingSystem.IsWindows())
+        {
+            return await WindowsProxyServiceHost.RunAsync(configPath, verbose, serviceName)
+                .ConfigureAwait(false);
+        }
+
+        return await ExecuteCoreAsync(configPath, verbose, serviceMode, CancellationToken.None, watch)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>Shared proxy lifecycle for foreground run and Windows Service hosted mode.</summary>
+    internal static async Task<int> ExecuteCoreAsync( // NOSONAR S3776 -- CLI run lifecycle (load, apply, wait, reload) shares the hosted proxy instance.
+        string configPath,
+        bool verbose,
+        bool serviceMode,
+        CancellationToken stoppingToken,
+        bool watch = false)
+    {
+        var loaded = ConfigLoader.Load(configPath);
+        var errors = TwpConfigValidator.Validate(loaded.Config);
+        if (errors.Count > 0)
+        {
+            foreach (var e in errors)
+            {
+                AsyncConsole.WriteError(e);
+            }
+
+            return 1;
+        }
+
+        WriteConfigWarnings(loaded);
+
+        // When launched as a service, resolve relative paths against the config directory
+        // (SCM / systemd / launchd cwd is typically System32 or /).
+        var configDir = Path.GetDirectoryName(Path.GetFullPath(configPath));
+        if (!string.IsNullOrEmpty(configDir))
+        {
+            Directory.SetCurrentDirectory(configDir);
+        }
+
+        var requiresSessionPath = ConfigNeedsSessionPath(loaded.Config);
+        // CLI is non-interactive: do not install the MITM root into the user trust store
+        // (Windows can block on a security prompt and hang headless CI / services).
+        using var proxy = new ProxyServer(userTrustRootCertificate: false);
+        ApplyLogging(proxy, loaded.Config.Logging, verbose);
+        if (serviceMode)
+        {
+            ApplyServiceLoggingDefaults(proxy, loaded.Config.Logging);
+        }
+
+        // Fast leaf cold-start before server.certificateManager overlays (which may override engine/algo).
+        proxy.CertificateManager.ApplyFastColdStartLeafSettings();
+        ServerConfigApplier.Apply(proxy, loaded.Config.Server);
+        ConfigureProxyFlags(proxy, loaded.Config, requiresSessionPath);
+
+        var clusterManager = new ClusterManager();
+        if (loaded.Config.Clusters.Count > 0)
+        {
+            await clusterManager.ApplyAsync(loaded.Config.Clusters.ToList(), stoppingToken).ConfigureAwait(false);
+        }
+
+        foreach (var listener in loaded.Config.Listeners)
+        {
+            AddListener(proxy, listener);
+        }
+
+        ServerConfigApplier.ApplyIgnoreServerCertificateErrorsAfterListeners(proxy, loaded.Config.Server);
+
+        if (loaded.Config.Listeners.Count == 0)
+        {
+            proxy.AddEndPoint(new ExplicitProxyEndPoint(IPAddress.Loopback, 8000, false));
+        }
+
+        CertificateBootstrap.Apply(proxy, loaded.Config.Certificates);
+        StaticFileHost.RegisterIfNeeded(proxy, loaded.Config.StaticFiles, requiresSessionPath);
+
+        var loadBalancer = new LoadBalancer();
+        var responseCache = new MemoryHttpResponseCache();
+        var middleware = new List<IProxyMiddleware>();
+        var routes = loaded.Config.Routes.ToList();
+        var plusOptions = loaded.Config.Plus is not null
+            ? BuildPlusOptions(loaded.Config.Plus)
+            : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        ResolvePlusRelativePaths(plusOptions, configDir);
+
+        ConfigureResponseCache(proxy, middleware, responseCache, plusOptions);
+
+        IGrpcJsonTranscoder? grpcJsonTranscoder = null;
+
+        void RefreshReverseProxy()
+        {
+            // Prefer ClusterManager snapshot so SIGHUP reload picks up new destinations
+            // (do not close over the initial ConfigLoader result).
+            var snapClusters = clusterManager.Snapshot.Clusters;
+            proxy.ReverseProxy = new ReverseProxyOptions
+            {
+                Routes = routes.Count > 0 ? routes : null,
+                Clusters = snapClusters.Count > 0 ? snapClusters.Values.ToList() : null,
+                ClusterManager = clusterManager,
+                RouteMatcher = new RouteMatcher(),
+                LoadBalancer = loadBalancer,
+                TransformEngine = new TransformEngine(),
+                Middleware = middleware.Count > 0 ? middleware : null,
+                LatencyRecorder = loadBalancer,
+                GrpcJsonTranscoder = grpcJsonTranscoder,
+            };
+        }
+
+        var plusContext = new PlusActivationContext
+        {
+            ProxyServer = proxy,
+            ClusterManager = clusterManager,
+            Options = plusOptions,
+            Middleware = middleware,
+            Routes = routes,
+            RefreshReverseProxy = RefreshReverseProxy,
+            ResponseCache = responseCache,
+            LatencyRecorder = loadBalancer,
+            Logger = proxy.Logger,
+        };
+        await TryActivatePlusAsync(loaded.Config, plusContext).ConfigureAwait(false);
+        grpcJsonTranscoder = plusContext.GrpcJsonTranscoder;
+
+        RefreshReverseProxy();
+        proxy.Start();
+        StartAcmeIfConfigured(proxy, loaded.Config);
+
+        JsonAccessLogWriter? accessLog = null;
+        try
+        {
+            accessLog = TryStartAccessLog(proxy, loaded.Config.Server);
+
+            if (serviceMode)
+            {
+                AsyncConsole.WriteLine("Titanium proxy running (service mode).");
+            }
+            else
+            {
+                AsyncConsole.WriteLine("Titanium proxy running. Press Ctrl+C to stop.");
+            }
+
+            await AsyncConsole.FlushAsync().ConfigureAwait(false);
+            Console.WriteLine("awaiting-shutdown-or-reload");
+            await Console.Out.FlushAsync(stoppingToken).ConfigureAwait(false);
+            ConfigReloadGate.WritePidFile(configPath, Environment.ProcessId);
+            try
+            {
+                await WaitForShutdownOrReloadAsync(
+                    stoppingToken,
+                    configPath,
+                    watch,
+                    onReload: async () =>
+                    {
+                        try
+                        {
+                            await ReloadConfigAsync(
+                                configPath,
+                                proxy,
+                                clusterManager,
+                                routes,
+                                middleware,
+                                loadBalancer,
+                                responseCache,
+                                plusOptions,
+                                () => grpcJsonTranscoder,
+                                t => grpcJsonTranscoder = t,
+                                RefreshReverseProxy,
+                                stoppingToken).ConfigureAwait(false);
+                            AsyncConsole.WriteLine("Config reloaded.");
+                            await AsyncConsole.FlushAsync().ConfigureAwait(false);
+                        }
+                        catch (Exception ex)
+                        {
+                            AsyncConsole.WriteError("Config reload failed: " + ex.Message);
+                        }
+                    }).ConfigureAwait(false);
+            }
+            finally
+            {
+                ConfigReloadGate.TryDeletePidFile(configPath);
+            }
+
+            await proxy.StopAsync().ConfigureAwait(false);
+            return 0;
+        }
+        finally
+        {
+            accessLog?.Dispose();
+        }
+    }
+
+    private static JsonAccessLogWriter? TryStartAccessLog(ProxyServer proxy, ServerConfig? server)
+    {
+        var cfg = server?.AccessLog;
+        if (cfg is null || string.IsNullOrWhiteSpace(cfg.Path))
+        {
+            return null;
+        }
+
+        var sample = cfg.SampleRate ?? 1.0;
+        if (sample <= 0)
+        {
+            return null;
+        }
+
+        proxy.EnableHttpInterception = true;
+        proxy.EnableRequestTimingCapture = true;
+        var writer = new JsonAccessLogWriter(cfg.Path, sample);
+        proxy.AfterResponse += (_, e) =>
+        {
+            try
+            {
+                writer.TryWrite(e);
+            }
+            catch
+            {
+                // Access log is best-effort.
+            }
+
+            return Task.CompletedTask;
+        };
+        AsyncConsole.WriteLine($"Access log: {cfg.Path} (sample={sample:0.###})");
+        return writer;
+    }
+
+    /// <summary>
+    /// Reloads routes/clusters (and server settings) from <paramref name="configPath"/>.
+    /// Validation failures throw before mutating <paramref name="routes"/> or the cluster manager.
+    /// </summary>
+    internal static async Task ReloadConfigAsync( // NOSONAR S107 -- Reload keeps established config wiring without a context bag.
+        string configPath,
+        ProxyServer proxy,
+        ClusterManager clusterManager,
+        List<RouteConfig> routes,
+        List<IProxyMiddleware> middleware,
+        LoadBalancer loadBalancer,
+        MemoryHttpResponseCache responseCache,
+        Dictionary<string, string> plusOptions,
+        Func<IGrpcJsonTranscoder?> getGrpc,
+        Action<IGrpcJsonTranscoder?> setGrpc,
+        Action refreshReverseProxy,
+        CancellationToken stoppingToken = default)
+    {
+        var loaded = ConfigLoader.Load(configPath);
+        var errors = TwpConfigValidator.Validate(loaded.Config);
+        if (errors.Count > 0)
+        {
+            throw new InvalidOperationException(string.Join("; ", errors));
+        }
+
+        WriteConfigWarnings(loaded);
+
+        ServerConfigApplier.Apply(proxy, loaded.Config.Server);
+        if (loaded.Config.Clusters.Count > 0)
+        {
+            await clusterManager.ApplyAsync(loaded.Config.Clusters.ToList(), stoppingToken).ConfigureAwait(false);
+        }
+        else
+        {
+            await clusterManager.ApplyAsync([], stoppingToken).ConfigureAwait(false);
+        }
+
+        ReplaceRoutes(routes, loaded.Config.Routes);
+
+        // Keep existing middleware; Plus control plane remains. Refresh reverse options only.
+        _ = getGrpc();
+        refreshReverseProxy();
+        _ = middleware;
+        _ = loadBalancer;
+        _ = responseCache;
+        _ = plusOptions;
+        _ = setGrpc;
+    }
+
+    /// <summary>In-place route list swap used by SIGHUP reload (and unit tests).</summary>
+    internal static void ReplaceRoutes(List<RouteConfig> routes, IEnumerable<RouteConfig> next)
+    {
+        routes.Clear();
+        foreach (var r in next)
+        {
+            routes.Add(r);
+        }
+    }
+
+    internal static int PrintHelp()
+    {
+        AsyncConsole.WriteLine("""
+            titanium run -c <config> [-v|--verbose] [--service] [--name <service-name>] [--watch]
+
+              -c, --config   Path to twp.yaml / .json / .twp / .conf (required).
+              -v, --verbose  Enable debug console logging.
+              --service      Run as an OS service worker (used by `titanium service install`).
+              --name         Windows SCM service name when --service is set (default: titanium).
+              --watch        Debounced reload when the config file changes (off by default).
+
+            Starts the proxy and blocks until Ctrl+C, SIGTERM, or the service manager stops it.
+            Reload routes/clusters without restart: `titanium reload -c <config>` (all OS),
+            Unix SIGHUP, or systemd `systemctl reload` when installed as a service.
+            """);
+        CliHelp.WriteDocsFooter();
+        return 0;
+    }
+
+    internal static string ParseConfigPath(string[] args)
+    {
+        for (var i = 1; i < args.Length; i++)
+        {
+            if ((args[i] is "-c" or "--config") && i + 1 < args.Length)
+            {
+                return args[i + 1];
+            }
+        }
+
+        throw new ArgumentException("Missing required -c <config-path>.");
+    }
+
+    internal static bool ParseVerbose(string[] args)
+    {
+        for (var i = 1; i < args.Length; i++)
+        {
+            if (args[i] is "-v" or "--verbose")
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    internal static bool ParseServiceMode(string[] args)
+    {
+        for (var i = 1; i < args.Length; i++)
+        {
+            if (args[i] is "--service")
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    internal static bool ParseWatch(string[] args)
+    {
+        for (var i = 1; i < args.Length; i++)
+        {
+            if (args[i] is "--watch")
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    internal static string? ParseServiceName(string[] args)
+    {
+        for (var i = 1; i < args.Length; i++)
+        {
+            if (args[i] is "--name" && i + 1 < args.Length)
+            {
+                return args[i + 1];
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// When YAML has no file log, enable a default file sink on Windows (SCM has no console)
+    /// and keep console on Linux/macOS so journald / launchd capture stdout.
+    /// </summary>
+    internal static void ApplyServiceLoggingDefaults(ProxyServer proxy, LoggingConfig? logging)
+    {
+        var hasFile = logging is { EnableFile: true } && !string.IsNullOrWhiteSpace(logging.FilePath);
+        if (hasFile)
+        {
+            return;
+        }
+
+        if (OperatingSystem.IsWindows())
+        {
+            var dir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                "Titanium",
+                "logs");
+            Directory.CreateDirectory(dir);
+            proxy.Logging.Enabled = true;
+            proxy.Logging.EnableFile = true;
+            proxy.Logging.FilePath = Path.Combine(dir, "titanium.log");
+            if (proxy.Logging.MinimumLevel > Microsoft.Extensions.Logging.LogLevel.Information)
+            {
+                proxy.Logging.MinimumLevel = Microsoft.Extensions.Logging.LogLevel.Information;
+            }
+
+            proxy.ApplyLoggingConfiguration();
+            return;
+        }
+
+        // Linux journald / macOS launchd StandardOutPath: ensure console is on.
+        if (!proxy.Logging.Enabled || !proxy.Logging.EnableConsole)
+        {
+            proxy.Logging.Enabled = true;
+            proxy.Logging.EnableConsole = true;
+            if (proxy.Logging.MinimumLevel > Microsoft.Extensions.Logging.LogLevel.Information)
+            {
+                proxy.Logging.MinimumLevel = Microsoft.Extensions.Logging.LogLevel.Information;
+            }
+
+            proxy.ApplyLoggingConfiguration();
+        }
+    }
+
+#pragma warning disable CA1068 // Token stays first so POSIX signal registration can observe the run CTS.
+    private static async Task WaitForShutdownOrReloadAsync( // NOSONAR CA1068 -- Token stays first so POSIX signal registration can observe the run CTS.
+        CancellationToken stoppingToken,
+        string configPath,
+        bool watch,
+        Func<Task>? onReload)
+    {
+        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        void RequestStop() => tcs.TrySetResult();
+
+        ConsoleCancelEventHandler? cancelHandler = (_, e) =>
+        {
+            e.Cancel = true;
+            RequestStop();
+        };
+        Console.CancelKeyPress += cancelHandler;
+
+        using var reg = stoppingToken.CanBeCanceled
+            ? stoppingToken.Register(RequestStop)
+            : default;
+
+        PosixSignalRegistration? sigTerm = null;
+        PosixSignalRegistration? sigInt = null;
+        PosixSignalRegistration? sigHup = null;
+        EventWaitHandle? winReload = null;
+        RegisteredWaitHandle? winReloadWait = null;
+        FileSystemWatcher? watcher = null;
+        CancellationTokenSource? watchDebounce = null;
+        try
+        {
+            if (!OperatingSystem.IsWindows())
+            {
+                sigTerm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx =>
+                {
+                    ctx.Cancel = true;
+                    RequestStop();
+                });
+                sigInt = PosixSignalRegistration.Create(PosixSignal.SIGINT, ctx =>
+                {
+                    ctx.Cancel = true;
+                    RequestStop();
+                });
+                if (onReload is not null)
+                {
+                    sigHup = PosixSignalRegistration.Create(PosixSignal.SIGHUP, ctx =>
+                    {
+                        // Cancel default terminate-on-HUP so reload can complete.
+                        ctx.Cancel = true;
+                        _ = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                await onReload().ConfigureAwait(false);
+                            }
+                            catch
+                            {
+                                // Reload errors are logged by caller.
+                            }
+                        }, stoppingToken);
+                    });
+                    Console.WriteLine("sighup-handler-registered");
+                    await Console.Out.FlushAsync(stoppingToken).ConfigureAwait(false);
+                }
+            }
+            else if (onReload is not null)
+            {
+                winReload = ConfigReloadGate.CreateWindowsReloadEvent(configPath, out _);
+                winReloadWait = ThreadPool.RegisterWaitForSingleObject(
+                    winReload,
+                    (_, _) =>
+                    {
+                        _ = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                await onReload().ConfigureAwait(false);
+                            }
+                            catch
+                            {
+                                // Reload errors are logged by caller.
+                            }
+                        }, stoppingToken);
+                    },
+                    state: null,
+                    millisecondsTimeOutInterval: -1,
+                    executeOnlyOnce: false);
+                Console.WriteLine("windows-reload-handler-registered");
+                await Console.Out.FlushAsync(stoppingToken).ConfigureAwait(false);
+            }
+
+            if (watch && onReload is not null)
+            {
+                var full = Path.GetFullPath(configPath);
+                var dir = Path.GetDirectoryName(full) ?? ".";
+                var file = Path.GetFileName(full);
+                watcher = new FileSystemWatcher(dir, file)
+                {
+                    NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.FileName,
+                    EnableRaisingEvents = true,
+                };
+                // Assigned on the main flow so finally can dispose; replaced on each FS event.
+                watchDebounce = new CancellationTokenSource();
+                void OnWatch(object sender, FileSystemEventArgs e)
+                {
+                    var prev = watchDebounce;
+                    if (prev is null)
+                    {
+                        return;
+                    }
+
+                    prev.Cancel();
+                    prev.Dispose();
+                    var next = new CancellationTokenSource();
+                    watchDebounce = next;
+                    var token = next.Token;
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await Task.Delay(250, token).ConfigureAwait(false);
+                            await onReload().ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            // Debounced.
+                        }
+                        catch
+                        {
+                            // Reload errors are logged by caller.
+                        }
+                    }, CancellationToken.None);
+                }
+
+                watcher.Changed += OnWatch;
+                watcher.Created += OnWatch;
+                watcher.Renamed += OnWatch;
+                Console.WriteLine("config-watch-enabled");
+                await Console.Out.FlushAsync(stoppingToken).ConfigureAwait(false);
+            }
+
+            await tcs.Task.ConfigureAwait(false);
+        }
+        finally
+        {
+            Console.CancelKeyPress -= cancelHandler;
+            sigTerm?.Dispose();
+            sigInt?.Dispose();
+            sigHup?.Dispose();
+            winReloadWait?.Unregister(null);
+            winReload?.Dispose();
+            watcher?.Dispose();
+            if (watchDebounce is not null)
+            {
+                await watchDebounce.CancelAsync().ConfigureAwait(false);
+                watchDebounce.Dispose();
+            }
+        }
+    }
+#pragma warning restore CA1068
+
+    private static void StartAcmeIfConfigured(ProxyServer proxy, TwpConfig config)
+    {
+        if (config.Certificates is not { AcmeEmail: not null, AcmeDomain: not null } certs)
+        {
+            return;
+        }
+
+        var directory = certs.AcmeDirectory ?? Environment.GetEnvironmentVariable("TITANIUM_ACME_DIRECTORY");
+        if (string.IsNullOrWhiteSpace(directory) &&
+            string.IsNullOrEmpty(Environment.GetEnvironmentVariable("TITANIUM_ACME_CERT_PATH")))
+        {
+            return;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await CertificateBootstrap.IssueOrRenewAsync(proxy, certs).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                AsyncConsole.WriteError($"ACME IssueOrRenew failed: {ex.Message}");
+            }
+        });
+    }
+
+    internal static void ConfigureProxyFlags(ProxyServer proxy, TwpConfig config, bool requiresSessionPath)
+    {
+        // Session-path features force interception (transforms / static files / ACME).
+        if (requiresSessionPath)
+        {
+            proxy.EnableHttpInterception = true;
+        }
+
+        // LeastTime LB needs per-request timing for EWMA latency.
+        if (ConfigNeedsRequestTimingCapture(config))
+        {
+            proxy.EnableRequestTimingCapture = true;
+        }
+
+        // HTTP/2: server.enableHttp2 is the base; any listener false still forces off.
+        if (config.Listeners.Any(l => l.EnableHttp2 == false))
+        {
+            proxy.EnableHttp2 = false;
+        }
+
+        // HTTP/3: server.enableHttp3 false wins; otherwise enable when OS supports QUIC unless a
+        // listener sets enableHttp3: false. server.enableHttp3 true already applied TryEnable in applier.
+        if (config.Server?.EnableHttp3 == false)
+        {
+            proxy.SetHttp3Enabled(false);
+        }
+        else if (ShouldEnableHttp3(config) && config.Server?.EnableHttp3 != true)
+        {
+            proxy.TryEnableHttp3IfSupported();
+        }
+        else if (!ShouldEnableHttp3(config))
+        {
+            proxy.SetHttp3Enabled(false);
+        }
+    }
+
+    private static void ConfigureResponseCache(
+        ProxyServer proxy,
+        List<IProxyMiddleware> middleware,
+        MemoryHttpResponseCache responseCache,
+        IReadOnlyDictionary<string, string> plusOptions)
+    {
+        if (!IsTruthy(plusOptions, "cache.enable"))
+        {
+            return;
+        }
+
+        var cacheMiddleware = new HttpResponseCacheMiddleware(responseCache);
+        middleware.Add(cacheMiddleware);
+
+        // Session-path fill (a transform plus cache) buffers a small 200 inside the response
+        // handler. Do not subscribe BeforeResponse/AfterResponse: those force every request
+        // off H1 terminate-lite, so a hit never skips the origin.
+        proxy.HttpResponseCacheFiller = cacheMiddleware.TryCacheCurrentResponse;
+    }
+
+    private static async Task TryActivatePlusAsync(TwpConfig config, PlusActivationContext context)
+    {
+        if (config.Plus?.Enabled != true)
+        {
+            return;
+        }
+
+        var plus = PlusLoader.TryLoad(out var warning);
+        if (warning is not null)
+        {
+            AsyncConsole.WriteError(warning);
+        }
+
+        if (plus is null)
+        {
+            return;
+        }
+
+        try
+        {
+            plus.Apply(context);
+        }
+        catch (Exception ex)
+        {
+            // Surface plugin failures (missing gRPC descriptor, bad JWKS URL, …) instead of
+            // continuing as a half-activated edge with silent Plus drop.
+            AsyncConsole.WriteError("Plus activation failed: " + ex.Message);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Resolves Plus file paths (e.g. gRPC descriptor sets) against the config directory so
+    /// relative paths keep working after <see cref="Directory.SetCurrentDirectory"/>.
+    /// </summary>
+    internal static void ResolvePlusRelativePaths(
+        Dictionary<string, string> plusOptions,
+        string? configDir)
+    {
+        if (string.IsNullOrEmpty(configDir) || plusOptions.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var key in PlusRelativePathKeys)
+        {
+            if (!plusOptions.TryGetValue(key, out var raw) || string.IsNullOrWhiteSpace(raw))
+            {
+                continue;
+            }
+
+            if (Path.IsPathRooted(raw))
+            {
+                continue;
+            }
+
+            plusOptions[key] = Path.GetFullPath(Path.Combine(configDir, raw));
+        }
+    }
+
+    internal static void ApplyLogging(ProxyServer proxy, LoggingConfig? logging, bool verbose)
+    {
+        if (logging is not null)
+        {
+            proxy.Logging.Enabled = logging.Enabled;
+            if (Enum.TryParse<LogLevel>(logging.MinimumLevel, ignoreCase: true, out var level))
+            {
+                proxy.Logging.MinimumLevel = level;
+            }
+
+            proxy.Logging.EnableConsole = logging.EnableConsole;
+            proxy.Logging.EnableConsoleColors = logging.EnableConsoleColors;
+            proxy.Logging.EnableFile = logging.EnableFile;
+            if (!string.IsNullOrWhiteSpace(logging.FilePath))
+            {
+                proxy.Logging.FilePath = logging.FilePath;
+            }
+
+            if (logging.MaxFileSizeBytes is long maxSize)
+            {
+                proxy.Logging.MaxFileSizeBytes = maxSize;
+            }
+
+            if (logging.MaxRolledFiles is int maxFiles)
+            {
+                proxy.Logging.MaxRolledFiles = maxFiles;
+            }
+
+            if (logging.QueueCapacity is int queueCapacity)
+            {
+                proxy.Logging.QueueCapacity = queueCapacity;
+            }
+        }
+        else
+        {
+#if DEBUG
+            // Debug builds: quiet Error+console so misconfig is visible while developing.
+            proxy.Logging.Enabled = true;
+            proxy.Logging.MinimumLevel = LogLevel.Error;
+            proxy.Logging.EnableConsole = true;
+#else
+            // Release/published: zero overhead unless YAML logging: or --verbose opts in.
+            proxy.Logging.Enabled = false;
+#endif
+        }
+
+        if (verbose)
+        {
+            proxy.Logging.Enabled = true;
+            proxy.Logging.MinimumLevel = LogLevel.Debug;
+            proxy.Logging.EnableConsole = true;
+        }
+
+        proxy.ApplyLoggingConfiguration();
+    }
+
+    private static void AddListener(ProxyServer proxy, ListenerConfig listener)
+    {
+        var host = listener.Host ?? "0.0.0.0";
+        var ip = host is "0.0.0.0" or "*"
+            ? IPAddress.Any
+            : IPAddress.Parse(host);
+
+        var kind = ResolveListenerKind(listener);
+        ProxyEndPoint endPoint = kind switch
+        {
+            "socks" => CreateSocksEndPoint(ip, listener),
+            "quic" => CreateQuicEndPoint(ip, listener),
+            "transparent" => CreateTransparentEndPoint(ip, listener),
+            _ when !string.IsNullOrEmpty(listener.ForwardHost) => CreateTransparentEndPoint(ip, listener),
+            _ => new ExplicitProxyEndPoint(ip, listener.Port, listener.DecryptSsl),
+        };
+
+        ApplyListenerOverrides(endPoint, listener);
+        proxy.AddEndPoint(endPoint);
+
+        if (endPoint is TransparentProxyEndPoint { ForwardHost: not null } transparent)
+        {
+            var mode = listener.DecryptSsl ? "TLS-terminate" : "transparent";
+            AsyncConsole.WriteLine(
+                $"Listener {host}:{listener.Port} {mode} ForwardHost={transparent.ForwardHost}:{transparent.ForwardPort ?? 80}");
+        }
+        else
+        {
+            AsyncConsole.WriteLine($"Listener {host}:{listener.Port} {kind} decryptSsl={listener.DecryptSsl}");
+        }
+    }
+
+    private static string ResolveListenerKind(ListenerConfig listener)
+    {
+        if (!string.IsNullOrWhiteSpace(listener.Type))
+        {
+            return listener.Type.Trim().ToLowerInvariant();
+        }
+
+        return string.IsNullOrEmpty(listener.ForwardHost) ? "explicit" : "transparent";
+    }
+
+    private static SocksProxyEndPoint CreateSocksEndPoint(IPAddress ip, ListenerConfig listener)
+    {
+        var ep = new SocksProxyEndPoint(ip, listener.Port, listener.DecryptSsl);
+        if (!string.IsNullOrWhiteSpace(listener.GenericCertificateName))
+        {
+            ep.GenericCertificateName = listener.GenericCertificateName;
+        }
+
+        if (!string.IsNullOrEmpty(listener.ForwardHost))
+        {
+            ep.ForwardHost = listener.ForwardHost;
+            ep.ForwardPort = listener.ForwardPort ?? 80;
+        }
+
+        return ep;
+    }
+
+    private static TransparentQuicProxyEndPoint CreateQuicEndPoint(IPAddress ip, ListenerConfig listener)
+    {
+        var ep = new TransparentQuicProxyEndPoint(ip, listener.Port);
+        ApplyQuicKnobs(ep, listener);
+        if (!string.IsNullOrWhiteSpace(listener.GenericCertificateName))
+        {
+            ep.GenericCertificateName = listener.GenericCertificateName;
+        }
+
+        if (!string.IsNullOrEmpty(listener.ForwardHost))
+        {
+            ep.ForwardHost = listener.ForwardHost;
+            ep.ForwardPort = listener.ForwardPort ?? 443;
+        }
+
+        return ep;
+    }
+
+    private static TransparentProxyEndPoint CreateTransparentEndPoint(IPAddress ip, ListenerConfig listener)
+    {
+        // TLS terminate → cleartext origin when ForwardHost is set (ForwardCleartext).
+        var ep = new TransparentProxyEndPoint(ip, listener.Port, listener.DecryptSsl)
+        {
+            EnableHttp3 = ResolveListenerHttp3(listener, listener.DecryptSsl),
+        };
+
+        if (!string.IsNullOrEmpty(listener.ForwardHost))
+        {
+            ep.ForwardHost = listener.ForwardHost;
+            ep.ForwardPort = listener.ForwardPort ?? 80;
+            ep.ForwardCleartext = true;
+        }
+
+        if (!string.IsNullOrWhiteSpace(listener.GenericCertificateName))
+        {
+            ep.GenericCertificateName = listener.GenericCertificateName;
+        }
+
+        ApplyQuicKnobs(ep, listener);
+        return ep;
+    }
+
+    private static void ApplyQuicKnobs(TransparentProxyEndPoint ep, ListenerConfig listener)
+    {
+        if (listener.MaxInboundBidirectionalStreams is int bidi)
+        {
+            ep.MaxInboundBidirectionalStreams = bidi;
+        }
+
+        if (listener.MaxInboundUnidirectionalStreams is int uni)
+        {
+            ep.MaxInboundUnidirectionalStreams = uni;
+        }
+
+        if (listener.HandshakeTimeoutSeconds is int handshake)
+        {
+            ep.HandshakeTimeout = TimeSpan.FromSeconds(handshake);
+        }
+
+        if (listener.IdleTimeoutSeconds is int idle)
+        {
+            ep.IdleTimeout = TimeSpan.FromSeconds(idle);
+        }
+    }
+
+    private static void ApplyQuicKnobs(TransparentQuicProxyEndPoint ep, ListenerConfig listener)
+    {
+        if (listener.MaxInboundBidirectionalStreams is int bidi)
+        {
+            ep.MaxInboundBidirectionalStreams = bidi;
+        }
+
+        if (listener.MaxInboundUnidirectionalStreams is int uni)
+        {
+            ep.MaxInboundUnidirectionalStreams = uni;
+        }
+
+        if (listener.HandshakeTimeoutSeconds is int handshake)
+        {
+            ep.HandshakeTimeout = TimeSpan.FromSeconds(handshake);
+        }
+
+        if (listener.IdleTimeoutSeconds is int idle)
+        {
+            ep.IdleTimeout = TimeSpan.FromSeconds(idle);
+        }
+    }
+
+    private static void ApplyListenerOverrides(ProxyEndPoint endPoint, ListenerConfig listener)
+    {
+        if (listener.MaxCachedConnections is int maxCached)
+        {
+            endPoint.MaxCachedConnections = maxCached;
+        }
+
+        if (listener.MaxConcurrentClients is int maxClients)
+        {
+            endPoint.MaxConcurrentClients = maxClients;
+        }
+    }
+
+    internal static bool ConfigNeedsRequestTimingCapture(TwpConfig config) =>
+        config.Clusters.Any(c => c.Algorithm == LoadBalanceAlgorithm.LeastTime);
+
+    internal static bool ShouldEnableHttp3(TwpConfig config) =>
+        !config.Listeners.Any(l => l.EnableHttp3 == false);
+
+    private static bool ResolveListenerHttp3(ListenerConfig listener, bool decryptSsl) =>
+        listener.EnableHttp3 ?? (decryptSsl && System.Net.Quic.QuicListener.IsSupported);
+
+    private static bool IsTruthy(IReadOnlyDictionary<string, string> options, string key) =>
+        options.TryGetValue(key, out var value) &&
+        (value.Equals("true", StringComparison.OrdinalIgnoreCase) ||
+         value.Equals("1", StringComparison.OrdinalIgnoreCase) ||
+         value.Equals("yes", StringComparison.OrdinalIgnoreCase));
+
+    internal static Dictionary<string, string> BuildPlusOptions(PlusConfig plus)
+    {
+        var options = plus.Options is null
+            ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, string>(plus.Options, StringComparer.OrdinalIgnoreCase);
+
+        if (plus.ControlPlane is not null)
+        {
+            options["controlPlane.host"] = plus.ControlPlane.Host;
+            options["controlPlane.port"] = plus.ControlPlane.Port.ToString();
+            if (plus.ControlPlane.DashboardPort is > 0 and < 65536)
+            {
+                options["controlPlane.dashboardPort"] = plus.ControlPlane.DashboardPort.Value.ToString();
+            }
+
+            if (!string.IsNullOrEmpty(plus.ControlPlane.SharedSecret))
+            {
+                options["controlPlane.sharedSecret"] = plus.ControlPlane.SharedSecret;
+            }
+        }
+
+        return options;
+    }
+
+    internal static bool ConfigNeedsSessionPath(TwpConfig config)
+    {
+        if (config.StaticFiles is not null && !string.IsNullOrEmpty(config.StaticFiles.Root))
+        {
+            return true;
+        }
+
+        if (config.Certificates?.AcmeDomain is not null)
+        {
+            return true;
+        }
+
+        if (config.Plus is not null &&
+            config.Plus.Options is not null &&
+            config.Plus.Options.TryGetValue("grpc.transcode.enabled", out var grpcEnabled) &&
+            (grpcEnabled.Equals("true", StringComparison.OrdinalIgnoreCase) ||
+             grpcEnabled.Equals("1", StringComparison.OrdinalIgnoreCase) ||
+             grpcEnabled.Equals("yes", StringComparison.OrdinalIgnoreCase)))
+        {
+            return true;
+        }
+
+        if (config.Server?.AccessLog is { Path: not null and not "" })
+        {
+            return true;
+        }
+
+        return config.Routes.Any(r => r.Transforms is { Count: > 0 });
+    }
+
+    private static void WriteConfigWarnings(LoadedConfig loaded)
+    {
+        foreach (var warning in loaded.UnknownKeys)
+            AsyncConsole.WriteError("warning: " + warning);
+        foreach (var warning in TwpConfigValidator.CollectWarnings(loaded.Config))
+            AsyncConsole.WriteError("warning: " + warning);
+    }
+}

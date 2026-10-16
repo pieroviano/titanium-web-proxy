@@ -1,0 +1,451 @@
+#pragma warning disable CA1416
+using System;
+using System.Buffers;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Threading;
+using System.Threading.Channels;
+using System.Threading.Tasks;
+using Titanium.Web.Proxy.EventArguments;
+using Titanium.Web.Proxy.Exceptions;
+using Titanium.Web.Proxy.Extensions;
+using Titanium.Web.Proxy.Helpers;
+using Titanium.Web.Proxy.Http;
+using Titanium.Web.Proxy.Http2;
+using Titanium.Web.Proxy.Http3;
+using Titanium.Web.Proxy.Http3.Qpack;
+using Titanium.Web.Proxy.Logging;
+using Titanium.Web.Proxy.Models;
+using Titanium.Web.Proxy.StreamExtended.Network;
+
+namespace Titanium.Web.Proxy;
+
+/// <summary>
+///     Translates an H2 (or H1.1) client connection onto HTTP/3 (QUIC) origins, one stream at a time.
+///     <para>
+///         The <em>cold path</em> (DNS/forced H3 at CONNECT time) uses
+///         <see cref="SendHttp2ToHttp3Bridge" /> with a <see cref="NullOriginStream" /> so the full
+///         <see cref="Http2Helper.SendHttp2" /> relay runs without an H2 origin connection.
+///         Every stream in that relay is answered by <see cref="BridgeOnBeforeRequestForH3" /> which
+///         forwards to the QUIC origin and emits the response back as H2 frames.
+///     </para>
+///     <para>
+///         The <em>warm path</em> still installs <see cref="BridgeOnBeforeRequestForH3" /> on
+///         H2↔H2 relays (for Via / BeforeRequest consistency), but mid-connection Alt-Svc upgrades
+///         are intentionally not taken — see the guard in that method.
+///     </para>
+/// </summary>
+public partial class ProxyServer
+{
+    /// <summary>
+    ///     Entry point for the cold H3 bridge path, invoked from the explicit and transparent client
+    ///     handlers when a connection-time HTTPS/SVCB DNS lookup (or forced
+    ///     <see cref="UpstreamHttpProtocol.Http3"/> policy) selects H3 before any H2 origin connection
+    ///     is opened.  Drives the standard <see cref="Http2Helper.SendHttp2"/> relay against a
+    ///     <see cref="NullOriginStream"/> so every eligible H2 stream is forwarded to the QUIC origin
+    ///     independently by <see cref="BridgeOnBeforeRequestForH3"/>.
+    /// </summary>
+    internal async Task SendHttp2ToHttp3Bridge( // NOSONAR S107 -- Bridge parameters mirror connection context and remain explicit for safe protocol routing.
+        HttpClientStream clientStream,
+        ProxyEndPoint endPoint,
+        ConnectRequest? connectRequest,
+        object? userData,
+        string remoteHostName,
+        int remotePort,
+        CancellationTokenSource cancellationTokenSource,
+        UpstreamHttpProtocol? upstreamHttpProtocol = null)
+    {
+        var cancellationToken = cancellationTokenSource.Token;
+        var originStream = new NullOriginStream(cancellationToken);
+
+        await Http2Helper.SendHttp2(
+            clientStream, originStream,
+            () => new SessionEventArgs(this, endPoint, clientStream, connectRequest, cancellationTokenSource)
+            {
+                UserData = userData,
+                // Seed connection-level protocol policy so per-stream H3 route resolution
+                // honours forced Http3/Http11/Http2 (same as the warm-path factory).
+                UpstreamHttpProtocol = upstreamHttpProtocol
+            },
+            (sessionArgs, ctx) => BridgeOnBeforeRequestForH3(sessionArgs, ctx, remoteHostName, remotePort,
+                coldH3Bridge: true),
+            // NullOriginStream never produces real response HEADERS frames; this delegate is never invoked.
+            (sessionArgs, ctx) => Task.CompletedTask,
+            sessionArgs => OnAfterResponse(sessionArgs),
+            headers => PrepareRequestHeaders(headers),
+            cancellationTokenSource, clientStream.Connection.Id, logger,
+            MaxDecodedHeaderListBytes, EnableRfc8441, ResourceLimits,
+            httpInterceptionEnabled: NeedsHttpInterception(endPoint),
+            shouldInterceptHttp: ShouldInterceptHttp);
+    }
+
+    /// <summary>
+    ///     The per-stream <c>onBeforeRequest</c> delegate for the H2→H3 bridge. On the cold path it
+    ///     runs user <c>BeforeRequest</c> handlers, performs a synchronous cache-only H3 route check,
+    ///     buffers the request body, registers the background round-trip task, and marks the stream
+    ///     as <see cref="Http2StreamState.IsExternalBridge"/> so <see cref="Http2Helper"/> suppresses
+    ///     native H2 origin forwarding. On the warm path it only runs <c>BeforeRequest</c> and then
+    ///     returns so the attached H2 origin relay continues.
+    /// </summary>
+    /// <param name="coldH3Bridge">
+    ///     <see langword="true"/> when this connection has no real H2 origin (NullOriginStream cold
+    ///     path). On a cache miss / post-eviction, the bridge must TCP-fallback itself — forwarding
+    ///     HEADERS into <see cref="NullOriginStream"/> would silently discard them and hang the
+    ///     client stream. Warm-path callers pass <see langword="false"/>; mid-connection H3
+    ///     upgrades are not taken on that path (native H2 origin relay only).
+    /// </param>
+    private async Task BridgeOnBeforeRequestForH3(
+        SessionEventArgs sessionArgs,
+        Http2StreamContext ctx,
+        string remoteHostName,
+        int remotePort,
+        bool coldH3Bridge = false)
+    {
+        if (!sessionArgs.IsFastPath)
+            await OnBeforeRequest(sessionArgs);
+
+        // Per-stream destination when ReverseProxy routes are set.
+        Routing.ReverseProxySessionDispatch.TryApply(this, sessionArgs);
+
+        // BeforeRequest already synthesized a response (Ok/GenericResponse/Redirect/etc.); Http2Helper
+        // handles this via the CancelRequest path — nothing to bridge.
+        if (sessionArgs.HttpClient.Request.CancelRequest)
+            return;
+
+        // RFC 8441 extended CONNECT / WebSocket streams remain on their own specialized tunnel path.
+        if (ctx.ConnectionState.Streams.TryGetValue(ctx.StreamId, out var ecState) &&
+            ecState.IsExtendedConnect)
+        {
+            return;
+        }
+
+        // Warm path (attached H2 origin): never upgrade individual streams to H3 mid-connection.
+        // Mixing native H2↔H2 relay with EmitSyntheticResponseAsync on the same client H2 session
+        // has been observed to trigger Chrome ERR_HTTP2_PROTOCOL_ERROR (blank YouTube after Alt-Svc
+        // / QUIC warmup). Keep serving this multiplexed connection over H2↔H2; cold NullOriginStream
+        // bridges remain the supported H2→H3 path for connections that commit to H3 at CONNECT time.
+        if (!coldH3Bridge)
+            return;
+
+        var (reqHost, reqPort) = ResolveH3BridgeOriginIdentity(sessionArgs, remoteHostName, remotePort);
+        var h3Route = ResolveHttp3Origin(reqHost, reqPort, sessionArgs.UpstreamHttpProtocol,
+            allowDnsProbe: false);
+
+        if (!h3Route.UseH3)
+        {
+            // Cold path: CONNECT committed to H2→H3 with NullOriginStream. After QUIC failure evicts
+            // the capability cache, later multiplexed streams must still be answered (via TCP).
+            h3Route = Http3OriginRoute.None;
+        }
+
+        if (TryRejectLoopedVia(sessionArgs))
+            return;
+
+        // Normalize headers before the background origin task starts so Http2Helper cannot race
+        // a header mutation against the parallel origin send.
+        PrepareRequestHeaders(sessionArgs.HttpClient.Request.Headers);
+
+        // Stream unread request DATA to the H3 origin unless BeforeRequest already buffered via
+        // GetRequestBody. Create the channel before returning so Http2Helper can route DATA into it.
+        Channel<(byte[] Buffer, int Length)>? requestBodyChannel = null;
+        if (sessionArgs.HttpClient.Request.HasBody && !sessionArgs.HttpClient.Request.IsBodyRead)
+        {
+            requestBodyChannel = Channel.CreateBounded<(byte[] Buffer, int Length)>(
+                new BoundedChannelOptions(256)
+                {
+                    SingleReader = true,
+                    SingleWriter = true,
+                    FullMode = BoundedChannelFullMode.Wait
+                });
+        }
+
+        // Re-check stream existence: it may have been reset while we were in BeforeRequest.
+        if (!ctx.ConnectionState.Streams.TryGetValue(ctx.StreamId, out var streamState))
+            return;
+
+        ConsolidateCookieHeaders(sessionArgs.HttpClient.Request.Headers);
+
+        streamState.InboundRequestBodyChannel = requestBodyChannel;
+
+        // The round trip below starts running right away and may reach BeforeResponse before Http2Helper
+        // gets to its own Request.Locked assignment (it awaits the previous stream's dispatch first).
+        // GetResponseBody throws "You cannot read the response body before request is made to server"
+        // while the request is unlocked, so lock it here: BeforeRequest is done and headers are final.
+        sessionArgs.HttpClient.Request.Locked = true;
+
+        // IsFastPath: no ContinueWith fault wrapper (same as H2→H1).
+        Task bridgeTask;
+        if (sessionArgs.IsFastPath)
+        {
+            bridgeTask = RunHttp2ToHttp3BridgeRoundTripAsync(
+                sessionArgs, ctx.StreamId, ctx.ConnectionState, ctx.ClientStream,
+                h3Route, ctx.CancellationToken, streamState.Cancellation.Token, requestBodyChannel);
+        }
+        else
+        {
+            bridgeTask = RunHttp2ToHttp3BridgeRoundTripAsync(
+                    sessionArgs, ctx.StreamId, ctx.ConnectionState, ctx.ClientStream,
+                    h3Route, ctx.CancellationToken, streamState.Cancellation.Token, requestBodyChannel)
+                .ContinueWith(t =>
+                {
+                    if (t.IsFaulted)
+                        ProxyDiagnostics.ReportException(logger,
+                            $"H2→H3 bridge round trip failed for stream {ctx.StreamId}",
+                            new ProxyHttpException(
+                                $"H2→H3 bridge round trip failed for stream {ctx.StreamId}",
+                                t.Exception.GetBaseException(), sessionArgs));
+                }, TaskScheduler.Default);
+        }
+
+        // Register ownership BEFORE returning from this delegate so Http2Helper sees the state
+        // correctly in ProcessCompleteHeaderBlockAsync (for bodiless requests, the handler
+        // completes in the Task.WhenAny 'if' branch and the IsExternalBridge check runs there).
+        streamState.SyntheticTask = bridgeTask;
+        streamState.IsExternalBridge = true;
+        ctx.ConnectionState.PendingSynthetics.Track(bridgeTask);
+    }
+
+    private static (string Host, int Port) ResolveH3BridgeOriginIdentity(
+        SessionEventArgs sessionArgs, string remoteHostName, int remotePort)
+    {
+        // Prefer CONNECT-time remote identity (ForwardHttpsHost/Port) over the client request URI:
+        // reverse proxies rewrite Host to the listen address, which must not become the QUIC target.
+        if (sessionArgs.ProxyEndPoint is TransparentBaseProxyEndPoint
+            {
+                ForwardHost: { Length: > 0 } forwardHost,
+                ForwardPort: { } forwardPort
+            })
+            return (forwardHost, forwardPort);
+
+        var (host, port) = sessionArgs.HttpClient.Request.GetOriginHostPort(remotePort);
+        return (string.IsNullOrEmpty(host) ? remoteHostName : host, port);
+    }
+
+    /// <returns><see langword="true"/> when a Via loop was detected and a 508 response was synthesized.</returns>
+    private bool TryRejectLoopedVia(SessionEventArgs sessionArgs)
+    {
+        if (sessionArgs.IsFastPath || sessionArgs.IsTransparent || sessionArgs.IsSocks ||
+            string.IsNullOrEmpty(ViaHeaderPseudonym))
+            return false;
+
+        if (HasLoopedVia(sessionArgs.HttpClient.Request.Headers, ViaHeaderPseudonym))
+        {
+            sessionArgs.GenericResponse(string.Empty, (HttpStatusCode)508);
+            return true;
+        }
+
+        AddViaHeader(sessionArgs.HttpClient.Request.Headers,
+            sessionArgs.HttpClient.Request.HttpVersion, ViaHeaderPseudonym);
+        return false;
+    }
+
+    private static void ConsolidateCookieHeaders(HeaderCollection headers)
+    {
+        // RFC 7540 section 8.1.2.5 permits multiple Cookie fields over HTTP/2; consolidate before
+        // forwarding to avoid confusing origins or middleware.
+        var cookieHeaders = headers.GetHeaders("Cookie");
+        if (cookieHeaders is not { Count: > 1 })
+            return;
+
+        var combined = string.Join("; ", cookieHeaders.Select(h => h.Value));
+        headers.RemoveHeader("Cookie");
+        headers.AddHeader("Cookie", combined);
+    }
+
+    /// <summary>
+    ///     Performs one independent HTTP/3 origin round trip for a single H2 stream and translates
+    ///     the result back into H2 frames for the client via
+    ///     <see cref="Http2Helper.EmitSyntheticResponseAsync"/>.  Mirrors the structure of
+    ///     <c>RunHttp2ToHttp11BridgeRoundTripAsync</c>.
+    /// </summary>
+    private async Task RunHttp2ToHttp3BridgeRoundTripAsync( // NOSONAR S3776 -- This protocol/state-machine path shares mutable parsing or transport state; splitting it further would create disproportionate regression risk.
+        SessionEventArgs sessionArgs,
+        int streamId,
+        Http2ConnectionState connectionState,
+        Stream clientStream,
+        Http3OriginRoute h3Route,
+        CancellationToken connectionToken,
+        CancellationToken streamToken,
+        Channel<(byte[] Buffer, int Length)>? requestBodyChannel)
+    {
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(connectionToken, streamToken);
+        var cancellationToken = linkedCts.Token;
+
+        try
+        {
+            Func<System.Net.Quic.QuicStream, CancellationToken, Task>? copyRequestBody = null;
+            if (requestBodyChannel != null && !sessionArgs.HttpClient.Request.IsBodyRead)
+            {
+                var request = sessionArgs.HttpClient.Request;
+                copyRequestBody = async (originStream, ct) =>
+                {
+                    await foreach (var chunk in requestBodyChannel.Reader.ReadAllAsync(ct))
+                    {
+                        try
+                        {
+                            if (chunk.Length > 0)
+                                await Http3Frame.WriteAsync(originStream, Http3FrameType.Data,
+                                    chunk.Buffer.AsMemory(0, chunk.Length), ct);
+                        }
+                        finally
+                        {
+                            ArrayPool<byte>.Shared.Return(chunk.Buffer);
+                        }
+                    }
+
+                    if (request.HasTrailingHeaders)
+                    {
+                        var trailerBlock = QpackEncoder.Encode(
+                            request.TrailingHeaders.Select(h => (h.Name, h.Value)));
+                        await Http3Frame.WriteAsync(originStream, Http3FrameType.Headers, trailerBlock, ct,
+                            completeWrites: true);
+                    }
+
+                    request.IsBodyReceived = true;
+                };
+            }
+
+            // Forward the request to the QUIC origin using the pre-resolved route (avoids re-probing
+            // DNS and ensures the correct alternative port is used). Relay 1xx (103 Early Hints)
+            // immediately so browser TTFB is not gated on the final 200.
+            await Http3OriginBridge.ForwardAsync(
+                sessionArgs, this, h3Route, logger, cancellationToken,
+                onInterimResponse: async (interim, ct) =>
+                {
+                    LowercaseHeaderNames(interim.Headers);
+                    await Http2Helper.EmitInterimResponseAsync(
+                        sessionArgs, streamId, connectionState, clientStream, interim, ct);
+                },
+                copyRequestBody: copyRequestBody);
+
+            sessionArgs.Timing?.MarkResponseHeadersReceived();
+
+            // This response was decoded from real HTTP/3 frames (Http3OriginBridge), never from
+            // HttpStream-read bytes, so it is explicitly out of scope for the HTTP/1 wire validator -
+            // see Http1FramingValidator's remarks. The call is still made (as a documented no-op) so
+            // this remains one of the five insertion points the isolation test suite enumerates.
+            Http1FramingValidator.Validate(sessionArgs.HttpClient.Response, FramingSource.SynthesizedFromH3);
+            if (!sessionArgs.IsFastPath)
+                sessionArgs.HttpClient.Response.SetOriginalHeaders();
+
+            if (!sessionArgs.IsFastPath && !sessionArgs.HttpClient.Response.Locked)
+            {
+                var responseBeforeHandler = sessionArgs.HttpClient.Response;
+                await OnBeforeResponse(sessionArgs);
+                // If BeforeResponse replaced the response, the QUIC StreamBodyWriter never runs —
+                // drain it so the origin stream/lease is released (same shape as H1→H2).
+                if (!ReferenceEquals(responseBeforeHandler, sessionArgs.HttpClient.Response)
+                    && responseBeforeHandler.StreamBodyWriter != null)
+                {
+                    try
+                    {
+                        await responseBeforeHandler.StreamBodyWriter(Stream.Null, cancellationToken);
+                    }
+                    catch
+                    {
+                        // Best-effort release of the QUIC stream/lease; emit path uses the new response.
+                    }
+                }
+            }
+
+            var response = sessionArgs.HttpClient.Response;
+
+            if (!response.Locked)
+            {
+                // Strip HTTP/2-forbidden connection-specific header fields that an H3 origin may
+                // legitimately send (e.g. via middleware or framework defaults).
+                response.Headers.RemoveHeader(KnownHeaders.Connection);
+                response.Headers.RemoveHeader("Keep-Alive");
+                response.Headers.RemoveHeader(KnownHeaders.ProxyConnection);
+                response.Headers.RemoveHeader(KnownHeaders.Upgrade);
+
+                if (!sessionArgs.IsFastPath && !sessionArgs.IsTransparent && !sessionArgs.IsSocks &&
+                    !string.IsNullOrEmpty(ViaHeaderPseudonym))
+                {
+                    AddViaHeader(response.Headers, response.HttpVersion, ViaHeaderPseudonym);
+                }
+
+                // RFC 7540 §8.1.2: header field names must be lowercase in HTTP/2.
+                LowercaseHeaderNames(response.Headers);
+                if (response.HasTrailingHeaders)
+                    LowercaseHeaderNames(response.TrailingHeaders);
+            }
+
+            await Http2Helper.EmitSyntheticResponseAsync(
+                sessionArgs, streamId, connectionState, clientStream, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            // Record the failure on the session even when it is expected teardown (cancellation): this
+            // matches the convention used by every other forwarding path (H1's RequestHandler, the H1↔H2
+            // bridge), which always sets args.Exception in their outermost catch before AfterResponse runs
+            // - including for OperationCanceledException. Without this, a stream the client itself aborted
+            // (e.g. RST_STREAM on an abandoned analytics/beacon call) reaches AfterResponse with a
+            // default/unset Response (StatusCode 0, HttpVersion null) and *no* way for the caller to tell
+            // "client cancelled this" apart from "the proxy actually failed".
+            sessionArgs.Exception = ex;
+
+            // Cancellation (RST_STREAM, GOAWAY, connection close) is expected teardown, not an error.
+            // Idle QUIC/TCP peer closes also surface here as IOException/QuicException — classify via
+            // ReportException so they stay Debug rather than red Error noise after a browsing pause.
+            if (!cancellationToken.IsCancellationRequested)
+            {
+                ProxyDiagnostics.ReportException(logger,
+                    $"H2→H3 bridge origin round trip failed for stream {streamId}",
+                    new ProxyHttpException(
+                        $"H2→H3 bridge origin round trip failed for stream {streamId}", ex, sessionArgs));
+
+                try
+                {
+                    if (!sessionArgs.HttpClient.Response.Locked)
+                    {
+                        // Headers not yet sent — answer with a clean 502.
+                        OriginFailureResponses.Apply(sessionArgs, ex);
+                        await Http2Helper.EmitSyntheticResponseAsync(
+                            sessionArgs, streamId, connectionState, clientStream, CancellationToken.None);
+                    }
+                    else
+                    {
+                        // Headers (and possibly part of the body) already reached the client before the
+                        // origin round trip failed. Queue RST through the FIFO so it cannot overtake
+                        // still-queued HEADERS/DATA.
+                        Http2Helper.QueueRstStreamFrame(connectionState, clientStream, streamId,
+                            Http2ErrorCode.InternalError);
+                    }
+                }
+                catch
+                {
+                    // Best-effort error reporting only.
+                }
+            }
+        }
+        finally
+        {
+            // Finalize (AfterResponse + Dispose) this stream immediately rather than deferring to
+            // connection teardown.  The bridged stream's response never flows through
+            // CopyHttp2FrameAsync's isClient=false direction, so the normal "both directions closed"
+            // bookkeeping never observes it.  FinalizedFlag makes this race-safe against any
+            // concurrent RST_STREAM / GOAWAY finalization.
+            if (connectionState.TryTakeStream(streamId, out var finalStreamState))
+            {
+                // Drain any leftover rented body buffers if the copy task never ran.
+                var bodyCh = finalStreamState.InboundRequestBodyChannel;
+                if (bodyCh != null)
+                {
+                    bodyCh.Writer.TryComplete();
+                    while (bodyCh.Reader.TryRead(out var leftover))
+                        ArrayPool<byte>.Shared.Return(leftover.Buffer);
+                }
+
+                connectionState.ClientSendFlow.RemoveStream(streamId);
+                connectionState.ServerSendFlow.RemoveStream(streamId);
+                await Http2Helper.FinalizeStreamAsync(
+                    finalStreamState,
+                    args => OnAfterResponse(args),
+                    logger);
+            }
+        }
+    }
+}
+#pragma warning restore CA1416

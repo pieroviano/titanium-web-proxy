@@ -1,0 +1,781 @@
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+using Titanium.Inspector.Services;
+
+namespace Titanium.Inspector.Tests;
+
+[TestClass]
+public class SessionSearchAndArchiveTests
+{
+    private static readonly long[] SessionIdsOneAndTwo = [1, 2];
+    private static readonly long[] EmptySessionIds = Array.Empty<long>();
+
+    [TestMethod]
+    public void Filter_ByMethodAndIsWs()
+    {
+        var sessions = new[]
+        {
+            new SessionSnapshot { Id = 1, Method = "GET", Url = "https://a/x", IsWebSocket = false },
+            new SessionSnapshot { Id = 2, Method = "GET", Url = "https://a/ws", IsWebSocket = true },
+            new SessionSnapshot { Id = 3, Method = "POST", Url = "https://a/y", IsWebSocket = false },
+        };
+
+        var filtered = SessionSearch.Filter(sessions, "method:GET is:ws").ToList();
+        Assert.AreEqual(1, filtered.Count);
+        Assert.AreEqual(2, filtered[0].Id);
+        Assert.IsTrue(SessionSearch.Matches(sessions[1], "method:GET is:ws"));
+        Assert.IsFalse(SessionSearch.Matches(sessions[0], "method:GET is:ws"));
+        Assert.IsTrue(SessionSearch.Matches(sessions[0], null));
+    }
+
+    [TestMethod]
+    public void Filter_HostMatchesHostFieldNotUrlPath()
+    {
+        var sessions = new[]
+        {
+            new SessionSnapshot { Id = 1, Host = "api.example.com", Url = "https://cdn.other/api.example.com/x" },
+            new SessionSnapshot { Id = 2, Host = "cdn.other", Url = "https://cdn.other/api.example.com/x" },
+            new SessionSnapshot { Id = 3, Host = null, Url = "https://fallback.host/path" },
+        };
+
+        var byHost = SessionSearch.Filter(sessions, "host:api.example").ToList();
+        Assert.AreEqual(1, byHost.Count);
+        Assert.AreEqual(1, byHost[0].Id);
+
+        var byUrlHost = SessionSearch.Filter(sessions, "host:fallback").ToList();
+        Assert.AreEqual(1, byUrlHost.Count);
+        Assert.AreEqual(3, byUrlHost[0].Id);
+    }
+
+    [TestMethod]
+    public void Filter_StatusClassAndExact()
+    {
+        var sessions = new[]
+        {
+            new SessionSnapshot { Id = 1, StatusCode = 200, Url = "https://a/" },
+            new SessionSnapshot { Id = 2, StatusCode = 404, Url = "https://a/" },
+            new SessionSnapshot { Id = 3, StatusCode = 500, Url = "https://a/" },
+            new SessionSnapshot { Id = 4, StatusCode = null, Url = "https://a/" },
+        };
+
+        Assert.AreEqual(1, SessionSearch.Filter(sessions, "status:2xx").Count());
+        Assert.AreEqual(1, SessionSearch.Filter(sessions, "status:4xx").Count());
+        Assert.AreEqual(1, SessionSearch.Filter(sessions, "status:404").Count());
+        Assert.AreEqual(2, SessionSearch.Filter(sessions, "is:error").Count());
+        Assert.IsFalse(SessionSearch.Matches(sessions[3], "status:2xx"));
+    }
+
+    /// <summary>Pins today's status syntax so a later list/range change cannot drop these forms.</summary>
+    [TestMethod]
+    public void Filter_StatusSemantics_Pinned()
+    {
+        var sessions = new[]
+        {
+            new SessionSnapshot { Id = 1, StatusCode = 200, Url = "https://a/" },
+            new SessionSnapshot { Id = 2, StatusCode = 304, Url = "https://a/" },
+            new SessionSnapshot { Id = 3, StatusCode = 404, Url = "https://a/" },
+            new SessionSnapshot { Id = 4, StatusCode = 500, Url = "https://a/" },
+            new SessionSnapshot { Id = 5, StatusCode = null, Url = "https://a/" },
+        };
+
+        Assert.AreEqual(1, SessionSearch.Filter(sessions, "status:304").Count());
+        Assert.AreEqual(1, SessionSearch.Filter(sessions, "status:2xx").Count());
+        Assert.AreEqual(1, SessionSearch.Filter(sessions, "status:3xx").Count());
+        Assert.AreEqual(1, SessionSearch.Filter(sessions, "status:4xx").Count());
+        Assert.AreEqual(1, SessionSearch.Filter(sessions, "status:5xx").Count());
+        Assert.AreEqual(2, SessionSearch.Filter(sessions, "status:error").Count());
+        Assert.IsFalse(SessionSearch.Matches(sessions[4], "status:200"));
+        Assert.IsFalse(SessionSearch.Matches(sessions[4], "status:2xx"));
+        Assert.IsFalse(SessionSearch.Matches(sessions[4], "status:error"));
+
+        var excluded = SessionSearch.Filter(sessions, "-status:404").Select(s => s.Id).ToList();
+        CollectionAssert.AreEquivalent(new long[] { 1, 2, 4, 5 }, excluded);
+    }
+
+    [TestMethod]
+    public void Filter_ProcessAndContentType()
+    {
+        var sessions = new[]
+        {
+            new SessionSnapshot
+            {
+                Id = 1, Url = "https://a/", ProcessName = "chrome", ProcessId = 42,
+                ContentType = "application/json",
+            },
+            new SessionSnapshot
+            {
+                Id = 2, Url = "https://a/", ProcessName = "firefox", ProcessId = 99,
+                ContentType = "text/html",
+            },
+        };
+
+        Assert.AreEqual(1, SessionSearch.Filter(sessions, "process:chrome").Count());
+        Assert.AreEqual(1, SessionSearch.Filter(sessions, "process:42").Count());
+        Assert.AreEqual(1, SessionSearch.Filter(sessions, "content-type:json").Count());
+    }
+
+    [TestMethod]
+    public void Filter_BareTextMatchesVisibleColumnsNotNumbersOrHiddenFields()
+    {
+        var processOnly = new SessionSnapshot
+        {
+            Id = 1,
+            Method = "POST",
+            Url = "https://cdn.other/v1/items",
+            Host = "api.example.com",
+            StatusCode = 201,
+            ProcessName = "chrome",
+            ProcessId = 4242,
+            Protocol = "h2",
+            ContentType = "application/json",
+        };
+        var urlOnly = new SessionSnapshot
+        {
+            Id = 2,
+            Method = "PUT",
+            Url = "https://cdn.other/chrome",
+            StatusCode = 200,
+            ProcessName = "firefox",
+            ProcessId = 99,
+            Protocol = "HTTP/1.1",
+        };
+        var statusAndMethod = new SessionSnapshot
+        {
+            Id = 3,
+            Method = "GET",
+            Url = "https://cdn.other/v1/other",
+            StatusCode = 404,
+            ProcessName = "msedge",
+            ProcessId = 42,
+            Protocol = "HTTP/1.1",
+        };
+        var portLikePid = new SessionSnapshot
+        {
+            Id = 4,
+            Method = "HEAD",
+            Url = "https://cdn.other/v1/other",
+            StatusCode = 204,
+            ProcessName = "widget",
+            ProcessId = 4430,
+            Protocol = "HTTP/1.1",
+        };
+
+        Assert.IsTrue(SessionSearch.Matches(processOnly, "chrome"));
+        Assert.IsTrue(SessionSearch.Matches(urlOnly, "chrome"));
+        Assert.IsFalse(SessionSearch.Matches(statusAndMethod, "chrome"));
+
+        Assert.IsTrue(SessionSearch.Matches(statusAndMethod, "GET"));
+        Assert.IsTrue(SessionSearch.Matches(statusAndMethod, "get"));
+        Assert.IsFalse(SessionSearch.Matches(processOnly, "GET"));
+
+        Assert.IsTrue(SessionSearch.Matches(statusAndMethod, "404"));
+        Assert.IsFalse(SessionSearch.Matches(processOnly, "404"));
+        Assert.IsFalse(SessionSearch.Matches(processOnly, "2xx"));
+
+        // A bare number matches the PID only when equal; never as a substring of the PID or of
+        // ProcessDisplay (chrome:4242, widget:4430, msedge:42).
+        Assert.IsTrue(SessionSearch.Matches(processOnly, "4242"));
+        Assert.IsTrue(SessionSearch.Matches(statusAndMethod, "42"));
+        Assert.IsFalse(SessionSearch.Matches(processOnly, "42"));
+        Assert.IsFalse(SessionSearch.Matches(portLikePid, "443"));
+        Assert.IsFalse(SessionSearch.Matches(portLikePid, "4430x"));
+        Assert.IsFalse(SessionSearch.Matches(statusAndMethod, "4"));
+        Assert.IsTrue(SessionSearch.Matches(portLikePid, "4430"));
+        Assert.IsTrue(SessionSearch.Matches(statusAndMethod, "pid:42"));
+        Assert.IsTrue(SessionSearch.Matches(statusAndMethod, "process:42"));
+        Assert.IsFalse(SessionSearch.Matches(processOnly, "pid:42"));
+
+        Assert.IsFalse(SessionSearch.Matches(urlOnly, "process:chrome"));
+        Assert.IsFalse(SessionSearch.Matches(processOnly, "url:chrome"));
+
+        Assert.IsFalse(SessionSearch.Matches(processOnly, "json"));
+        Assert.IsTrue(SessionSearch.Matches(processOnly, "content-type:json"));
+
+        Assert.IsTrue(SessionSearch.Matches(processOnly, "protocol:h2"));
+        Assert.IsFalse(SessionSearch.Matches(processOnly, "h2"));
+        Assert.IsFalse(SessionSearch.Matches(urlOnly, "protocol:h2"));
+
+        Assert.IsTrue(SessionSearch.Matches(processOnly, "api.example"));
+
+        Assert.IsTrue(SessionSearch.Matches(processOnly, "chrome api"));
+        Assert.IsFalse(SessionSearch.Matches(processOnly, "chrome missing"));
+        Assert.IsFalse(SessionSearch.Matches(urlOnly, "chrome api"));
+    }
+
+    [TestMethod]
+    public void Filter_HideTunnelAndImage()
+    {
+        var sessions = new[]
+        {
+            new SessionSnapshot { Id = 1, Url = "https://a/page", IsTunnel = false, ContentType = "text/html" },
+            new SessionSnapshot { Id = 2, Url = "https://a:443", IsTunnel = true },
+            new SessionSnapshot { Id = 3, Url = "https://a/logo.png", ContentType = "image/png" },
+            new SessionSnapshot { Id = 4, Url = "https://a/app.js", ContentType = "application/javascript" },
+        };
+
+        var noTunnels = SessionSearch.Filter(sessions, "hide:tunnel").ToList();
+        Assert.AreEqual(3, noTunnels.Count);
+        Assert.IsFalse(noTunnels.Any(s => s.IsTunnel));
+
+        var noImages = SessionSearch.Filter(sessions, "hide:image").Select(s => s.Id).ToList();
+        CollectionAssert.AreEquivalent(SessionIdsOneAndTwo, noImages);
+
+        // Extension match must ignore query string (IsImageOrStatic path trim).
+        var withQuery = new List<SessionSnapshot>
+        {
+            new() { Id = 10, Url = "https://cdn.example/a/logo.png?cache=1", ContentType = "text/plain" },
+            new() { Id = 11, Url = "https://cdn.example/a/page", ContentType = "font/woff2" },
+        };
+        var filtered = SessionSearch.Filter(withQuery, "hide:image").Select(s => s.Id).ToList();
+        CollectionAssert.AreEquivalent(EmptySessionIds, filtered);
+    }
+
+    [TestMethod]
+    public void ToggleToken_AddRemoveAndClear()
+    {
+        Assert.IsFalse(SessionSearch.ContainsToken("", "hide", "tunnel"));
+
+        var withTunnel = SessionSearch.ToggleToken("method:GET", "hide", "tunnel");
+        Assert.AreEqual("method:GET hide:tunnel", withTunnel);
+        Assert.IsTrue(SessionSearch.ContainsToken(withTunnel, "hide", "tunnel"));
+
+        var removed = SessionSearch.ToggleToken(withTunnel, "hide", "tunnel");
+        Assert.AreEqual("method:GET", removed);
+
+        var withError = SessionSearch.ToggleToken("host:x", "is", "error");
+        Assert.IsTrue(SessionSearch.ContainsToken(withError, "is", "error"));
+        Assert.AreEqual("", SessionSearch.ClearFilters(withError));
+    }
+
+    [TestMethod]
+    public void Filter_LeadingMinusExcludesThatField()
+    {
+        var cursor = new SessionSnapshot
+        {
+            Id = 1, Method = "CONNECT", Host = "api2.cursor.sh", Url = "https://api2.cursor.sh/",
+            ProcessName = "Cursor", StatusCode = 200, IsTunnel = true,
+        };
+        var page = new SessionSnapshot
+        {
+            Id = 2, Method = "GET", Host = "example.com", Url = "https://example.com/cursor",
+            ProcessName = "chrome", StatusCode = 404,
+        };
+        var ok = new SessionSnapshot
+        {
+            Id = 3, Method = "GET", Host = "ok.test", Url = "https://ok.test/",
+            ProcessName = "chrome", StatusCode = 200,
+        };
+        var sessions = new[] { cursor, page, ok };
+
+        var hiddenHost = SessionSearch.Filter(sessions, "-host:cursor.sh").Select(s => s.Id).ToList();
+        CollectionAssert.AreEquivalent(new long[] { 2, 3 }, hiddenHost);
+        Assert.IsFalse(SessionSearch.Matches(cursor, "-process:Cursor"));
+        Assert.IsTrue(SessionSearch.Matches(page, "-process:Cursor"));
+
+        var combined = SessionSearch.Filter(sessions, "status:2xx -host:cursor.sh").Select(s => s.Id).ToList();
+        CollectionAssert.AreEquivalent(new long[] { 3 }, combined);
+
+        // The URL contains "cursor", so a URL fall-through would have hidden this row.
+        Assert.IsTrue(SessionSearch.Matches(page, "-notafield:cursor"));
+
+        // hide: already excludes; a leading minus must not invert it back.
+        Assert.IsFalse(SessionSearch.Matches(cursor, "-hide:tunnel"));
+        Assert.IsTrue(SessionSearch.Matches(page, "-hide:tunnel"));
+
+        // A bare -word excludes whatever the bare word matches (URL, host, process, ...).
+        var bare = SessionSearch.Filter(sessions, "-cursor").Select(s => s.Id).ToList();
+        CollectionAssert.AreEquivalent(new long[] { 3 }, bare);
+        Assert.IsTrue(SessionSearch.Matches(ok, "-cursor"));
+        Assert.IsFalse(SessionSearch.Matches(cursor, "-Cursor"));
+        // A lone minus is still just text, not an exclusion of nothing.
+        Assert.IsFalse(SessionSearch.Matches(ok, "-"));
+    }
+
+    [TestMethod]
+    public void NegatedBodyToken_UsesTheBodySearchPath()
+    {
+        Assert.IsTrue(SessionSearch.HasBodyToken("body:abc"));
+        Assert.IsTrue(SessionSearch.HasBodyToken("host:x -body:abc"));
+        Assert.IsFalse(SessionSearch.HasBodyToken("-host:abc"));
+
+        var withBody = new SessionSnapshot { Id = 1, Url = "https://a/", ResponseBodyText = "needle" };
+        var without = new SessionSnapshot { Id = 2, Url = "https://a/", ResponseBodyText = "other" };
+        Assert.IsFalse(SessionSearch.Matches(withBody, "-body:needle"));
+        Assert.IsTrue(SessionSearch.Matches(without, "-body:needle"));
+    }
+
+    [TestMethod]
+    public void NegatedTokens_AddRemoveAndClear_LeavePositiveKeysAlone()
+    {
+        Assert.IsTrue(SessionSearch.ContainsToken("-host:cursor.sh", "-host", "cursor.sh"));
+        Assert.IsFalse(SessionSearch.ContainsToken("-host:cursor.sh", "host", "cursor.sh"));
+
+        var added = SessionSearch.AddToken("status:2xx", "-host", "cursor.sh");
+        Assert.AreEqual("status:2xx -host:cursor.sh", added);
+        Assert.AreEqual(added, SessionSearch.AddToken(added, "-host", "cursor.sh"));
+
+        // Removing every host: token must not also remove -host:.
+        Assert.AreEqual("status:2xx -host:cursor.sh", SessionSearch.RemoveKeyedTokens("host:example.com " + added, "host"));
+        Assert.AreEqual("status:2xx", SessionSearch.RemoveToken(added, "-host", "cursor.sh"));
+        Assert.AreEqual("", SessionSearch.ClearFilters(added));
+    }
+
+    [TestMethod]
+    public void GetTokens_ReturnsKeyedAndBarePairsInOrder()
+    {
+        var tokens = SessionSearch.GetTokens("status:2xx -host:cursor.sh -cursor hide:tunnel");
+        Assert.AreEqual(4, tokens.Count);
+        Assert.AreEqual(("status", "2xx"), tokens[0]);
+        Assert.AreEqual(("-host", "cursor.sh"), tokens[1]);
+        Assert.AreEqual(("", "-cursor"), tokens[2]);
+        Assert.AreEqual(("hide", "tunnel"), tokens[3]);
+        Assert.AreEqual(0, SessionSearch.GetTokens("   ").Count);
+        Assert.AreEqual(0, SessionSearch.GetTokens(null).Count);
+    }
+
+    [TestMethod]
+    public void ReplaceHideTokens_KeepsRemainderAndRewritesHideLists()
+    {
+        var query = "login -host:old.example hide:tunnel -process:Cursor method:GET";
+        var replaced = SessionSearch.ReplaceHideTokens(
+            query,
+            ["api2.cursor.sh", "cursor.sh", "api2.cursor.sh"],
+            ["Cursor", "Google Chrome"]);
+
+        Assert.AreEqual(
+            "login hide:tunnel method:GET -host:api2.cursor.sh -host:cursor.sh -process:Cursor -process:Google",
+            replaced);
+        Assert.IsTrue(SessionSearch.ContainsToken(replaced, "-host", "cursor.sh"));
+        Assert.IsFalse(SessionSearch.ContainsToken(replaced, "-host", "old.example"));
+        Assert.IsTrue(SessionSearch.ContainsToken(replaced, "hide", "tunnel"));
+        Assert.IsTrue(SessionSearch.ContainsToken(replaced, "method", "GET"));
+
+        var cleared = SessionSearch.ReplaceHideTokens(replaced, [], []);
+        Assert.AreEqual("login hide:tunnel method:GET", cleared);
+
+        var tokens = SessionSearch.GetTokens(replaced);
+        var hosts = tokens.Where(t => t.Key == "-host").Select(t => t.Value);
+        var processes = tokens.Where(t => t.Key == "-process").Select(t => t.Value);
+        Assert.AreEqual(replaced, SessionSearch.ReplaceHideTokens(cleared, hosts, processes));
+    }
+
+    [TestMethod]
+    public void SetKeyedToken_ReplacesExistingKey()
+    {
+        var set = SessionSearch.SetKeyedToken("method:GET host:old", "host", "example.com");
+        Assert.AreEqual("method:GET host:example.com", set);
+        Assert.IsTrue(SessionSearch.ContainsToken(set, "host", "example.com"));
+        Assert.IsFalse(SessionSearch.ContainsToken(set, "host", "old"));
+
+        var process = SessionSearch.SetKeyedToken(set, "process", "chrome");
+        Assert.AreEqual("method:GET host:example.com process:chrome", process);
+
+        var replacedProcess = SessionSearch.SetKeyedToken(process, "process", "msedge");
+        Assert.AreEqual("method:GET host:example.com process:msedge", replacedProcess);
+        Assert.AreEqual("method:GET host:example.com", SessionSearch.RemoveKeyedTokens(replacedProcess, "process"));
+    }
+
+    [TestMethod]
+    public async Task NativeArchive_RoundTrip()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"twp-insp-{Guid.NewGuid():N}.zip");
+        try
+        {
+            var sessions = new List<SessionSnapshot>
+            {
+                new() { Id = 9, Method = "GET", Url = "https://example/" },
+            };
+            await SessionArchive.ExportNativeArchiveAsync(sessions, path, CancellationToken.None);
+            var imported = await SessionArchive.ImportNativeArchiveAsync(path, CancellationToken.None);
+            Assert.AreEqual(1, imported.Count);
+            Assert.AreEqual(9, imported[0].Id);
+        }
+        finally
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+    }
+
+    [TestMethod]
+    public async Task Har_RoundTrip_PreservesPostDataAndTimings()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"twp-har-{Guid.NewGuid():N}.har");
+        try
+        {
+            var started = new DateTimeOffset(2026, 1, 2, 3, 4, 5, TimeSpan.Zero);
+            var sessions = new List<SessionSnapshot>
+            {
+                new()
+                {
+                    Id = 1,
+                    Method = "POST",
+                    Url = "https://api.example/v1?q=1",
+                    StartedUtc = started,
+                    StatusCode = 201,
+                    RequestHeadersText = "Content-Type: application/json\r\n",
+                    ResponseHeadersText = "Content-Type: application/json\r\n",
+                    RequestBodyText = """{"a":1}""",
+                    ResponseBodyText = """{"ok":true}""",
+                    ContentType = "application/json",
+                    DurationMs = 100,
+                    TtfbMs = 40,
+                },
+            };
+
+            await SessionArchive.ExportHarAsync(sessions, path, CancellationToken.None);
+            var imported = await SessionArchive.ImportHarAsync(path, CancellationToken.None);
+            Assert.AreEqual(1, imported.Count);
+            Assert.AreEqual("POST", imported[0].Method);
+            Assert.AreEqual("https://api.example/v1?q=1", imported[0].Url);
+            Assert.AreEqual(201, imported[0].StatusCode);
+            Assert.AreEqual("""{"a":1}""", imported[0].RequestBodyText);
+            Assert.AreEqual("""{"ok":true}""", imported[0].ResponseBodyText);
+            Assert.AreEqual(100, imported[0].DurationMs);
+            Assert.AreEqual(40, imported[0].TtfbMs);
+            Assert.AreEqual("application/json", imported[0].ContentType);
+            Assert.AreEqual(started, imported[0].StartedUtc);
+        }
+        finally
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+    }
+
+    [TestMethod]
+    public void ProtocolFrameInspectors_ParseWebSocketFrames_Smoke()
+    {
+        Assert.AreEqual(0, ProtocolFrameInspectors.ParseWebSocketFrames(null).Count);
+        Assert.AreEqual(0, ProtocolFrameInspectors.ParseWebSocketFrames([]).Count);
+
+        var frames = ProtocolFrameInspectors.ParseWebSocketFrames("hello-ws"u8.ToArray());
+        Assert.AreEqual(1, frames.Count);
+        Assert.AreEqual("Text", frames[0].Opcode);
+        StringAssert.Contains(frames[0].PayloadPreview, "hello-ws");
+    }
+
+    [TestMethod]
+    public void ProtocolFrameInspectors_ParseGrpcFrames_Smoke()
+    {
+        Assert.AreEqual(0, ProtocolFrameInspectors.ParseGrpcFrames(null).Count);
+        Assert.AreEqual(0, ProtocolFrameInspectors.ParseGrpcFrames(new byte[3]).Count);
+
+        var payload = new byte[5 + 4];
+        payload[0] = 0; // uncompressed
+        payload[1] = 0;
+        payload[2] = 0;
+        payload[3] = 0;
+        payload[4] = 4; // length
+        payload[5] = 0xDE;
+        payload[6] = 0xAD;
+        payload[7] = 0xBE;
+        payload[8] = 0xEF;
+
+        var frames = ProtocolFrameInspectors.ParseGrpcFrames(payload);
+        Assert.AreEqual(1, frames.Count);
+        Assert.IsFalse(frames[0].Compressed);
+        Assert.AreEqual(4, frames[0].Length);
+        Assert.AreEqual("DEADBEEF", frames[0].HexPreview);
+    }
+
+    [TestMethod]
+    public void ProtocolFrameInspectors_ParseMultipart_NullAndNonMultipart()
+    {
+        Assert.AreEqual(0, ProtocolFrameInspectors.ParseMultipart(null, "x"u8.ToArray()).Count);
+        Assert.AreEqual(0, ProtocolFrameInspectors.ParseMultipart("multipart/form-data", null).Count);
+        Assert.AreEqual(0, ProtocolFrameInspectors.ParseMultipart("text/plain", "x"u8.ToArray()).Count);
+        Assert.AreEqual(0, ProtocolFrameInspectors.ParseMultipart("multipart/form-data", "x"u8.ToArray()).Count);
+    }
+
+    [TestMethod]
+    public void ProtocolFrameInspectors_ParseMultipart_NamedPartsWithBoundary()
+    {
+        const string boundary = "----twp";
+        var body = string.Join("\r\n",
+            $"--{boundary}",
+            "Content-Disposition: form-data; name=\"field1\"",
+            "Content-Type: text/plain",
+            "",
+            "hello",
+            $"--{boundary}",
+            "Content-Disposition: form-data; name=\"file\"; filename=\"a.txt\"",
+            "",
+            "bytes",
+            $"--{boundary}--",
+            "");
+        var parts = ProtocolFrameInspectors.ParseMultipart(
+            $"multipart/form-data; boundary=\"{boundary}\"",
+            System.Text.Encoding.UTF8.GetBytes(body));
+        Assert.AreEqual(2, parts.Count);
+        Assert.AreEqual("field1", parts[0].Name);
+        Assert.AreEqual("text/plain", parts[0].ContentType);
+        StringAssert.Contains(parts[0].Preview!, "hello");
+        Assert.AreEqual("file", parts[1].Name);
+    }
+
+    [TestMethod]
+    public void ProtocolFrameInspectors_ParseMultipart_NoHeaderSeparatorAndDispositionWithoutName()
+    {
+        const string boundary = "b";
+        var noSep = $"--{boundary}\r\njust-content\r\n--{boundary}--\r\n";
+        var parts = ProtocolFrameInspectors.ParseMultipart(
+            $"multipart/mixed; boundary={boundary}",
+            System.Text.Encoding.UTF8.GetBytes(noSep));
+        Assert.AreEqual(1, parts.Count);
+        Assert.IsNull(parts[0].Name);
+        StringAssert.Contains(parts[0].Preview!, "just-content");
+
+        // Disposition without name= (avoid filename= which contains the substring name=")
+        var noName = string.Join("\r\n",
+            $"--{boundary}",
+            "Content-Disposition: form-data",
+            "",
+            "data",
+            $"--{boundary}--",
+            "");
+        var unnamed = ProtocolFrameInspectors.ParseMultipart(
+            $"multipart/form-data; boundary={boundary}",
+            System.Text.Encoding.UTF8.GetBytes(noName));
+        Assert.AreEqual(1, unnamed.Count);
+        Assert.IsNull(unnamed[0].Name);
+    }
+
+    [TestMethod]
+    public void SessionSearch_TokenArms_StatusHostBodyIsAndBareUrl()
+    {
+        var s = new SessionSnapshot
+        {
+            Method = "POST",
+            Url = "https://api.example/v1/items?q=1",
+            StatusCode = 201,
+            IsGrpc = true,
+            IsTunnel = false,
+            IsMultipart = true,
+            RequestBodyText = "needle-req",
+            ResponseBodyText = "other",
+        };
+
+        Assert.IsTrue(SessionSearch.Matches(s, "status:201"));
+        Assert.IsFalse(SessionSearch.Matches(s, "status:404"));
+        Assert.IsTrue(SessionSearch.Matches(s, "host:api.example"));
+        Assert.IsTrue(SessionSearch.Matches(s, "url:items"));
+        Assert.IsTrue(SessionSearch.Matches(s, "body:needle"));
+        Assert.IsFalse(SessionSearch.Matches(s, "body:missing"));
+        Assert.IsTrue(SessionSearch.Matches(s, "is:grpc"));
+        Assert.IsTrue(SessionSearch.Matches(s, "is:multipart"));
+        Assert.IsFalse(SessionSearch.Matches(s, "is:tunnel"));
+        Assert.AreEqual(s.IsWebSocket, SessionSearch.Matches(s, "is:websocket"));
+        Assert.IsTrue(SessionSearch.Matches(s, "is:unknownflag")); // unknown is: → true
+        Assert.IsTrue(SessionSearch.Matches(s, "api.example")); // bare token matches the URL
+        Assert.IsTrue(SessionSearch.Matches(s, "weirdkey:api.example")); // unknown key → url contains value
+
+        var ws = new SessionSnapshot { Url = "wss://x", IsWebSocket = true };
+        Assert.IsTrue(SessionSearch.Matches(ws, "is:ws"));
+        Assert.IsTrue(SessionSearch.Matches(ws, "is:websocket"));
+
+        var tunnel = new SessionSnapshot { Url = "https://t", IsTunnel = true };
+        Assert.IsTrue(SessionSearch.Matches(tunnel, "is:tunnel"));
+    }
+
+    [TestMethod]
+    public void BodySearch_MissesSpilledBodies_AndScopeHintSurfaces()
+    {
+        var hot = new SessionSnapshot
+        {
+            Id = 1,
+            Url = "https://a/",
+            RequestBodyText = "secret-hot",
+            BodiesOnDisk = false,
+        };
+        var spilled = new SessionSnapshot
+        {
+            Id = 2,
+            Url = "https://b/",
+            RequestBodyText = null,
+            ResponseBodyText = null,
+            BodiesOnDisk = true,
+        };
+
+        Assert.IsTrue(SessionSearch.Matches(hot, "body:secret-hot"));
+        Assert.IsFalse(SessionSearch.Matches(spilled, "body:secret-hot"));
+        Assert.IsTrue(
+            SessionSearch.Matches(spilled, "body:secret-hot", (_, _) => true),
+            "Optional body matcher can see spilled bodies");
+        Assert.IsTrue(SessionSearch.HasBodyToken("host:a body:secret"));
+        Assert.IsFalse(SessionSearch.HasBodyToken("host:a"));
+
+        var sessions = new[] { hot, spilled };
+        var filtered = SessionSearch.Filter(sessions, "body:secret-hot").ToList();
+        Assert.AreEqual(1, filtered.Count);
+        Assert.AreEqual(1, filtered[0].Id);
+    }
+
+    [TestMethod]
+    public void BuildSessionCountText_IncludesRetentionHints()
+    {
+        Assert.AreEqual("Sessions: 3", SessionSearch.BuildSessionCountText(3, 3, null, 0, null));
+        Assert.AreEqual("Sessions: 3", SessionSearch.BuildSessionCountText(3, 3, "", 0, null));
+
+        // Local wall-clock times so the same-day / other-day split is stable in any time zone.
+        var oldest = new DateTimeOffset(new DateTime(2026, 9, 2, 10, 2, 0, DateTimeKind.Local));
+        var sameDay = new DateTimeOffset(new DateTime(2026, 9, 2, 15, 0, 0, DateTimeKind.Local));
+        var nextDay = new DateTimeOffset(new DateTime(2026, 9, 3, 9, 0, 0, DateTimeKind.Local));
+        var sinceToday = oldest.ToLocalTime().ToString("HH:mm", System.Globalization.CultureInfo.CurrentCulture);
+        var sinceOtherDay = oldest.ToLocalTime().ToString("MMM d, HH:mm", System.Globalization.CultureInfo.CurrentCulture);
+
+        Assert.AreEqual(sinceToday, SessionSearch.FormatSince(oldest, sameDay));
+        Assert.AreEqual(sinceOtherDay, SessionSearch.FormatSince(oldest, nextDay));
+        Assert.AreNotEqual(sinceToday, sinceOtherDay);
+        Assert.AreEqual(
+            $"Sessions: 3 · since {sinceToday}",
+            SessionSearch.BuildSessionCountText(3, 3, null, 0, oldest, sameDay));
+        Assert.AreEqual(
+            $"Sessions: 3 · since {sinceOtherDay}",
+            SessionSearch.BuildSessionCountText(3, 3, null, 0, oldest, nextDay));
+
+        var withBody = SessionSearch.BuildSessionCountText(
+            visibleCount: 0,
+            totalCount: 10,
+            searchQuery: "body:needle",
+            retentionEvictedTotal: 0,
+            oldestStartedUtc: null);
+        Assert.AreEqual("Sessions: 0 of 10 match filter", withBody);
+
+        var withRetention = SessionSearch.BuildSessionCountText(
+            visibleCount: 0,
+            totalCount: 50,
+            searchQuery: "host:missing",
+            retentionEvictedTotal: 120,
+            oldestStartedUtc: oldest,
+            nowUtc: sameDay);
+        StringAssert.Contains(withRetention, "Sessions: 0 of 50 most recent match filter");
+        StringAssert.Contains(withRetention, "since ");
+        StringAssert.Contains(withRetention, "120 older removed by retention (not searched)");
+
+        var atDefaultCap = SessionSearch.BuildSessionCountText(
+            visibleCount: 25,
+            totalCount: 10_000,
+            searchQuery: "host:api",
+            retentionEvictedTotal: 40,
+            oldestStartedUtc: oldest,
+            nowUtc: sameDay);
+        Assert.AreEqual(
+            $"Sessions: 25 of 10k most recent match filter · since {sinceToday}",
+            atDefaultCap);
+
+        Assert.AreEqual(
+            $"Sessions: 10k most recent · since {sinceToday}",
+            SessionSearch.BuildSessionCountText(10_000, 10_000, null, 40, oldest, sameDay));
+    }
+
+    [TestMethod]
+    public async Task Archive_CanceledToken_ThrowsBeforeWriteOrDuringRead()
+    {
+        var harPath = Path.Combine(Path.GetTempPath(), $"twp-har-ct-{Guid.NewGuid():N}.har");
+        var zipPath = Path.Combine(Path.GetTempPath(), $"twp-zip-ct-{Guid.NewGuid():N}.zip");
+        var sessions = new List<SessionSnapshot>
+        {
+            new() { Id = 3, Method = "GET", Url = "https://cancel.example/" },
+        };
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+        try
+        {
+            await Assert.ThrowsExactlyAsync<OperationCanceledException>(
+                () => SessionArchive.ExportHarAsync(sessions, harPath, cts.Token));
+            Assert.IsFalse(File.Exists(harPath));
+
+            await Assert.ThrowsExactlyAsync<OperationCanceledException>(
+                () => SessionArchive.ExportNativeArchiveAsync(sessions, zipPath, cts.Token));
+            Assert.IsFalse(File.Exists(zipPath));
+
+            await SessionArchive.ExportHarAsync(sessions, harPath, CancellationToken.None);
+            await SessionArchive.ExportNativeArchiveAsync(sessions, zipPath, CancellationToken.None);
+
+            await Assert.ThrowsExactlyAsync<TaskCanceledException>(
+                () => SessionArchive.ImportHarAsync(harPath, cts.Token));
+            await Assert.ThrowsExactlyAsync<OperationCanceledException>(
+                () => SessionArchive.ImportNativeArchiveAsync(zipPath, cts.Token));
+        }
+        finally
+        {
+            if (File.Exists(harPath))
+            {
+                File.Delete(harPath);
+            }
+
+            if (File.Exists(zipPath))
+            {
+                File.Delete(zipPath);
+            }
+        }
+    }
+
+    [TestMethod]
+    public async Task ImportHar_SkipsMalformedEntries_AndGuessMimeFromHeaders()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "twp-har-edge-" + Guid.NewGuid().ToString("N") + ".har");
+        var zip = Path.Combine(Path.GetTempPath(), "twp-zip-empty-" + Guid.NewGuid().ToString("N") + ".zip");
+        try
+        {
+            File.WriteAllText(path, """
+                {"log":{"entries":[
+                  {},
+                  {"request":{"method":"GET","url":"not-absolute"}},
+                  {"request":{"method":"POST","url":"https://edge.test/q?a&b=1","headers":[{"name":"H","value":"v"}],"postData":{"text":"body","mimeType":""}},
+                   "response":{"status":204,"headers":[{"name":"Content-Type","value":"text/plain"}],"content":{"text":"","mimeType":""}},
+                   "timings":{"send":1,"wait":2,"receive":3},"startedDateTime":"not-a-date"}
+                ]}}
+                """);
+            var imported = await SessionArchive.ImportHarAsync(path, CancellationToken.None);
+            Assert.IsTrue(imported.Count >= 1);
+            Assert.IsTrue(imported.Exists(s => s.Url.Contains("edge.test", StringComparison.Ordinal)));
+
+            await SessionArchive.ExportHarAsync(
+            [
+                new SessionSnapshot
+                {
+                    Method = "GET",
+                    Url = "https://mime.test/",
+                    ResponseHeadersText = "Content-Type: image/png\r\n",
+                },
+            ], path);
+            var round = await SessionArchive.ImportHarAsync(path);
+            Assert.AreEqual(1, round.Count);
+
+            using (var fs = File.Create(zip))
+            using (var archive = new System.IO.Compression.ZipArchive(fs, System.IO.Compression.ZipArchiveMode.Create))
+            {
+                archive.CreateEntry("readme.txt");
+            }
+
+            var empty = await SessionArchive.ImportNativeArchiveAsync(zip);
+            Assert.AreEqual(0, empty.Count);
+
+            Assert.AreEqual(0, SessionStore.EstimateInMemoryBodyBytes(new SessionSnapshot { BodiesOnDisk = true }));
+            Assert.IsTrue(SessionStore.EstimateInMemoryBodyBytes(new SessionSnapshot
+            {
+                BodiesOnDisk = true,
+                RequestBodyText = "x",
+            }) > 0, "Selected spilled sessions may still hold RAM bodies");
+            Assert.IsTrue(SessionStore.EstimateInMemoryBodyBytes(new SessionSnapshot
+            {
+                RequestBodyBytes = [1, 2],
+                ResponseBodyBytes = [3],
+                RequestBodyText = "ab",
+                ResponseBodyText = "cd",
+            }) > 0);
+        }
+        finally
+        {
+            if (File.Exists(path))
+                File.Delete(path);
+            if (File.Exists(zip))
+                File.Delete(zip);
+        }
+    }
+}

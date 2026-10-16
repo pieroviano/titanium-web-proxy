@@ -16,13 +16,13 @@ using Microsoft.Extensions.Logging;
 
 namespace Titanium.Web.Proxy.IntegrationTests.Setup;
 
-// set up a kestrel test server
+// set up an ASP.NET Core test server
 public class TestServer : IDisposable
 {
     private readonly IHost host;
 
-    private Func<HttpContext, Task> requestHandler;
-    private Func<ConnectionContext, Task> tcpRequestHandler;
+    private Func<HttpContext, Task> requestHandler = null!;
+    private Func<ConnectionContext, Task> tcpRequestHandler = null!;
 
     public TestServer(X509Certificate2 serverCertificate, bool requireMutualTls)
     {
@@ -53,6 +53,9 @@ public class TestServer : IDisposable
 
                     options.Listen(IPAddress.Loopback, 0, listenOptions =>
                     {
+                        // TestCertificateAuthority.ServerCertificate vends a fresh, independent
+                        // X509Certificate2 each time (backed by cached PKCS12 bytes), so the server host
+                        // can safely dispose it without affecting any other TestServer instance.
                         listenOptions.UseHttps(serverCertificate);
                     });
                     options.Listen(IPAddress.Loopback, 0, listenOptions =>
@@ -74,7 +77,7 @@ public class TestServer : IDisposable
         host.Start();
 
         var addresses = host.Services.GetRequiredService<IServer>()
-            .Features.Get<IServerAddressesFeature>()
+            .Features.Get<IServerAddressesFeature>()!
             .Addresses.ToArray();
 
         HttpListeningPort = new Uri(addresses[0]).Port;
@@ -94,6 +97,7 @@ public class TestServer : IDisposable
     {
         host.StopAsync().Wait();
         host.Dispose();
+        GC.SuppressFinalize(this);
     }
 
     public void HandleRequest(Func<HttpContext, Task> requestHandler)
@@ -128,7 +132,7 @@ public class TestServer : IDisposable
             });
         }
 
-        public void ConfigureServices(IServiceCollection services)
+        public static void ConfigureServices(IServiceCollection services)
         {
         }
     }

@@ -18,7 +18,7 @@ internal static class StreamExtensions
     /// <param name="output"></param>
     /// <param name="onCopy"></param>
     /// <param name="bufferPool"></param>
-    internal static Task CopyToAsync(this Stream input, Stream output, Action<byte[], int, int> onCopy,
+    internal static ValueTask CopyToAsync(this Stream input, Stream output, Action<byte[], int, int> onCopy,
         IBufferPool bufferPool)
     {
         return CopyToAsync(input, output, onCopy, bufferPool, CancellationToken.None);
@@ -32,28 +32,52 @@ internal static class StreamExtensions
     /// <param name="onCopy"></param>
     /// <param name="bufferPool"></param>
     /// <param name="cancellationToken"></param>
-    internal static async Task CopyToAsync(this Stream input, Stream output, Action<byte[], int, int>? onCopy,
+    internal static async ValueTask CopyToAsync(this Stream input, Stream output, Action<byte[], int, int>? onCopy,
         IBufferPool bufferPool, CancellationToken cancellationToken)
     {
         var buffer = bufferPool.GetBuffer();
         try
         {
-            while (!cancellationToken.IsCancellationRequested)
+            while (true)
             {
-                // cancellation is not working on Socket ReadAsync
-                // https://github.com/dotnet/corefx/issues/15033
-                var num = await input.ReadAsync(buffer, 0, buffer.Length, cancellationToken)
-                    .WithCancellation(cancellationToken);
                 int bytesRead;
-                if ((bytesRead = num) != 0 && !cancellationToken.IsCancellationRequested)
+                try
                 {
-                    await output.WriteAsync(buffer, 0, bytesRead, CancellationToken.None);
-                    onCopy?.Invoke(buffer, 0, bytesRead);
+                    // Read directly with the real cancellation token. Do not wrap with
+                    // WithCancellation: that races the real read against a cancellation-triggered
+                    // TaskCompletionSource and, the instant the token fires, returns 0 without ever
+                    // awaiting the real read - abandoning it mid-flight rather than cancelling it. That
+                    // read keeps running against this same `buffer` array in the background, so the
+                    // `finally` below could return the buffer to the shared pool - and another relay
+                    // could immediately reuse it - while the abandoned read was still writing into it,
+                    // corrupting whichever connection borrowed it next. Awaiting the read directly lets
+                    // it observe cancellation itself and actually stop before this method reuses its
+                    // buffer. HttpStream.FillBufferAsync uses the same direct-await pattern.
+                    var readVt = input.ReadAsync(buffer.AsMemory(), cancellationToken);
+                    if (readVt.IsCompletedSuccessfully)
+                        bytesRead = readVt.Result;
+                    else
+                        bytesRead = await readVt.ConfigureAwait(false);
                 }
-                else
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                 {
                     break;
                 }
+
+                if (bytesRead == 0) break;
+
+                try
+                {
+                    var writeVt = output.WriteAsync(buffer.AsMemory(0, bytesRead), cancellationToken);
+                    if (!writeVt.IsCompletedSuccessfully)
+                        await writeVt.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    break;
+                }
+
+                onCopy?.Invoke(buffer, 0, bytesRead);
             }
         }
         finally
@@ -66,7 +90,7 @@ internal static class StreamExtensions
         where T : struct
     {
         var tcs = new TaskCompletionSource<bool>();
-        using (cancellationToken.Register(s => ((TaskCompletionSource<bool>)s).TrySetResult(true), tcs))
+        using (cancellationToken.Register(() => tcs.TrySetResult(true)))
         {
             if (task != await Task.WhenAny(task, tcs.Task)) return default;
         }

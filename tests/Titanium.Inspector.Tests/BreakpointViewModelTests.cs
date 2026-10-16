@@ -1,0 +1,176 @@
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+using Titanium.Inspector.Services;
+using Titanium.Inspector.ViewModels;
+
+namespace Titanium.Inspector.Tests;
+
+[TestClass]
+public class BreakpointViewModelTests
+{
+    [TestMethod]
+    public void TryEnter_RequiresEnabledAndMatchingUrl()
+    {
+        var vm = new BreakpointViewModel { Enabled = false, UrlFilter = "*" };
+        var session = new SessionSnapshot { Url = "https://example.com/a" };
+        Assert.IsFalse(vm.TryEnter(session, out _));
+
+        vm.Enabled = true;
+        Assert.IsTrue(vm.TryEnter(session, out var hit));
+        Assert.IsNotNull(vm.Active);
+        Assert.IsTrue(vm.HasActiveHit);
+        StringAssert.Contains(vm.ActiveSummary, "Paused");
+        Assert.AreSame(session, hit.Session);
+        vm.Continue();
+        Assert.IsNull(vm.Active);
+        Assert.IsFalse(vm.HasActiveHit);
+    }
+
+    [TestMethod]
+    public void TryEnter_RaisesPropertyChangedAndActiveHitChanged()
+    {
+        var vm = new BreakpointViewModel { Enabled = true, UrlFilter = "*" };
+        var props = new List<string?>();
+        var hitChanged = 0;
+        vm.PropertyChanged += (_, e) => props.Add(e.PropertyName);
+        vm.ActiveHitChanged += (_, _) => hitChanged++;
+
+        Assert.IsTrue(vm.TryEnter(new SessionSnapshot { Method = "POST", Url = "https://api.example/v1" }, out _));
+        CollectionAssert.Contains(props, nameof(BreakpointViewModel.Active));
+        CollectionAssert.Contains(props, nameof(BreakpointViewModel.HasActiveHit));
+        CollectionAssert.Contains(props, nameof(BreakpointViewModel.ActiveSummary));
+        Assert.AreEqual(1, hitChanged);
+
+        props.Clear();
+        vm.Continue();
+        CollectionAssert.Contains(props, nameof(BreakpointViewModel.Active));
+        Assert.AreEqual(2, hitChanged);
+    }
+
+    [TestMethod]
+    public async Task DisableWhilePaused_ContinuesActiveHit()
+    {
+        var vm = new BreakpointViewModel { Enabled = true, UrlFilter = "*" };
+        Assert.IsTrue(vm.TryEnter(new SessionSnapshot { Url = "https://paused/" }, out var hit));
+        var wait = hit.WaitAsync();
+
+        vm.Enabled = false;
+        Assert.IsFalse(vm.Enabled);
+        Assert.IsNull(vm.Active);
+        Assert.IsFalse(vm.HasActiveHit);
+        Assert.AreEqual(BreakpointAction.Continue, await wait.WaitAsync(TimeSpan.FromSeconds(2)));
+        StringAssert.Contains(vm.LastOverflowMessage, "Breakpoints disabled");
+    }
+
+    [TestMethod]
+    public void DisableWhileIdle_DoesNotRaiseHitChanged()
+    {
+        var vm = new BreakpointViewModel { Enabled = true };
+        var hits = 0;
+        vm.ActiveHitChanged += (_, _) => hits++;
+        vm.Enabled = false;
+        Assert.AreEqual(0, hits);
+        Assert.IsFalse(vm.ContinueIfPaused());
+    }
+
+    [TestMethod]
+    public async Task Stop_ContinuesPausedBreakpoint()
+    {
+        using var interception = new InterceptionService { UseInMemoryTrustState = true };
+        var vm = new BreakpointViewModel { Enabled = true };
+        interception.Breakpoints = vm;
+        Assert.IsTrue(vm.TryEnter(new SessionSnapshot { Url = "https://stop-proxy/" }, out var hit));
+        var wait = hit.WaitAsync();
+
+        interception.Stop();
+        Assert.IsNull(vm.Active);
+        Assert.AreEqual(BreakpointAction.Continue, await wait.WaitAsync(TimeSpan.FromSeconds(2)));
+        StringAssert.Contains(vm.LastOverflowMessage, "Proxy stopped");
+    }
+
+    [TestMethod]
+    public async Task ContinueIfPaused_ReleasesWaiter()
+    {
+        var vm = new BreakpointViewModel { Enabled = true };
+        Assert.IsTrue(vm.TryEnter(new SessionSnapshot { Url = "https://stop/" }, out var hit));
+        var wait = hit.WaitAsync();
+        Assert.IsTrue(vm.ContinueIfPaused("Proxy stopped — paused request continued"));
+        Assert.AreEqual(BreakpointAction.Continue, await wait.WaitAsync(TimeSpan.FromSeconds(2)));
+        StringAssert.Contains(vm.LastOverflowMessage, "Proxy stopped");
+    }
+
+    [TestMethod]
+    public void TryEnter_OverflowAutoContinuesSecond()
+    {
+        var vm = new BreakpointViewModel { Enabled = true, UrlFilter = "*" };
+        Assert.IsTrue(vm.TryEnter(new SessionSnapshot { Url = "https://a/" }, out _));
+        Assert.IsFalse(vm.TryEnter(new SessionSnapshot { Url = "https://b/" }, out _));
+        StringAssert.Contains(vm.LastOverflowMessage, "extra breakpoint hit continued");
+        vm.Abort();
+        Assert.IsNull(vm.Active);
+    }
+
+    [TestMethod]
+    public void UrlFilter_GlobMatch()
+    {
+        var vm = new BreakpointViewModel { Enabled = true, UrlFilter = "https://api.*/v1/*" };
+        Assert.IsTrue(vm.TryEnter(new SessionSnapshot { Url = "https://api.example/v1/x" }, out _));
+        vm.Continue();
+
+        Assert.IsFalse(vm.TryEnter(new SessionSnapshot { Url = "https://other.example/v1/x" }, out _));
+
+        vm.UrlFilter = "";
+        Assert.IsTrue(vm.TryEnter(new SessionSnapshot { Url = "https://anything/" }, out _));
+        vm.Continue();
+    }
+
+    [TestMethod]
+    public async Task Continue_Abort_EditBody()
+    {
+        var vm = new BreakpointViewModel { Enabled = true };
+        Assert.IsTrue(vm.TryEnter(new SessionSnapshot { Url = "https://e/" }, out var hit));
+
+        vm.EditBody("patched-body");
+        Assert.AreEqual("patched-body", hit.EditedBody);
+        Assert.AreEqual(System.Text.Encoding.UTF8.GetByteCount("patched-body"), hit.ContentLength);
+
+        var wait = hit.WaitAsync();
+        vm.Continue();
+        Assert.AreEqual(BreakpointAction.Continue, await wait.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.IsNull(vm.Active);
+
+        Assert.IsTrue(vm.TryEnter(new SessionSnapshot { Url = "https://e/" }, out var hit2));
+        var waitAbort = hit2.WaitAsync();
+        vm.Abort();
+        Assert.AreEqual(BreakpointAction.Abort, await waitAbort.WaitAsync(TimeSpan.FromSeconds(2)));
+
+        // EditBody with no active hit is a no-op
+        vm.EditBody("ignored");
+    }
+
+    [TestMethod]
+    public async Task BreakpointHit_ShortTimeout_AutoContinues()
+    {
+        var hit = new BreakpointHit(new SessionSnapshot { Url = "https://timeout/" }, TimeSpan.FromMilliseconds(40));
+        var action = await hit.WaitAsync().WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.AreEqual(BreakpointAction.Continue, action);
+    }
+
+    [TestMethod]
+    public async Task BreakpointHit_WaitAsync_CanceledToken_Throws()
+    {
+        var hit = new BreakpointHit(new SessionSnapshot { Url = "https://cancel/" }, TimeSpan.FromHours(1));
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+        await Assert.ThrowsExactlyAsync<TaskCanceledException>(() => hit.WaitAsync(cts.Token));
+    }
+
+    [TestMethod]
+    public async Task BreakpointHit_WaitAsync_CancelAfterStart_Throws()
+    {
+        var hit = new BreakpointHit(new SessionSnapshot { Url = "https://cancel-later/" }, TimeSpan.FromHours(1));
+        using var cts = new CancellationTokenSource();
+        var wait = hit.WaitAsync(cts.Token);
+        cts.Cancel();
+        await Assert.ThrowsExactlyAsync<TaskCanceledException>(() => wait);
+    }
+}

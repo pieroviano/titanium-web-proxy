@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Net;
 using System.Text;
 using System.Threading.Tasks;
@@ -6,15 +6,31 @@ using Microsoft.VisualStudio.TestTools.UnitTesting;
 using Titanium.Web.Proxy.Http;
 using Titanium.Web.Proxy.IntegrationTests.Helpers;
 
+using Titanium.Web.Proxy.IntegrationTests.Setup;
 namespace Titanium.Web.Proxy.IntegrationTests;
 
+[DoNotParallelize]
 [TestClass]
 public class ExpectContinueTests
 {
+    private static TestServer sharedServer = null!;
+
+    [ClassInitialize]
+    public static void ClassSetup(TestContext _)
+    {
+        sharedServer = new TestServer(TestCertificateAuthority.ServerCertificate, requireMutualTls: false);
+    }
+
+    [ClassCleanup(ClassCleanupBehavior.EndOfClass)]
+    public static void ClassCleanup()
+    {
+        sharedServer?.Dispose();
+    }
+
     [TestMethod]
     public async Task ReverseProxy_GotContinueAndOkResponse()
     {
-        var testSuite = new TestSuite();
+        using var testSuite = new TestSuite(sharedServer);
         var server = testSuite.GetServer();
         var continueServer = new HttpContinueServer
         {
@@ -31,7 +47,7 @@ public class ExpectContinueTests
         };
 
         var client = new HttpContinueClient();
-        var response = await client.Post("localhost", proxy.ProxyEndPoints[0].Port, "Hello server. I am a client.");
+        var response = await HttpContinueClient.Post("localhost", proxy.ProxyEndPoints[0].Port, "Hello server. I am a client.");
 
         Assert.IsNotNull(response, "No response to 'expect: 100-continue' request");
         Assert.AreEqual((int)HttpStatusCode.OK, response.StatusCode);
@@ -41,7 +57,7 @@ public class ExpectContinueTests
     [TestMethod]
     public async Task ReverseProxy_GotExpectationFailedResponse()
     {
-        var testSuite = new TestSuite();
+        using var testSuite = new TestSuite(sharedServer);
         var server = testSuite.GetServer();
         var continueServer = new HttpContinueServer { ExpectationResponse = HttpStatusCode.ExpectationFailed };
         server.HandleTcpRequest(continueServer.HandleRequest);
@@ -55,7 +71,7 @@ public class ExpectContinueTests
         };
 
         var client = new HttpContinueClient();
-        var response = await client.Post("localhost", proxy.ProxyEndPoints[0].Port, "Hello server. I am a client.");
+        var response = await HttpContinueClient.Post("localhost", proxy.ProxyEndPoints[0].Port, "Hello server. I am a client.");
 
         Assert.IsNotNull(response, "No response to 'expect: 100-continue' request");
         Assert.AreEqual((int)HttpStatusCode.ExpectationFailed, response.StatusCode);
@@ -64,7 +80,7 @@ public class ExpectContinueTests
     [TestMethod]
     public async Task ReverseProxy_GotNotFoundResponse()
     {
-        var testSuite = new TestSuite();
+        using var testSuite = new TestSuite(sharedServer);
         var server = testSuite.GetServer();
         var continueServer = new HttpContinueServer { ExpectationResponse = HttpStatusCode.NotFound };
         server.HandleTcpRequest(continueServer.HandleRequest);
@@ -78,7 +94,7 @@ public class ExpectContinueTests
         };
 
         var client = new HttpContinueClient();
-        var response = await client.Post("localhost", proxy.ProxyEndPoints[0].Port, "Hello server. I am a client.");
+        var response = await HttpContinueClient.Post("localhost", proxy.ProxyEndPoints[0].Port, "Hello server. I am a client.");
 
         Assert.IsNotNull(response, "No response to 'expect: 100-continue' request");
         Assert.AreEqual((int)HttpStatusCode.NotFound, response.StatusCode);
@@ -87,7 +103,7 @@ public class ExpectContinueTests
     [TestMethod]
     public async Task ReverseProxy_BeforeRequestThrows()
     {
-        var testSuite = new TestSuite();
+        using var testSuite = new TestSuite(sharedServer);
         var server = testSuite.GetServer();
         var continueServer = new HttpContinueServer { ExpectationResponse = HttpStatusCode.Continue };
         server.HandleTcpRequest(continueServer.HandleRequest);
@@ -120,10 +136,10 @@ public class ExpectContinueTests
         };
 
         var client = new HttpContinueClient();
-        var response = await client.Post("localhost", proxy.ProxyEndPoints[0].Port, "Hello server. I am a client.");
+        var response = await HttpContinueClient.Post("localhost", proxy.ProxyEndPoints[0].Port, "Hello server. I am a client.");
 
         Assert.IsNotNull(response, "No response to 'expect: 100-continue' request");
-        Assert.AreEqual(response.StatusCode, (int)HttpStatusCode.InternalServerError);
-        Assert.AreEqual(response.BodyString, dbzString);
+        Assert.AreEqual((int)HttpStatusCode.InternalServerError, response.StatusCode);
+        Assert.AreEqual(dbzString, response.BodyString);
     }
 }

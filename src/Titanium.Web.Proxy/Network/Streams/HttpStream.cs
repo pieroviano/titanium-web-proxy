@@ -1,9 +1,11 @@
-﻿using System;
+using System;
 using System.Buffers;
+using System.Collections.Generic;
 using System.Diagnostics;
-using System.Globalization;
 using System.IO;
+using System.Net.Security;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -12,21 +14,27 @@ using Titanium.Web.Proxy.EventArguments;
 using Titanium.Web.Proxy.Exceptions;
 using Titanium.Web.Proxy.Extensions;
 using Titanium.Web.Proxy.Http;
+using Titanium.Web.Proxy.Logging;
 using Titanium.Web.Proxy.Models;
+using Titanium.Web.Proxy.Options;
 using Titanium.Web.Proxy.Shared;
 using Titanium.Web.Proxy.StreamExtended.BufferPool;
 using Titanium.Web.Proxy.StreamExtended.Network;
 
 namespace Titanium.Web.Proxy.Helpers;
 
-internal class HttpStream : Stream, IHttpStreamWriter, IHttpStreamReader, IPeekStream
+internal partial class HttpStream : Stream, IHttpStreamWriter, IHttpStreamReader, IPeekStream, ITransportCapableStream
 {
     private readonly bool leaveOpen;
     private readonly byte[] streamBuffer;
 
     private static Encoding Encoding => HttpHeader.Encoding;
 
-    private static readonly bool networkStreamHack = true;
+    // On .NET Framework, NetworkStream does not override the cancellable ReadAsync/WriteAsync
+    // overloads (they fall back to Stream's sync-over-async), so we route Begin/End Read/Write
+    // through our own Task-based async methods. Modern .NET implements true async socket I/O, so
+    // this stays false there and the base Stream implementation is used directly.
+    private static readonly bool networkStreamHack = false;
 
     private int bufferPos;
 
@@ -39,6 +47,18 @@ internal class HttpStream : Stream, IHttpStreamWriter, IHttpStreamReader, IPeekS
 
     public bool IsNetworkStream { get; }
 
+    /// <summary>
+    ///     See <see cref="ITransportCapableStream" />. True for a plain socket <see cref="NetworkStream" />
+    ///     or a TLS-wrapped <see cref="SslStream" /> - i.e. any real duplex network transport, decrypted or
+    ///     not - so the per-chunk body-write hook fires with parity for plain and TLS-decrypted connections.
+    /// </summary>
+    public bool SupportsBodyWriteHook { get; }
+
+    /// <summary>
+    ///     Whether a header write failure should be translated into a retryable server-connection failure.
+    /// </summary>
+    protected virtual bool IsRetryableHeaderWriteFailure => false;
+
     public event EventHandler<DataEventArgs>? DataRead;
 
     public event EventHandler<DataEventArgs>? DataWrite;
@@ -47,20 +67,14 @@ internal class HttpStream : Stream, IHttpStreamWriter, IHttpStreamReader, IPeekS
 
     public bool IsClosed { get; private set; }
 
-    static HttpStream()
-    {
-        // TODO: remove this hack when removing .NET 4.x support
-        try
-        {
-            var method = typeof(NetworkStream).GetMethod(nameof(Stream.ReadAsync),
-                new[] { typeof(byte[]), typeof(int), typeof(int), typeof(CancellationToken) });
-            if (method != null && method.DeclaringType != typeof(Stream)) networkStreamHack = false;
-        }
-        catch
-        {
-            // ignore
-        }
-    }
+    /// <summary>
+    ///     First transport failure this stream swallowed (client reset, TLS alert). Null on the success path.
+    ///     Consulted once, after the first decrypted read, to tell a certificate rejection from a clean close.
+    /// </summary>
+    internal Exception? SuppressedReadFailure { get; private set; }
+
+
+    private readonly bool ownsStreamBuffer;
 
     private static readonly byte[] newLine = ProxyConstants.NewLineBytes;
     private readonly ProxyServer server;
@@ -75,18 +89,61 @@ internal class HttpStream : Stream, IHttpStreamWriter, IHttpStreamReader, IPeekS
     ///     <see langword="true" /> to leave the stream open after disposing the
     ///     <see cref="T:CustomBufferedStream" /> object; otherwise, <see langword="false" />.
     /// </param>
+    /// <param name="rentReadBuffer">
+    ///     When <see langword="false" />, skips the 8 KiB <see cref="IBufferPool" /> rent. Use for
+    ///     HTTP/3 session placeholders backed by <see cref="Stream.Null" /> that never read the client stream.
+    /// </param>
+    internal HeaderBlockBudget HeaderBudget(bool isRequest) =>
+        new(server.ResourceLimits.MaxHeaderCount, server.ResourceLimits.MaxHeaderAggregateBytes,
+            server.PolicyModes[PolicyFamily.HeaderLimits], isRequest);
+
     internal HttpStream(ProxyServer server, Stream baseStream, IBufferPool bufferPool,
-        CancellationToken cancellationToken, bool leaveOpen = false)
+        CancellationToken cancellationToken, bool leaveOpen = false, bool rentReadBuffer = true)
     {
         this.server = server;
 
-        if (baseStream is NetworkStream) IsNetworkStream = true;
+        if (baseStream is NetworkStream or SslStream)
+            IsNetworkStream = true;
+
+        SupportsBodyWriteHook = baseStream is NetworkStream || baseStream is SslStream;
 
         BaseStream = baseStream;
         this.leaveOpen = leaveOpen;
-        streamBuffer = bufferPool.GetBuffer();
+        ownsStreamBuffer = rentReadBuffer;
+        // Use BufferSize (8 KiB) for SslStream too: decrypt leftover stays inside SslStream, and
+        // large-body CopyBytesToStream already rents a 64 KiB grain. The prior 16 KiB ctor rent
+        // was paid on every new-connection handshake before ReadRequestLine (Kestrel uses 4 KiB).
+        streamBuffer = rentReadBuffer
+            ? bufferPool.GetBuffer(bufferPool.BufferSize)
+            : Array.Empty<byte>();
         this.bufferPool = bufferPool;
         this.cancellationToken = cancellationToken;
+    }
+
+    /// <summary>
+    ///     Reports a read/write failure on the underlying transport that this stream is deliberately
+    ///     suppressing (rather than rethrowing) because <see cref="IsNetworkStream" /> is
+    ///     <see langword="true" /> - i.e. a real socket/TLS connection where the remote endpoint closing
+    ///     or resetting the connection mid-operation is an expected, benign occurrence, not a bug. This
+    ///     class has no owning <see cref="ProxyServer" /> reference to source a live logger from, so it
+    ///     always reports through the process-wide fallback gateway logger.
+    /// </summary>
+    private static void ReportSuppressedFailure(Exception ex)
+    {
+        ProxyDiagnostics.ReportExpected(ProxyDiagnostics.Logger,"Suppressed a network stream read/write failure (expected when the remote endpoint closed or reset the connection).",
+            ex);
+    }
+
+    /// <summary>
+    ///     Debug breadcrumb for a non-network stream failure that is about to be rethrown (buffered /
+    ///     memory streams where an IO error is unexpected). Returns <paramref name="ex" /> so callers
+    ///     can <c>throw ReportRethrownFailure(ex)</c> without an extra local.
+    /// </summary>
+    private static Exception ReportRethrownFailure(Exception ex)
+    {
+        ProxyDiagnostics.ReportCaught(ProxyDiagnostics.Logger,
+            "HttpStream read/write failed; rethrowing (non-network stream)", ex);
+        return ex;
     }
 
     /// <summary>
@@ -101,11 +158,17 @@ internal class HttpStream : Stream, IHttpStreamWriter, IHttpStreamReader, IPeekS
         {
             BaseStream.Flush();
         }
-        catch
+        catch (Exception ex)
         {
             closedWrite = true;
             if (!IsNetworkStream)
-                throw;
+                {
+                    throw ReportRethrownFailure(ex);
+                }
+                else
+                {
+                    ReportSuppressedFailure(ex);
+                }
         }
     }
 
@@ -187,11 +250,17 @@ internal class HttpStream : Stream, IHttpStreamWriter, IHttpStreamReader, IPeekS
         {
             BaseStream.Write(buffer, offset, count);
         }
-        catch
+        catch (Exception ex)
         {
             closedWrite = true;
             if (!IsNetworkStream)
-                throw;
+                {
+                    throw ReportRethrownFailure(ex);
+                }
+                else
+                {
+                    ReportSuppressedFailure(ex);
+                }
         }
     }
 
@@ -215,7 +284,7 @@ internal class HttpStream : Stream, IHttpStreamWriter, IHttpStreamReader, IPeekS
     {
         if (Available > 0)
         {
-            await destination.WriteAsync(streamBuffer, bufferPos, Available, cancellationToken);
+            await destination.WriteAsync(streamBuffer.AsMemory(bufferPos, Available), cancellationToken);
 
             Available = 0;
         }
@@ -234,20 +303,10 @@ internal class HttpStream : Stream, IHttpStreamWriter, IHttpStreamReader, IPeekS
     /// <returns>
     ///     A task that represents the asynchronous flush operation.
     /// </returns>
-    public override async Task FlushAsync(CancellationToken cancellationToken)
+    public override Task FlushAsync(CancellationToken cancellationToken)
     {
-        if (closedWrite) return;
-
-        try
-        {
-            await BaseStream.FlushAsync(cancellationToken);
-        }
-        catch
-        {
-            closedWrite = true;
-            if (!IsNetworkStream)
-                throw;
-        }
+        var vt = FlushBaseStreamAsync(cancellationToken);
+        return vt.IsCompletedSuccessfully ? Task.CompletedTask : vt.AsTask();
     }
 
     /// <summary>
@@ -274,19 +333,14 @@ internal class HttpStream : Stream, IHttpStreamWriter, IHttpStreamReader, IPeekS
     ///     less than the requested number, or it can be 0 (zero)
     ///     if the end of the stream has been reached.
     /// </returns>
-    public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+    public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
     {
-        if (Available == 0) await FillBufferAsync(cancellationToken);
+        // Sync-complete when bytes are already buffered (keep-alive leftover) — avoid an async
+        // state machine that would only memcpy and return.
+        if (Available > 0)
+            return Task.FromResult(ReadFromBuffer(buffer.AsSpan(offset, count)));
 
-        var available = Math.Min(Available, count);
-        if (available > 0)
-        {
-            Buffer.BlockCopy(streamBuffer, bufferPos, buffer, offset, available);
-            bufferPos += available;
-            Available -= available;
-        }
-
-        return available;
+        return ReadAsyncSlow(buffer, offset, count, cancellationToken);
     }
 
     /// <summary>
@@ -308,19 +362,122 @@ internal class HttpStream : Stream, IHttpStreamWriter, IHttpStreamReader, IPeekS
     ///     less than the requested number, or it can be 0 (zero)
     ///     if the end of the stream has been reached.
     /// </returns>
-#if NETSTANDARD2_1
-        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken =
+    public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken =
  default)
-#else
-    public async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
-#endif
     {
-        if (Available == 0) await FillBufferAsync(cancellationToken);
+        if (Available > 0)
+            return new ValueTask<int>(ReadFromBuffer(buffer.Span));
 
-        var available = Math.Min(Available, buffer.Length);
+        return ReadAsyncSlow(buffer, cancellationToken);
+    }
+
+    private async Task<int> ReadAsyncSlow(byte[] buffer, int offset, int count,
+        CancellationToken cancellationToken)
+    {
+        // Large destination + empty parser window: read the transport directly (classic
+        // BufferedStream rule). Body pumps that pass ≥ streamBuffer.Length avoid the
+        // socket→streamBuffer→dest double-copy that dominated H2→H1 large reverse RPS.
+        if (count >= streamBuffer.Length && streamBuffer.Length > 0 && !IsClosed)
+        {
+            try
+            {
+                var readBytes = await BaseStream.ReadAsync(buffer.AsMemory(offset, count), cancellationToken);
+                if (readBytes > 0)
+                    OnDataRead(buffer, offset, readBytes);
+                else
+                {
+                    IsClosed = true;
+                    closedWrite = true;
+                }
+
+                return readBytes;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                if (!IsNetworkStream)
+                    throw ReportRethrownFailure(ex);
+
+                ReportSuppressedFailure(ex);
+                IsClosed = true;
+                closedWrite = true;
+                return 0;
+            }
+        }
+
+        await FillBufferAsync(cancellationToken);
+        return ReadFromBuffer(buffer.AsSpan(offset, count));
+    }
+
+    private async ValueTask<int> ReadAsyncSlow(Memory<byte> buffer, CancellationToken cancellationToken)
+    {
+        // See byte[] ReadAsyncSlow: large dest + empty window → direct BaseStream read.
+        if (buffer.Length >= streamBuffer.Length && streamBuffer.Length > 0 && !IsClosed)
+        {
+            try
+            {
+                var readBytes = await BaseStream.ReadAsync(buffer, cancellationToken);
+                if (readBytes > 0)
+                {
+                    if (System.Runtime.InteropServices.MemoryMarshal.TryGetArray(
+                            (ReadOnlyMemory<byte>)buffer.Slice(0, readBytes), out var segment))
+                        OnDataRead(segment.Array!, segment.Offset, segment.Count);
+                }
+                else
+                {
+                    IsClosed = true;
+                    closedWrite = true;
+                }
+
+                return readBytes;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                if (!IsNetworkStream)
+                    throw ReportRethrownFailure(ex);
+
+                ReportSuppressedFailure(ex);
+                IsClosed = true;
+                closedWrite = true;
+                return 0;
+            }
+        }
+
+        await FillBufferAsync(cancellationToken);
+        return ReadFromBuffer(buffer.Span);
+    }
+
+    /// <summary>
+    ///     Copies exactly <paramref name="destination"/>.Length bytes from the unread window when
+    ///     <see cref="Available"/> is already sufficient; otherwise returns false without consuming.
+    /// </summary>
+    internal bool TryCopyAvailableExact(Span<byte> destination)
+    {
+        if (destination.IsEmpty)
+            return true;
+        if (Available < destination.Length)
+            return false;
+        ReadFromBuffer(destination);
+        return true;
+    }
+
+    /// <summary>
+    ///     Copies up to <paramref name="destination" />.Length bytes from the unread window.
+    ///     Caller must ensure <see cref="Available" /> is already non-zero, or accept a zero return.
+    /// </summary>
+    private int ReadFromBuffer(Span<byte> destination)
+    {
+        var available = Math.Min(Available, destination.Length);
         if (available > 0)
         {
-            new Span<byte>(streamBuffer, bufferPos, available).CopyTo(buffer.Span);
+            new Span<byte>(streamBuffer, bufferPos, available).CopyTo(destination);
             bufferPos += available;
             Available -= available;
         }
@@ -355,7 +512,8 @@ internal class HttpStream : Stream, IHttpStreamWriter, IHttpStreamReader, IPeekS
     {
         // When index is greater than the buffer size
         if (streamBuffer.Length <= index)
-            throw new Exception("Requested Peek index exceeds the buffer size. Consider increasing the buffer size.");
+            throw new ArgumentOutOfRangeException(nameof(index), index,
+                "Requested peek index exceeds the buffer size. Consider increasing the buffer size.");
 
         while (Available <= index)
         {
@@ -381,8 +539,9 @@ internal class HttpStream : Stream, IHttpStreamWriter, IHttpStreamReader, IPeekS
     {
         // When index is greater than the buffer size
         if (streamBuffer.Length <= index + count)
-            throw new Exception(
-                "Requested Peek index and size exceeds the buffer size. Consider increasing the buffer size.");
+            throw new ArgumentOutOfRangeException(
+                nameof(count), count,
+                "Requested peek index and size exceed the buffer size. Consider increasing the buffer size.");
 
         while (Available <= index)
         {
@@ -392,7 +551,10 @@ internal class HttpStream : Stream, IHttpStreamWriter, IHttpStreamReader, IPeekS
 
         if (Available - index < count) count = Available - index;
 
-        Buffer.BlockCopy(streamBuffer, index, buffer, offset, count);
+        // Peek is relative to the unread window (bufferPos), same as PeekByteAsync /
+        // PeekByteFromBuffer. Copying from absolute index would return already-consumed bytes
+        // when bufferPos > 0 (keep-alive leftover or a prior Read).
+        Buffer.BlockCopy(streamBuffer, bufferPos + index, buffer, offset, count);
         return count;
     }
 
@@ -404,7 +566,8 @@ internal class HttpStream : Stream, IHttpStreamWriter, IHttpStreamReader, IPeekS
     /// <exception cref="Exception">Index is out of buffer size</exception>
     public byte PeekByteFromBuffer(int index)
     {
-        if (Available <= index) throw new Exception("Index is out of buffer size");
+        if (Available <= index)
+            throw new ArgumentOutOfRangeException(nameof(index), index, "Index is outside the buffered data.");
 
         return streamBuffer[bufferPos + index];
     }
@@ -416,7 +579,7 @@ internal class HttpStream : Stream, IHttpStreamWriter, IHttpStreamReader, IPeekS
     /// <exception cref="Exception">Buffer is empty</exception>
     public byte ReadByteFromBuffer()
     {
-        if (Available == 0) throw new Exception("Buffer is empty");
+        if (Available == 0) throw new InvalidOperationException("Buffer is empty.");
 
         Available--;
         return streamBuffer[bufferPos++];
@@ -434,22 +597,21 @@ internal class HttpStream : Stream, IHttpStreamWriter, IHttpStreamReader, IPeekS
     ///     <see cref="P:System.Threading.CancellationToken.None"></see>.
     /// </param>
     [DebuggerStepThrough]
-    public override async Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+    public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+    {
+        var vt = WriteAsyncCore(buffer, offset, count, cancellationToken);
+        return vt.IsCompletedSuccessfully ? Task.CompletedTask : vt.AsTask();
+    }
+
+    /// <inheritdoc cref="IHttpStreamWriter.WriteAsync" />
+    ValueTask IHttpStreamWriter.WriteAsync(byte[] buffer, int offset, int count,
+        CancellationToken cancellationToken)
+        => WriteAsyncCore(buffer, offset, count, cancellationToken);
+
+    private ValueTask WriteAsyncCore(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
     {
         OnDataWrite(buffer, offset, count);
-
-        if (closedWrite) return;
-
-        try
-        {
-            await BaseStream.WriteAsync(buffer, offset, count, cancellationToken);
-        }
-        catch
-        {
-            closedWrite = true;
-            if (!IsNetworkStream)
-                throw;
-        }
+        return WriteToBaseStreamAsync(buffer.AsMemory(offset, count), cancellationToken);
     }
 
     /// <summary>
@@ -467,11 +629,17 @@ internal class HttpStream : Stream, IHttpStreamWriter, IHttpStreamReader, IPeekS
             OnDataWrite(buffer, 0, 1);
             BaseStream.Write(buffer, 0, 1);
         }
-        catch
+        catch (Exception ex)
         {
             closedWrite = true;
             if (!IsNetworkStream)
-                throw;
+                {
+                    throw ReportRethrownFailure(ex);
+                }
+                else
+                {
+                    ReportSuppressedFailure(ex);
+                }
         }
         finally
         {
@@ -509,9 +677,12 @@ internal class HttpStream : Stream, IHttpStreamWriter, IHttpStreamReader, IPeekS
             {
                 if (!leaveOpen) BaseStream.Dispose();
 
-                bufferPool.ReturnBuffer(streamBuffer);
+                if (ownsStreamBuffer)
+                    bufferPool.ReturnBuffer(streamBuffer);
             }
         }
+
+        base.Dispose(disposing);
     }
 
     /// <summary>
@@ -579,161 +750,9 @@ internal class HttpStream : Stream, IHttpStreamWriter, IHttpStreamReader, IPeekS
     /// <summary>
     ///     Fills the buffer.
     /// </summary>
-    public bool FillBuffer()
-    {
-        if (IsClosed) throw new Exception("Stream is already closed");
-
-        if (Available > 0)
-            // normally we fill the buffer only when it is empty, but sometimes we need more data
-            // move the remaining data to the beginning of the buffer 
-            Buffer.BlockCopy(streamBuffer, bufferPos, streamBuffer, 0, Available);
-
-        bufferPos = 0;
-
-        var result = false;
-        try
-        {
-            var readBytes = BaseStream.Read(streamBuffer, Available, streamBuffer.Length - Available);
-            result = readBytes > 0;
-            if (result)
-            {
-                OnDataRead(streamBuffer, Available, readBytes);
-                Available += readBytes;
-            }
-        }
-        catch
-        {
-            if (!IsNetworkStream)
-                throw;
-        }
-        finally
-        {
-            if (!result)
-            {
-                IsClosed = true;
-                closedWrite = true;
-            }
-        }
-
-        return result;
-    }
-
-    /// <summary>
-    ///     Fills the buffer asynchronous.
-    /// </summary>
-    /// <param name="cancellationToken">The cancellation token.</param>
     /// <returns></returns>
-    public async ValueTask<bool> FillBufferAsync(CancellationToken cancellationToken = default)
-    {
-        if (IsClosed) throw new Exception("Stream is already closed");
-
-        var bytesToRead = streamBuffer.Length - Available;
-        if (bytesToRead == 0) return false;
-
-        if (Available > 0)
-            // normally we fill the buffer only when it is empty, but sometimes we need more data
-            // move the remaining data to the beginning of the buffer 
-            Buffer.BlockCopy(streamBuffer, bufferPos, streamBuffer, 0, Available);
-
-        bufferPos = 0;
-
-        var result = false;
-        try
-        {
-            var readTask = BaseStream.ReadAsync(streamBuffer, Available, bytesToRead, cancellationToken);
-            if (IsNetworkStream) readTask = readTask.WithCancellation(cancellationToken);
-
-            var readBytes = await readTask;
-            result = readBytes > 0;
-            if (result)
-            {
-                OnDataRead(streamBuffer, Available, readBytes);
-                Available += readBytes;
-            }
-        }
-        catch
-        {
-            if (!IsNetworkStream)
-                throw;
-        }
-        finally
-        {
-            if (!result)
-            {
-                IsClosed = true;
-                closedWrite = true;
-            }
-        }
-
-        return result;
-    }
-
-    /// <summary>
-    ///     Read a line from the byte stream
-    /// </summary>
     /// <returns></returns>
-    public ValueTask<string?> ReadLineAsync(CancellationToken cancellationToken = default)
-    {
-        return ReadLineInternalAsync(this, bufferPool, cancellationToken);
-    }
-
-    /// <summary>
-    ///     Read a line from the byte stream
-    /// </summary>
-    /// <returns></returns>
-    internal static async ValueTask<string?> ReadLineInternalAsync(ILineStream reader, IBufferPool bufferPool,
-        CancellationToken cancellationToken = default)
-    {
-        byte lastChar = default;
-
-        var bufferDataLength = 0;
-
-        // try to use buffer from the buffer pool, usually it is enough
-        var bufferPoolBuffer = bufferPool.GetBuffer();
-        var buffer = bufferPoolBuffer;
-
-        try
-        {
-            while (reader.DataAvailable || await reader.FillBufferAsync(cancellationToken))
-            {
-                var newChar = reader.ReadByteFromBuffer();
-                buffer[bufferDataLength] = newChar;
-
-                // if new line
-                if (newChar == '\n')
-                {
-                    if (lastChar == '\r') return Encoding.GetString(buffer, 0, bufferDataLength - 1);
-
-                    return Encoding.GetString(buffer, 0, bufferDataLength);
-                }
-
-                bufferDataLength++;
-
-                // store last char for new line comparison
-                lastChar = newChar;
-
-                if (bufferDataLength == buffer.Length) Array.Resize(ref buffer, bufferDataLength * 2);
-            }
-        }
-        finally
-        {
-            bufferPool.ReturnBuffer(bufferPoolBuffer);
-        }
-
-        if (bufferDataLength == 0) return null;
-
-        return Encoding.GetString(buffer, 0, bufferDataLength);
-    }
-
-    /// <summary>
-    ///     Base Stream.BeginRead will call this.Read and block thread (we don't want this, Network stream handles async)
-    ///     In order to really async Reading Launch this.ReadAsync as Task will fire NetworkStream.ReadAsync
-    ///     See Threads here :
-    ///     https://github.com/justcoding121/Stream-Extended/pull/43
-    ///     https://github.com/justcoding121/Titanium-Web-Proxy/issues/575
-    /// </summary>
-    /// <returns></returns>
-    public override IAsyncResult BeginRead(byte[] buffer, int offset, int count, AsyncCallback callback, object state)
+    public override IAsyncResult BeginRead(byte[] buffer, int offset, int count, AsyncCallback? callback, object? state)
     {
         if (!networkStreamHack) return base.BeginRead(buffer, offset, count, callback, state);
 
@@ -768,7 +787,7 @@ internal class HttpStream : Stream, IHttpStreamWriter, IHttpStreamReader, IPeekS
     ///     That's why we need to call NetworkStream.BeginWrite only (while read is waiting SemaphoreSlim)
     /// </summary>
     /// <returns></returns>
-    public override IAsyncResult BeginWrite(byte[] buffer, int offset, int count, AsyncCallback callback, object state)
+    public override IAsyncResult BeginWrite(byte[] buffer, int offset, int count, AsyncCallback? callback, object? state)
     {
         if (!networkStreamHack) return base.BeginWrite(buffer, offset, count, callback, state);
 
@@ -790,420 +809,4 @@ internal class HttpStream : Stream, IHttpStreamWriter, IHttpStreamReader, IPeekS
 
         ((TaskResult)asyncResult).GetResult();
     }
-
-    /// <summary>
-    ///     Writes a line async
-    /// </summary>
-    /// <param name="cancellationToken">Optional cancellation token for this async task.</param>
-    /// <returns></returns>
-    public ValueTask WriteLineAsync(CancellationToken cancellationToken = default)
-    {
-        return WriteAsync(newLine, cancellationToken: cancellationToken);
-    }
-
-    private async ValueTask WriteAsyncInternal(string value, bool addNewLine, CancellationToken cancellationToken)
-    {
-        if (closedWrite) return;
-
-        var newLineChars = addNewLine ? newLine.Length : 0;
-        var charCount = value.Length;
-        if (charCount < bufferPool.BufferSize - newLineChars)
-        {
-            var buffer = bufferPool.GetBuffer();
-            try
-            {
-                var idx = Encoding.GetBytes(value, 0, charCount, buffer, 0);
-                if (newLineChars > 0)
-                {
-                    Buffer.BlockCopy(newLine, 0, buffer, idx, newLineChars);
-                    idx += newLineChars;
-                }
-
-                await BaseStream.WriteAsync(buffer, 0, idx, cancellationToken);
-            }
-            catch
-            {
-                closedWrite = true;
-                if (!IsNetworkStream)
-                    throw;
-            }
-            finally
-            {
-                bufferPool.ReturnBuffer(buffer);
-            }
-        }
-        else
-        {
-            var buffer = new byte[charCount + newLineChars + 1];
-            var idx = Encoding.GetBytes(value, 0, charCount, buffer, 0);
-            if (newLineChars > 0)
-            {
-                Buffer.BlockCopy(newLine, 0, buffer, idx, newLineChars);
-                idx += newLineChars;
-            }
-
-            try
-            {
-                await BaseStream.WriteAsync(buffer, 0, idx, cancellationToken);
-            }
-            catch
-            {
-                closedWrite = true;
-                if (!IsNetworkStream)
-                    throw;
-            }
-        }
-    }
-
-    public ValueTask WriteLineAsync(string value, CancellationToken cancellationToken = default)
-    {
-        return WriteAsyncInternal(value, true, cancellationToken);
-    }
-
-    /// <summary>
-    ///     Write the headers to client
-    /// </summary>
-    /// <param name="headerBuilder"></param>
-    /// <param name="cancellationToken"></param>
-    /// <returns></returns>
-    internal async Task WriteHeadersAsync(HeaderBuilder headerBuilder, CancellationToken cancellationToken = default)
-    {
-        var buffer = headerBuilder.GetBuffer();
-
-        try
-        {
-            await WriteAsync(buffer.Array, buffer.Offset, buffer.Count, true, cancellationToken);
-        }
-        catch (IOException e)
-        {
-            //throw this as ServerConnectionException so that RetryPolicy can retry with a new server connection.
-            if (this is HttpServerStream)
-                throw new RetryableServerConnectionException(
-                    "Server connection was closed. Exception while sending request line and headers.", e);
-
-            throw;
-        }
-    }
-
-    /// <summary>
-    ///     Writes the data to the stream.
-    /// </summary>
-    /// <param name="data">The data.</param>
-    /// <param name="flush">Should we flush after write?</param>
-    /// <param name="cancellationToken">The cancellation token.</param>
-    internal async ValueTask WriteAsync(byte[] data, bool flush = false, CancellationToken cancellationToken = default)
-    {
-        if (closedWrite) return;
-
-        try
-        {
-            await BaseStream.WriteAsync(data, 0, data.Length, cancellationToken);
-            if (flush) await BaseStream.FlushAsync(cancellationToken);
-        }
-        catch
-        {
-            closedWrite = true;
-            if (!IsNetworkStream)
-                throw;
-        }
-    }
-
-    internal async Task WriteAsync(byte[] data, int offset, int count, bool flush,
-        CancellationToken cancellationToken = default)
-    {
-        if (closedWrite) return;
-
-        try
-        {
-            await BaseStream.WriteAsync(data, offset, count, cancellationToken);
-            if (flush) await BaseStream.FlushAsync(cancellationToken);
-        }
-        catch
-        {
-            closedWrite = true;
-            if (!IsNetworkStream)
-                throw;
-        }
-    }
-
-    /// <summary>
-    ///     Writes the byte array body to the stream; optionally chunked
-    /// </summary>
-    /// <param name="data"></param>
-    /// <param name="isChunked"></param>
-    /// <param name="cancellationToken"></param>
-    /// <returns></returns>
-    internal ValueTask WriteBodyAsync(byte[] data, bool isChunked, CancellationToken cancellationToken)
-    {
-        if (isChunked) return WriteBodyChunkedAsync(data, cancellationToken);
-
-        return WriteAsync(data, cancellationToken: cancellationToken);
-    }
-
-    public async Task CopyBodyAsync(RequestResponseBase requestResponse, bool useOriginalHeaderValues,
-        IHttpStreamWriter writer, TransformationMode transformation, bool isRequest, SessionEventArgs args,
-        CancellationToken cancellationToken)
-    {
-        var isChunked = useOriginalHeaderValues ? requestResponse.OriginalIsChunked : requestResponse.IsChunked;
-        var contentLength = useOriginalHeaderValues
-            ? requestResponse.OriginalContentLength
-            : requestResponse.ContentLength;
-
-        if (transformation == TransformationMode.None)
-        {
-            await CopyBodyAsync(writer, isChunked, contentLength, isRequest, args, cancellationToken);
-            return;
-        }
-
-        LimitedStream limitedStream;
-        Stream? decompressStream = null;
-
-        var contentEncoding = useOriginalHeaderValues
-            ? requestResponse.OriginalContentEncoding
-            : requestResponse.ContentEncoding;
-
-        Stream s = limitedStream = new LimitedStream(this, bufferPool, isChunked, contentLength);
-
-        if (transformation == TransformationMode.Uncompress && contentEncoding != null)
-            s = decompressStream =
-                DecompressionFactory.Create(CompressionUtil.CompressionNameToEnum(contentEncoding), s);
-
-        try
-        {
-            var http = new HttpStream(server, s, bufferPool, cancellationToken, true);
-            await http.CopyBodyAsync(writer, false, -1, isRequest, args, cancellationToken);
-        }
-        finally
-        {
-            decompressStream?.Dispose();
-
-            await limitedStream.Finish();
-            limitedStream.Dispose();
-        }
-    }
-
-    /// <summary>
-    ///     Copies the specified content length number of bytes to the output stream from the given inputs stream
-    ///     optionally chunked
-    /// </summary>
-    /// <param name="writer"></param>
-    /// <param name="isChunked"></param>
-    /// <param name="contentLength"></param>
-    /// <param name="onCopy"></param>
-    /// <param name="cancellationToken"></param>
-    /// <returns></returns>
-    public Task CopyBodyAsync(IHttpStreamWriter writer, bool isChunked, long contentLength,
-        bool isRequest,
-        SessionEventArgs args, CancellationToken cancellationToken)
-    {
-#if DEBUG
-            var isResponse = !isRequest;
-
-            if (IsNetworkStream && writer.IsNetworkStream &&
-                (isRequest && args.HttpClient.Request.OriginalHasBody && !args.HttpClient.Request.IsBodyRead && server.ShouldCallBeforeRequestBodyWrite()) ||
-                (isResponse && args.HttpClient.Response.OriginalHasBody && !args.HttpClient.Response.IsBodyRead && server.ShouldCallBeforeResponseBodyWrite()))
-            {
-                return HandleBodyWrite(writer, isChunked, contentLength, isRequest, args, cancellationToken);
-            }
-#endif
-        // For chunked request we need to read data as they arrive, until we reach a chunk end symbol
-        if (isChunked) return CopyBodyChunkedAsync(writer, isRequest, args, cancellationToken);
-
-        // http 1.0 or the stream reader limits the stream
-        if (contentLength == -1) contentLength = long.MaxValue;
-
-        // If not chunked then its easy just read the amount of bytes mentioned in content length header
-        return CopyBytesToStream(writer, contentLength, isRequest, args, cancellationToken);
-    }
-
-    private Task HandleBodyWrite(IHttpStreamWriter writer, bool isChunked, long contentLength,
-        bool isRequest, SessionEventArgs args, CancellationToken cancellationToken)
-    {
-        var originalContentLength = isRequest
-            ? args.HttpClient.Request.OriginalContentLength
-            : args.HttpClient.Response.OriginalContentLength;
-        var originalIsChunked =
-            isRequest ? args.HttpClient.Request.OriginalIsChunked : args.HttpClient.Response.OriginalIsChunked;
-
-        //TODO
-        //create a new decompression stream to wrap this source HttpStream based on original content encoding if needed.
-        //create a new compression stream to wrap target writer stream based on content encoding if needed.
-
-        //1. Begin while(true) loop
-        //2. Parse chunk if chunked, and read bytes from original stream. Max length of bytes read will be equal to bufferPool.BufferSize.
-        //3. Call BeforeBodyWrite event handler with BeforeBodyWriteEventArgs.BodyBytes set to the bytes read from original stream (pass null if original stream reached its end).
-        //4. Write BeforeBodyWriteEventArgs.BodyBytes to the target stream when BeforeBodyWriteEventArgs.BodyBytes is not null or empty.
-        //5. Stop writing to target stream when 'long contentLength' parameter number of bytes are written (when not chunked) or
-        //when BeforeBodyWriteEventArgs.IsLastChunk is true after callback (when chunked).
-        //6. Exit loop when original stream reaches its end AND when writing in step 5 has stopped.
-        throw new NotImplementedException();
-    }
-
-    /// <summary>
-    ///     Copies the given input bytes to output stream chunked
-    /// </summary>
-    /// <param name="data"></param>
-    /// <param name="cancellationToken"></param>
-    /// <returns></returns>
-    private async ValueTask WriteBodyChunkedAsync(byte[] data, CancellationToken cancellationToken)
-    {
-        var chunkHead = Encoding.ASCII.GetBytes(data.Length.ToString("x2"));
-
-        await WriteAsync(chunkHead, cancellationToken: cancellationToken);
-        await WriteLineAsync(cancellationToken);
-        await WriteAsync(data, cancellationToken: cancellationToken);
-        await WriteLineAsync(cancellationToken);
-
-        await WriteLineAsync("0", cancellationToken);
-        await WriteLineAsync(cancellationToken);
-    }
-
-    /// <summary>
-    ///     Copies the streams chunked
-    /// </summary>
-    /// <param name="writer"></param>
-    /// <param name="onCopy"></param>
-    /// <param name="cancellationToken"></param>
-    /// <returns></returns>
-    private async Task CopyBodyChunkedAsync(IHttpStreamWriter writer, bool isRequest, SessionEventArgs args,
-        CancellationToken cancellationToken)
-    {
-        while (true)
-        {
-            var chunkHead = await ReadLineAsync(cancellationToken);
-            if (chunkHead == null) return;
-
-            var idx = chunkHead.IndexOf(";", StringComparison.Ordinal);
-            if (idx >= 0) chunkHead = chunkHead.Substring(0, idx);
-
-            if (!int.TryParse(chunkHead, NumberStyles.HexNumber, null, out var chunkSize))
-                throw new ProxyHttpException($"Invalid chunk length: '{chunkHead}'", null, null);
-
-            await writer.WriteLineAsync(chunkHead, cancellationToken);
-
-            if (chunkSize != 0) await CopyBytesToStream(writer, chunkSize, isRequest, args, cancellationToken);
-
-            await writer.WriteLineAsync(cancellationToken);
-
-            // chunk trail
-            await ReadLineAsync(cancellationToken);
-
-            if (chunkSize == 0) break;
-        }
-    }
-
-    /// <summary>
-    ///     Copies the specified bytes to the stream from the input stream
-    /// </summary>
-    /// <param name="writer"></param>
-    /// <param name="count"></param>
-    /// <param name="onCopy"></param>
-    /// <param name="cancellationToken"></param>
-    /// <returns></returns>
-    private async Task CopyBytesToStream(IHttpStreamWriter writer, long count, bool isRequest, SessionEventArgs args,
-        CancellationToken cancellationToken)
-    {
-        var buffer = bufferPool.GetBuffer();
-
-        try
-        {
-            var remainingBytes = count;
-
-            while (remainingBytes > 0)
-            {
-                var bytesToRead = buffer.Length;
-                if (remainingBytes < bytesToRead) bytesToRead = (int)remainingBytes;
-
-                var bytesRead = await ReadAsync(buffer, 0, bytesToRead, cancellationToken);
-                if (bytesRead == 0) break;
-
-                remainingBytes -= bytesRead;
-
-                await writer.WriteAsync(buffer, 0, bytesRead, cancellationToken);
-
-                if (isRequest)
-                    args.OnDataSent(buffer, 0, bytesRead);
-                else
-                    args.OnDataReceived(buffer, 0, bytesRead);
-            }
-        }
-        finally
-        {
-            bufferPool.ReturnBuffer(buffer);
-        }
-    }
-
-    /// <summary>
-    ///     Writes the request/response headers and body.
-    /// </summary>
-    /// <param name="requestResponse"></param>
-    /// <param name="headerBuilder"></param>
-    /// <param name="cancellationToken"></param>
-    /// <returns></returns>
-    protected async ValueTask WriteAsync(RequestResponseBase requestResponse, HeaderBuilder headerBuilder,
-        CancellationToken cancellationToken = default)
-    {
-        var body = requestResponse.CompressBodyAndUpdateContentLength();
-        headerBuilder.WriteHeaders(requestResponse.Headers);
-        await WriteHeadersAsync(headerBuilder, cancellationToken);
-
-        if (body != null)
-        {
-            await WriteBodyAsync(body, requestResponse.IsChunked, cancellationToken);
-            requestResponse.IsBodySent = true;
-        }
-    }
-
-#if NETSTANDARD2_1
-        /// <summary>
-        ///     Asynchronously writes a sequence of bytes to the current stream, advances the current position within this stream by the number of bytes written, and monitors cancellation requests.
-        /// </summary>
-        /// <param name="buffer">The buffer to write data from.</param>
-        /// <param name="cancellationToken">The token to monitor for cancellation requests. The default value is <see cref="P:System.Threading.CancellationToken.None" />.</param>
-        /// <returns>A task that represents the asynchronous write operation.</returns>
-        public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken =
- default)
-        {
-            if (closedWrite)
-            {
-                return;
-            }
-
-            try
-            {
-                await BaseStream.WriteAsync(buffer, cancellationToken);
-            }
-            catch
-            {
-                closedWrite = true;
-                if (!IsNetworkStream)
-                    throw;
-            }
-        }
-#else
-    /// <summary>
-    ///     Asynchronously writes a sequence of bytes to the current stream, advances the current position within this stream
-    ///     by the number of bytes written, and monitors cancellation requests.
-    /// </summary>
-    /// <param name="buffer">The buffer to write data from.</param>
-    /// <param name="cancellationToken">
-    ///     The token to monitor for cancellation requests. The default value is
-    ///     <see cref="P:System.Threading.CancellationToken.None" />.
-    /// </param>
-    /// <returns>A task that represents the asynchronous write operation.</returns>
-    public async Task WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken)
-    {
-        var buf = ArrayPool<byte>.Shared.Rent(buffer.Length);
-        buffer.CopyTo(buf);
-        try
-        {
-            await BaseStream.WriteAsync(buf, 0, buf.Length, cancellationToken);
-        }
-        catch
-        {
-            if (!IsNetworkStream)
-                throw;
-        }
-    }
-#endif
 }

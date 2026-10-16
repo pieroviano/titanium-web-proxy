@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Threading;
+using Titanium.Web.Proxy.Diagnostics;
 using Titanium.Web.Proxy.Helpers;
 using Titanium.Web.Proxy.Http;
 using Titanium.Web.Proxy.Models;
@@ -13,6 +14,7 @@ namespace Titanium.Web.Proxy.EventArguments;
 public class TunnelConnectSessionEventArgs : SessionEventArgsBase
 {
     private bool? isHttpsConnect;
+    private UpstreamHttpProtocol upstreamHttpProtocol = UpstreamHttpProtocol.Auto;
 
     internal TunnelConnectSessionEventArgs(ProxyServer server, ProxyEndPoint endPoint, ConnectRequest connectRequest,
         HttpClientStream clientStream, CancellationTokenSource cancellationTokenSource)
@@ -32,12 +34,63 @@ public class TunnelConnectSessionEventArgs : SessionEventArgsBase
     public bool DenyConnect { get; set; }
 
     /// <summary>
+    ///     When <see langword="true" />, the proxy establishes the upstream TCP connection
+    ///     (and upstream-proxy CONNECT when configured) <b>before</b> writing HTTP 200 to the client.
+    ///     On failure, <see cref="ExplicitProxyEndPoint.BeforeTunnelConnectFailure" /> can supply a
+    ///     custom HTTP error response (the client never receives 200 / never starts TLS).
+    ///     Default is <see langword="false" /> — no preconnect and no added latency.
+    ///     Set this during <see cref="ExplicitProxyEndPoint.BeforeTunnelConnectRequest" />.
+    /// </summary>
+    public bool EstablishServerConnectionBeforeResponse { get; set; }
+
+    /// <summary>
+    ///     Controls which HTTP version the proxy uses on its own connection to the origin server for this
+    ///     tunnel, independent of the HTTP version the client itself negotiates with the proxy. Must be set
+    ///     during <c>BeforeTunnelConnectRequest</c> - it is read before the client TLS handshake, and the
+    ///     client's own ALPN offer/negotiation cannot change afterward. See <see cref="UpstreamHttpProtocol" />.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">The value is not a defined <see cref="UpstreamHttpProtocol" /> member.</exception>
+    public UpstreamHttpProtocol UpstreamHttpProtocol
+    {
+        get => upstreamHttpProtocol;
+        set => upstreamHttpProtocol = Enum.IsDefined(value)
+            ? value
+            : throw new ArgumentOutOfRangeException(nameof(value), value,
+                "Unknown UpstreamHttpProtocol value.");
+    }
+
+    /// <summary>
+    ///     Whether the proxy may bridge a mismatch between the client's negotiated HTTP version and the
+    ///     origin's HTTP version implied by <see cref="UpstreamHttpProtocol" />. Defaults to <c>false</c>, in
+    ///     which case <see cref="UpstreamHttpProtocol.Http11" /> instead simply never offers "h2" to the
+    ///     client (so no mismatch, and no translation, is ever needed) and <see cref="UpstreamHttpProtocol.Http2" />
+    ///     fails the connection outright if the client does not also support HTTP/2.
+    /// </summary>
+    public bool AllowHttpProtocolTranslation { get; set; }
+
+    /// <summary>
+    ///     Timing of the client-facing (browser-to-proxy) TLS handshake performed while decrypting this
+    ///     tunnel, populated only when <see cref="ProxyServer.EnableRequestTimingCapture" /> is enabled and
+    ///     <see cref="DecryptSsl" /> is <see langword="true" />; <see langword="null" /> otherwise (including
+    ///     for a plain, non-HTTPS CONNECT tunnel that is never TLS-decrypted at all).
+    /// </summary>
+    public ClientTlsTiming? ClientTlsTiming { get; internal set; }
+
+    /// <summary>
+    ///     CONNECT-phase milestones (certificate readiness, origin capability resolution, HTTP/2 probe,
+    ///     browser TLS) populated only when <see cref="ProxyServer.EnableRequestTimingCapture" /> is
+    ///     enabled and <see cref="DecryptSsl" /> is <see langword="true" />; otherwise
+    ///     <see langword="null" />.
+    /// </summary>
+    public TunnelConnectTiming? ConnectTiming { get; internal set; }
+
+    /// <summary>
     ///     Is this a connect request to secure HTTP server? Or is it to some other protocol.
     /// </summary>
     public bool IsHttpsConnect
     {
         get => isHttpsConnect ??
-               throw new Exception("The value of this property is known in the BeforeTunnelConnectResponse event");
+               throw new InvalidOperationException("The value of this property is known in the BeforeTunnelConnectResponse event");
 
         internal set => isHttpsConnect = value;
     }
@@ -54,9 +107,12 @@ public class TunnelConnectSessionEventArgs : SessionEventArgsBase
 
     internal void OnDecryptedDataSent(byte[] buffer, int offset, int count)
     {
+        var handler = DecryptedDataSent;
+        if (handler == null) return;
+
         try
         {
-            DecryptedDataSent?.Invoke(this, new DataEventArgs(buffer, offset, count));
+            handler.Invoke(this, new DataEventArgs(CopyDataEventPayload(buffer, offset, count), 0, count));
         }
         catch (Exception ex)
         {
@@ -66,9 +122,12 @@ public class TunnelConnectSessionEventArgs : SessionEventArgsBase
 
     internal void OnDecryptedDataReceived(byte[] buffer, int offset, int count)
     {
+        var handler = DecryptedDataReceived;
+        if (handler == null) return;
+
         try
         {
-            DecryptedDataReceived?.Invoke(this, new DataEventArgs(buffer, offset, count));
+            handler.Invoke(this, new DataEventArgs(CopyDataEventPayload(buffer, offset, count), 0, count));
         }
         catch (Exception ex)
         {
@@ -76,8 +135,13 @@ public class TunnelConnectSessionEventArgs : SessionEventArgsBase
         }
     }
 
-    ~TunnelConnectSessionEventArgs()
+    private static byte[] CopyDataEventPayload(byte[] buffer, int offset, int count)
     {
-        Dispose(false);
+        if (count == 0) return Array.Empty<byte>();
+        if (offset == 0 && count == buffer.Length) return (byte[])buffer.Clone();
+        var copy = new byte[count];
+        Buffer.BlockCopy(buffer, offset, copy, 0, count);
+        return copy;
     }
+
 }

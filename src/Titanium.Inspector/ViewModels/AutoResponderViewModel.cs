@@ -1,0 +1,357 @@
+using System.Collections.ObjectModel;
+using System.ComponentModel;
+using System.Runtime.CompilerServices;
+using System.Text;
+using System.Text.RegularExpressions;
+using Titanium.Inspector.Services;
+
+namespace Titanium.Inspector.ViewModels;
+
+/// <summary>AutoResponder rules — evaluated before breakpoints. Optional Map Local file body.</summary>
+public sealed class AutoResponderViewModel : INotifyPropertyChanged
+{
+    private readonly object _rulesGate = new();
+    private bool _enabled;
+    private AutoResponderRule? _selectedRule;
+
+    public bool Enabled
+    {
+        get => _enabled;
+        set
+        {
+            if (_enabled == value)
+            {
+                return;
+            }
+
+            _enabled = value;
+            PropertyChanged?.Invoke(this, new(nameof(Enabled)));
+            EnabledChanged?.Invoke(this, EventArgs.Empty);
+        }
+    }
+
+    /// <summary>UI-bound rule list. Mutate only via <see cref="AddRule"/> / <see cref="RemoveRule"/> / <see cref="LoadFromDtos"/>.</summary>
+    public ObservableCollection<AutoResponderRule> Rules { get; } = new();
+
+    public AutoResponderRule? SelectedRule
+    {
+        get => _selectedRule;
+        set
+        {
+            if (ReferenceEquals(_selectedRule, value))
+            {
+                return;
+            }
+
+            _selectedRule = value;
+            PropertyChanged?.Invoke(this, new(nameof(SelectedRule)));
+        }
+    }
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+    public event EventHandler? EnabledChanged;
+    public event EventHandler? RulesChanged;
+
+    public void NotifyRulesChanged() => RulesChanged?.Invoke(this, EventArgs.Empty);
+
+    public void AddRule(AutoResponderRule rule)
+    {
+        lock (_rulesGate)
+        {
+            Rules.Add(rule);
+        }
+    }
+
+    public bool RemoveRule(AutoResponderRule rule)
+    {
+        lock (_rulesGate)
+        {
+            return Rules.Remove(rule);
+        }
+    }
+
+    public void ClearRules()
+    {
+        lock (_rulesGate)
+        {
+            Rules.Clear();
+        }
+    }
+
+    public void LoadFromDtos(IEnumerable<AutoResponderRuleDto> dtos)
+    {
+        lock (_rulesGate)
+        {
+            Rules.Clear();
+            foreach (var dto in dtos)
+            {
+                Rules.Add(new AutoResponderRule
+                {
+                    MatchUrl = dto.MatchUrl,
+                    StatusCode = dto.StatusCode,
+                    Body = dto.Body,
+                    ContentType = string.IsNullOrEmpty(dto.ContentType) ? "text/plain" : dto.ContentType,
+                    Enabled = dto.Enabled,
+                    LocalFilePath = dto.LocalFilePath ?? string.Empty,
+                    GraphQlOperationName = dto.GraphQlOperationName ?? string.Empty,
+                });
+            }
+        }
+    }
+
+    public List<AutoResponderRuleDto> ToDtos() =>
+        SnapshotRules().Select(r => new AutoResponderRuleDto
+        {
+            MatchUrl = r.MatchUrl,
+            StatusCode = r.StatusCode,
+            Body = r.Body,
+            ContentType = r.ContentType,
+            Enabled = r.Enabled,
+            LocalFilePath = string.IsNullOrWhiteSpace(r.LocalFilePath) ? null : r.LocalFilePath,
+            GraphQlOperationName = string.IsNullOrWhiteSpace(r.GraphQlOperationName) ? null : r.GraphQlOperationName,
+        }).ToList();
+
+    /// <summary>True when an enabled rule filters by GraphQL operation (needs request body).</summary>
+    public bool HasEnabledGraphQlRule()
+    {
+        foreach (var r in SnapshotRules())
+        {
+            if (r.Enabled && !string.IsNullOrWhiteSpace(r.GraphQlOperationName))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    public bool TryMatch(string url, string? requestBody, out AutoResponderRule? matched)
+    {
+        matched = null;
+        if (!Enabled)
+        {
+            return false;
+        }
+
+        // Snapshot: proxy OnBeforeRequest enumerates while the UI may Add/Remove.
+        foreach (var rule in SnapshotRules())
+        {
+            if (!rule.Enabled)
+            {
+                continue;
+            }
+
+            if (!Matches(rule.MatchUrl, url))
+            {
+                continue;
+            }
+
+            if (!GraphQlOperationMatcher.MatchesOperation(requestBody, rule.GraphQlOperationName))
+            {
+                continue;
+            }
+
+            matched = rule;
+            return true;
+        }
+
+        return false;
+    }
+
+    public bool TryMatch(string url, out AutoResponderRule? matched)
+        => TryMatch(url, requestBody: null, out matched);
+
+    private AutoResponderRule[] SnapshotRules()
+    {
+        lock (_rulesGate)
+        {
+            var arr = new AutoResponderRule[Rules.Count];
+            Rules.CopyTo(arr, 0);
+            return arr;
+        }
+    }
+
+    public bool TryRespond(SessionSnapshot session, out AutoResponderRule? matched)
+        => TryMatch(session.Url, session.RequestBodyText, out matched);
+
+    /// <summary>
+    /// Resolves how to answer a matched rule. Map Local streams from disk (with size cap);
+    /// otherwise returns inline body bytes.
+    /// </summary>
+    public static bool TryResolveResponse(
+        AutoResponderRule rule,
+        out byte[]? inlineBody,
+        out string? mapLocalPath,
+        out long mapLocalLength,
+        out string? error)
+    {
+        inlineBody = null;
+        mapLocalPath = null;
+        mapLocalLength = 0;
+        error = null;
+        if (!string.IsNullOrWhiteSpace(rule.LocalFilePath))
+        {
+            try
+            {
+                var path = rule.LocalFilePath.Trim();
+                if (!File.Exists(path))
+                {
+                    error = $"Map Local file not found: {path}";
+                    return false;
+                }
+
+                var length = new FileInfo(path).Length;
+                if (length > InspectorBodyLimits.MaxMapLocalFileBytes)
+                {
+                    error =
+                        $"Map Local file exceeds {SessionDisplayFormat.FormatByteSize(InspectorBodyLimits.MaxMapLocalFileBytes)}";
+                    return false;
+                }
+
+                mapLocalPath = path;
+                mapLocalLength = length;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = $"Map Local read failed: {ex.Message}";
+                return false;
+            }
+        }
+
+        inlineBody = Encoding.UTF8.GetBytes(rule.Body ?? string.Empty);
+        return true;
+    }
+
+    /// <summary>
+    /// Resolves the response body for a matched rule. Map Local (<see cref="AutoResponderRule.LocalFilePath"/>)
+    /// wins when the path is non-empty; otherwise uses the inline <see cref="AutoResponderRule.Body"/>.
+    /// Prefer <see cref="TryResolveResponse"/> for streaming Map Local.
+    /// </summary>
+    public static bool TryResolveBody(AutoResponderRule rule, out byte[] body, out string? error)
+    {
+        if (!TryResolveResponse(rule, out var inline, out var path, out var length, out error))
+        {
+            body = Array.Empty<byte>();
+            return false;
+        }
+
+        if (path is not null)
+        {
+            if (length > InspectorBodyLimits.MaxMapLocalFileBytes)
+            {
+                body = Array.Empty<byte>();
+                error = $"Map Local file exceeds limit";
+                return false;
+            }
+
+            try
+            {
+                body = File.ReadAllBytes(path);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = $"Map Local read failed: {ex.Message}";
+                body = Array.Empty<byte>();
+                return false;
+            }
+        }
+
+        body = inline ?? Array.Empty<byte>();
+        return true;
+    }
+
+    private static bool Matches(string filter, string url)
+    {
+        if (string.IsNullOrEmpty(filter) || filter == "*")
+        {
+            return true;
+        }
+
+        var pattern = "^" + Regex.Escape(filter).Replace("\\*", ".*") + "$";
+        return Regex.IsMatch(url, pattern, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
+    }
+}
+
+public sealed class AutoResponderRule : INotifyPropertyChanged
+{
+    private string _matchUrl = "*";
+    private int _statusCode = 200;
+    private string _body = string.Empty;
+    private string _contentType = "text/plain";
+    private string _localFilePath = string.Empty;
+    private string _graphQlOperationName = string.Empty;
+    private bool _enabled = true;
+
+    public string MatchUrl
+    {
+        get => _matchUrl;
+        set => SetField(ref _matchUrl, value);
+    }
+
+    public int StatusCode
+    {
+        get => _statusCode;
+        set => SetField(ref _statusCode, value);
+    }
+
+    public string Body
+    {
+        get => _body;
+        set => SetField(ref _body, value);
+    }
+
+    public string ContentType
+    {
+        get => _contentType;
+        set => SetField(ref _contentType, value);
+    }
+
+    /// <summary>Optional absolute path; when set, body is loaded from disk (Map Local).</summary>
+    public string LocalFilePath
+    {
+        get => _localFilePath;
+        set => SetField(ref _localFilePath, value ?? string.Empty);
+    }
+
+    /// <summary>Optional GraphQL operation filter; when set, the rule matches only that client request.</summary>
+    public string GraphQlOperationName
+    {
+        get => _graphQlOperationName;
+        set => SetField(ref _graphQlOperationName, value ?? string.Empty);
+    }
+
+    public bool Enabled
+    {
+        get => _enabled;
+        set => SetField(ref _enabled, value);
+    }
+
+    public string Display
+    {
+        get
+        {
+            var map = string.IsNullOrWhiteSpace(LocalFilePath) ? string.Empty : " [Map Local]";
+            var gql = string.IsNullOrWhiteSpace(GraphQlOperationName) ? string.Empty : $" GraphQL:{GraphQlOperationName}";
+            return $"{(Enabled ? "✓" : "✗")} {StatusCode}{map}{gql} {MatchUrl}";
+        }
+    }
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+
+    private void SetField<T>(ref T field, T value, [CallerMemberName] string? name = null)
+    {
+        if (Equals(field, value))
+        {
+            return;
+        }
+
+        field = value;
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+        if (name is not nameof(Display))
+        {
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Display)));
+        }
+    }
+}

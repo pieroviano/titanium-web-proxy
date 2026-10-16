@@ -1,15 +1,14 @@
 ﻿# Self-elevate the script if required.
-if (-Not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator')) {
+if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator')) {
 	if ([int](Get-CimInstance -Class Win32_OperatingSystem | Select-Object -ExpandProperty BuildNumber) -ge 6000) {
 		$CommandLine = "-File `"" + $MyInvocation.MyCommand.Path + "`" " + $MyInvocation.UnboundArguments
 		Start-Process -FilePath PowerShell.exe -Verb Runas -ArgumentList $CommandLine
-		Exit
+		exit
 	}
 }
 
-# This is the name of the service and will also show as the display name in services.msc.
-# This must match what the service was installed as.
-$ServiceName = "ProxyService"
+# Internal SCM name — must match install.ps1 / AddWindowsService(...) in Program.cs.
+$ServiceName = "TitaniumWebProxy"
 
 # Make sure the service is stopped.
 Stop-Service -Name $ServiceName

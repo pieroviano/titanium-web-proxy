@@ -1,0 +1,554 @@
+using Avalonia.Controls;
+using Avalonia.Controls.ApplicationLifetimes;
+using Avalonia.Threading;
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+using Titanium.E2E.Tests.Harness;
+using Titanium.Inspector.Services;
+
+namespace Titanium.E2E.Tests.UiHeadless;
+
+/// <summary>
+/// Clicks every Capture/File/Tools/Options/Help menu command and asserts a side effect.
+/// Dialog menus are closed via their AutomationIds so ShowDialog cannot hang Headless.
+/// </summary>
+[TestClass]
+public class MenuActionsHeadlessTests
+{
+    private static readonly string[] RootCertificateMenuIds =
+    [
+        "MenuInstallCa", "MenuRemoveCa", "MenuRotateCa", "MenuRemoveOldRootCas",
+        "MenuExportCa", "MenuTrustFirefoxCa", "MenuDeviceCa",
+    ];
+
+    [TestMethod]
+    [TestCategory("E2E-UI-Headless")]
+    public async Task EveryMenuCommand_Click_ProducesExpectedSideEffect()
+    {
+        await using var fx = new InspectorHeadlessFixture();
+        await fx.StartAsync();
+
+        var harPath = Path.Combine(Path.GetTempPath(), "twp-menu-" + Guid.NewGuid().ToString("N") + ".har");
+        var zipPath = Path.Combine(Path.GetTempPath(), "twp-menu-" + Guid.NewGuid().ToString("N") + ".zip");
+        var cerPath = Path.Combine(Path.GetTempPath(), "twp-menu-" + Guid.NewGuid().ToString("N") + ".cer");
+
+        try
+        {
+            await fx.DispatchAsync(async () =>
+            {
+                fx.Robot.Click("MenuStartCapture");
+                await InspectorUiRobot.WaitForAsync(() => fx.Interception.IsRunning, TimeSpan.FromSeconds(15));
+                Assert.IsTrue(fx.Interception.IsRunning, fx.ViewModel.StatusText);
+            });
+
+            await fx.DispatchAsync(() =>
+            {
+                fx.ViewModel.SeedSession(new SessionSnapshot
+                {
+                    Id = 1,
+                    Method = "GET",
+                    StatusCode = 200,
+                    Host = "menu.test",
+                    Url = "http://menu.test/item",
+                    Protocol = "HTTP/1.1",
+                    ProcessName = "chrome",
+                });
+                fx.ViewModel.SeedSession(new SessionSnapshot
+                {
+                    Id = 2,
+                    Method = "GET",
+                    StatusCode = 200,
+                    Host = "menu.test",
+                    Url = "http://menu.test/other",
+                    Protocol = "HTTP/1.1",
+                    ProcessName = "chrome",
+                });
+                SelectOneSession(fx, fx.ViewModel.Sessions[0]);
+            });
+
+            // File
+            fx.PathPicker.SavePath = harPath;
+            await fx.DispatchAsync(() => fx.Robot.Click("MenuExportHar"));
+            await fx.WaitUntilAsync(
+                () => fx.PathPicker.SaveCalls >= 1 || File.Exists(harPath),
+                TimeSpan.FromSeconds(15));
+
+            fx.PathPicker.SavePath = harPath;
+            await fx.DispatchAsync(() => fx.Robot.Click("MenuExportSelectedHar"));
+            await fx.WaitUntilAsync(() => fx.PathPicker.SaveCalls >= 2, TimeSpan.FromSeconds(15));
+
+            fx.PathPicker.OpenPath = harPath;
+            await fx.DispatchAsync(() => fx.Robot.Click("MenuImportHar"));
+            await fx.WaitUntilAsync(() => fx.PathPicker.OpenCalls >= 1, TimeSpan.FromSeconds(15));
+
+            fx.PathPicker.SavePath = zipPath;
+            await fx.DispatchAsync(() => fx.Robot.Click("MenuExportArchive"));
+            await fx.WaitUntilAsync(
+                () => File.Exists(zipPath) || fx.ViewModel.StatusText.Contains("Exported", StringComparison.Ordinal),
+                TimeSpan.FromSeconds(15));
+
+            fx.PathPicker.SavePath = zipPath;
+            await fx.DispatchAsync(() => fx.Robot.Click("MenuExportSelectedArchive"));
+            await fx.WaitUntilAsync(() => fx.PathPicker.SaveCalls >= 4, TimeSpan.FromSeconds(15));
+
+            if (File.Exists(zipPath))
+            {
+                fx.PathPicker.OpenPath = zipPath;
+                await fx.DispatchAsync(() => fx.Robot.Click("MenuImportArchive"));
+                await fx.WaitUntilAsync(() => fx.PathPicker.OpenCalls >= 2, TimeSpan.FromSeconds(15));
+            }
+
+            // Capture toggles + CA (in-memory trust)
+            await fx.DispatchAsync(() =>
+            {
+                var capturing = fx.ViewModel.Capturing;
+                fx.Robot.Click("MenuToggleCapturing");
+                Assert.AreEqual(!capturing, fx.ViewModel.Capturing);
+                fx.Robot.Click("MenuToggleCapturing");
+                Assert.AreEqual(capturing, fx.ViewModel.Capturing);
+
+                var autoStart = fx.ViewModel.AutoStartCapture;
+                fx.Robot.Click("AutoStartCaptureCheck");
+                Assert.AreEqual(!autoStart, fx.ViewModel.AutoStartCapture);
+                fx.Robot.Click("AutoStartCaptureCheck");
+                Assert.AreEqual(autoStart, fx.ViewModel.AutoStartCapture);
+
+                var autoProxy = fx.ViewModel.AutoSystemProxyOnStart;
+                fx.Robot.Click("AutoSystemProxyCheck");
+                Assert.AreEqual(!autoProxy, fx.ViewModel.AutoSystemProxyOnStart);
+                fx.Robot.Click("AutoSystemProxyCheck");
+                Assert.AreEqual(autoProxy, fx.ViewModel.AutoSystemProxyOnStart);
+
+                var loopback = fx.ViewModel.ProxyLoopback;
+                fx.Robot.Click("MenuProxyLocalhost");
+                Assert.AreEqual(!loopback, fx.ViewModel.ProxyLoopback);
+                fx.Robot.Click("MenuProxyLocalhost");
+                Assert.AreEqual(loopback, fx.ViewModel.ProxyLoopback);
+            });
+
+            await fx.DispatchAsync(() => fx.Robot.Click("MenuInstallCa"));
+            await fx.WaitUntilAsync(() => fx.Interception.IsRootTrusted, TimeSpan.FromSeconds(10));
+
+            await fx.DispatchAsync(() => fx.Robot.Click("DecryptHttpsCheck"));
+            await fx.WaitUntilAsync(() => fx.ViewModel.DecryptHttps, TimeSpan.FromSeconds(10));
+
+            await fx.DispatchAsync(() => fx.Robot.Click("SystemProxyCheck"));
+            await fx.WaitUntilAsync(() => fx.ViewModel.SystemProxy, TimeSpan.FromSeconds(10));
+            await fx.DispatchAsync(() => fx.Robot.Click("SystemProxyCheck"));
+            await fx.WaitUntilAsync(() => !fx.ViewModel.SystemProxy, TimeSpan.FromSeconds(10));
+
+            fx.PathPicker.SavePath = cerPath;
+            await fx.DispatchAsync(() => fx.Robot.Click("MenuExportCa"));
+            await fx.WaitUntilAsync(
+                () => File.Exists(cerPath) || fx.ViewModel.StatusText.Contains("Exported CA", StringComparison.Ordinal),
+                TimeSpan.FromSeconds(10));
+
+            fx.Dialogs.DeviceCaSetupResult = false;
+            await fx.DispatchAsync(() => fx.Robot.Click("MenuDeviceCa"));
+            await fx.WaitUntilAsync(() => fx.Dialogs.DeviceCaSetupCalls >= 1, TimeSpan.FromSeconds(10));
+
+            await fx.DispatchAsync(() => fx.Robot.Click("MenuTrustFirefoxCa"));
+            await fx.WaitUntilAsync(
+                () => fx.ViewModel.StatusText.Contains("Firefox", StringComparison.OrdinalIgnoreCase)
+                      || fx.ViewModel.StatusText.Contains("certutil", StringComparison.OrdinalIgnoreCase)
+                      || fx.ViewModel.StatusText.Contains("Trust", StringComparison.OrdinalIgnoreCase),
+                TimeSpan.FromSeconds(15));
+
+            await fx.DispatchAsync(() => fx.Robot.Click("MenuLoopbackExempt"));
+            await fx.WaitUntilAsync(
+                () => fx.ViewModel.StatusText.Contains("Windows 8", StringComparison.OrdinalIgnoreCase)
+                      || fx.ViewModel.StatusText.Contains("Store app", StringComparison.OrdinalIgnoreCase)
+                      || fx.ViewModel.StatusText.Contains("Store apps unchanged", StringComparison.Ordinal),
+                TimeSpan.FromSeconds(8));
+
+            fx.Dialogs.RotateRootCaResult = true;
+            fx.Dialogs.InstallRootCaResult = true;
+            await fx.DispatchAsync(() => fx.Robot.Click("MenuRotateCa"));
+            // Do not wait for a Busy pulse — in-memory rotate can finish before the waiter starts.
+            await fx.WaitUntilAsync(
+                () => fx.Dialogs.RotateRootCaCalls >= 1
+                      && !fx.ViewModel.IsStatusBusy
+                      && !fx.ViewModel.DecryptHttps
+                      && fx.Interception.IsRootTrusted,
+                TimeSpan.FromSeconds(20));
+
+            await fx.DispatchAsync(() => fx.Robot.Click("MenuRemoveCa"));
+            await fx.WaitUntilAsync(
+                () => fx.Dialogs.RemoveRootCaCalls >= 1
+                      && !fx.ViewModel.IsStatusBusy
+                      && !fx.ViewModel.DecryptHttps
+                      && !fx.Interception.IsRootTrusted,
+                TimeSpan.FromSeconds(20));
+
+
+            // Tools: Map Remote pane + filters + Via header + inspect/composer leaves
+            await fx.DispatchAsync(() =>
+            {
+                fx.Robot.Click("MenuToolsMapRemote");
+                Assert.AreEqual(4, fx.ViewModel.SelectedToolsTabIndex);
+
+                var connect = fx.ViewModel.ConnectMethodRow;
+                Assert.IsNotNull(connect);
+                Assert.IsTrue(connect.IsChecked);
+                connect.IsChecked = false;
+                StringAssert.Contains(fx.ViewModel.SearchQuery, "-method:CONNECT");
+                connect.IsChecked = true;
+                Assert.IsFalse(fx.ViewModel.SearchQuery.Contains("-method:", StringComparison.Ordinal));
+                Assert.IsFalse(fx.ViewModel.HideTunnelsFilter);
+
+                var hideImages = fx.ViewModel.HideImagesFilter;
+                fx.Robot.SetCheck("HideImagesFilterCheck", !hideImages);
+                Assert.AreEqual(!hideImages, fx.ViewModel.HideImagesFilter);
+                fx.Robot.SetCheck("HideImagesFilterCheck", hideImages);
+
+                var errorsOnly = fx.ViewModel.ErrorsOnlyFilter;
+                fx.Robot.SetCheck("ErrorsOnlyFilterCheck", true);
+                Assert.IsTrue(fx.ViewModel.ErrorsOnlyFilter);
+                Assert.IsTrue(fx.ViewModel.HasActiveSearch);
+                var clearFilters = fx.Robot.Find<Avalonia.Controls.Button>("ClearFiltersButton");
+                Assert.IsTrue(clearFilters.IsEnabled);
+                fx.Robot.Click("ClearFiltersButton");
+                Assert.IsFalse(fx.ViewModel.HasActiveSearch);
+                Assert.IsFalse(clearFilters.IsEnabled);
+                fx.Robot.SetCheck("ErrorsOnlyFilterCheck", errorsOnly);
+
+                var via = fx.ViewModel.AddViaHeader;
+                fx.Robot.Click("MenuAddViaHeader");
+                Assert.AreEqual(!via, fx.ViewModel.AddViaHeader);
+                fx.Robot.Click("MenuAddViaHeader");
+            });
+
+            await ClickMenuAndDismissDialogAsync(fx, "MenuSessionRetention", "RetentionSave");
+            await ClickMenuAndDismissDialogAsync(fx, "MenuHttpsDecryptHosts", "ExcludedHostsSave");
+            await ClickMenuAndDismissDialogAsync(fx, "MenuLogging", "LoggingSave");
+
+            await fx.DispatchAsync(() =>
+            {
+                fx.Robot.Click("MenuToolsComposer");
+                fx.Robot.Click("ComposerLoad");
+                fx.Robot.Click("MenuToolsAutoResponder");
+                fx.Robot.Click("AutoResponderAdd");
+                fx.Robot.Click("MenuToolsMapRemote");
+                fx.Robot.Click("MapRemoteAdd");
+            });
+
+            await fx.DispatchAsync(() =>
+            {
+                fx.ViewModel.SeedSession(new SessionSnapshot
+                {
+                    Id = 99,
+                    Method = "POST",
+                    StatusCode = 200,
+                    Host = "menu.test",
+                    Url = "http://menu.test/body",
+                    Protocol = "HTTP/1.1",
+                    RequestBodyText = "request-body",
+                    ResponseBodyText = "response-body",
+                    RequestBodyCapture = BodyCaptureState.Complete,
+                    ResponseBodyCapture = BodyCaptureState.Complete,
+                });
+                var bodySession = fx.ViewModel.Sessions[^1];
+                SelectOneSession(fx, bodySession);
+                OpenSessionsContextMenu(fx);
+                fx.PathPicker.SavePath = Path.Combine(Path.GetTempPath(), "twp-body-" + Guid.NewGuid().ToString("N") + ".bin");
+                fx.Robot.Click("CtxSaveRequestBody");
+                OpenSessionsContextMenu(fx);
+                fx.Robot.Click("CtxSaveResponseBody");
+                Assert.IsTrue(fx.ViewModel.Sessions.Count >= 2, "Diff needs two seeded sessions");
+                fx.ViewModel.SetSelectedSessions([fx.ViewModel.Sessions[0], fx.ViewModel.Sessions[1]]);
+                OpenSessionsContextMenu(fx);
+                fx.Robot.Click("CtxDiffSessions");
+                fx.Robot.Click("TabRequest");
+                fx.Robot.SetCheck("BodyPretty", false);
+                fx.Robot.Click("CopyReqHeaders");
+            });
+            // Tools
+            await fx.DispatchAsync(() =>
+            {
+                fx.Robot.Click("MenuToolsComposer");
+                Assert.AreEqual(0, fx.ViewModel.SelectedToolsTabIndex);
+                fx.Robot.Click("MenuToolsBreakpoints");
+                Assert.AreEqual(1, fx.ViewModel.SelectedToolsTabIndex);
+                fx.Robot.Click("MenuToolsAutoResponder");
+                Assert.AreEqual(2, fx.ViewModel.SelectedToolsTabIndex);
+                fx.Robot.Click("MenuToolsScripts");
+                Assert.AreEqual(3, fx.ViewModel.SelectedToolsTabIndex);
+            });
+
+            // Options
+            await fx.DispatchAsync(() =>
+            {
+                fx.Robot.Click("MenuThemeLight");
+                Assert.IsTrue(fx.ViewModel.ThemeModeIsLight);
+                fx.Robot.Click("MenuThemeDark");
+                Assert.IsTrue(fx.ViewModel.ThemeModeIsDark);
+                fx.Robot.Click("MenuThemeAutomatic");
+                Assert.IsTrue(fx.ViewModel.ThemeModeIsAutomatic);
+
+                var ignore = fx.ViewModel.IgnoreServerCertificateErrors;
+                fx.Robot.Click("MenuIgnoreServerCertErrors");
+                Assert.AreEqual(!ignore, fx.ViewModel.IgnoreServerCertificateErrors);
+            });
+
+            await ClickMenuAndDismissDialogAsync(fx, "MenuSessionRetention", "RetentionCancel");
+            await fx.WaitUntilAsync(
+                () => fx.ViewModel.StatusText.Contains("retention", StringComparison.OrdinalIgnoreCase),
+                TimeSpan.FromSeconds(10));
+
+            // Status-bar session count opens the same dialog.
+            await ClickMenuAndDismissDialogAsync(fx, "SessionCountLink", "RetentionCancel");
+            await fx.WaitUntilAsync(
+                () => fx.ViewModel.StatusText.Contains("retention", StringComparison.OrdinalIgnoreCase),
+                TimeSpan.FromSeconds(10));
+
+            await ClickMenuAndDismissDialogAsync(fx, "MenuHttpsDecryptHosts", "ExcludedHostsCancel");
+            await fx.WaitUntilAsync(
+                () => fx.ViewModel.StatusText.Contains("Excluded hosts", StringComparison.OrdinalIgnoreCase),
+                TimeSpan.FromSeconds(10));
+
+            await ClickMenuAndDismissDialogAsync(fx, "MenuLogging", "LoggingCancel");
+            await fx.WaitUntilAsync(
+                () => fx.ViewModel.StatusText.Contains("Logging", StringComparison.OrdinalIgnoreCase),
+                TimeSpan.FromSeconds(10));
+
+            fx.Dialogs.ResetSettingsResult = true;
+            await fx.DispatchAsync(() => fx.Robot.Click("MenuResetSettings"));
+            await fx.WaitUntilAsync(() => fx.Dialogs.ResetSettingsCalls >= 1, TimeSpan.FromSeconds(10));
+
+            // Help
+            await fx.DispatchAsync(() =>
+            {
+                var check = fx.ViewModel.CheckForUpdatesOnStartup;
+                fx.Robot.Click("MenuCheckUpdatesOnStartup");
+                Assert.AreEqual(!check, fx.ViewModel.CheckForUpdatesOnStartup);
+                fx.Robot.Click("MenuUpdateChannelBeta");
+                Assert.IsTrue(fx.ViewModel.UpdateChannelIsBeta);
+                fx.Robot.Click("MenuUpdateChannelStable");
+                Assert.IsTrue(fx.ViewModel.UpdateChannelIsStable);
+            });
+
+            await fx.DispatchAsync(() => fx.Robot.Click("MenuCheckForUpdates"));
+            await fx.WaitUntilAsync(
+                () => !fx.ViewModel.StatusText.Contains("Checking for updates", StringComparison.Ordinal),
+                TimeSpan.FromSeconds(15));
+
+            await ClickMenuAndDismissDialogAsync(fx, "MenuAbout", "AboutOk");
+
+            await fx.DispatchAsync(() =>
+            {
+                if (fx.ViewModel.Sessions.Count == 0)
+                {
+                    fx.ViewModel.SeedSession(new SessionSnapshot
+                    {
+                        Id = 99,
+                        Method = "GET",
+                        StatusCode = 200,
+                        Host = "menu.test",
+                        Url = "http://menu.test/ctx",
+                        Protocol = "HTTP/1.1",
+                        ProcessName = "chrome",
+                    });
+                }
+
+                SelectOneSession(fx, fx.ViewModel.Sessions[0]);
+                OpenSessionsContextMenu(fx);
+                fx.Robot.Click("CtxCopyUrl");
+                OpenSessionsContextMenu(fx);
+                fx.Robot.Click("CtxCopyAsCurl");
+                OpenSessionsContextMenu(fx);
+                fx.Robot.Click("CtxCopyAsFetch");
+                OpenSessionsContextMenu(fx);
+                fx.Robot.Click("CtxFilterByHost");
+                OpenSessionsContextMenu(fx);
+                fx.Robot.Click("CtxFilterByProcess");
+                OpenSessionsContextMenu(fx);
+                var hideHost = fx.ViewModel.SelectedSession?.Host;
+                var hideProcess = fx.ViewModel.SelectedSession?.ProcessName;
+                fx.Robot.Click("CtxHideHost");
+                StringAssert.Contains(fx.ViewModel.SearchQuery, $"-host:{hideHost}");
+                // Hiding the only row empties the list, so clear the filters and reselect between steps.
+                fx.ViewModel.SearchQuery = "";
+                SelectOneSession(fx, fx.ViewModel.Sessions[0]);
+                OpenSessionsContextMenu(fx);
+                fx.Robot.Click("CtxHideProcess");
+                if (!string.IsNullOrWhiteSpace(hideProcess))
+                    StringAssert.Contains(fx.ViewModel.SearchQuery, "-process:" + hideProcess.Split(' ')[0]);
+                fx.ViewModel.SearchQuery = "";
+                SelectOneSession(fx, fx.ViewModel.Sessions[0]);
+                OpenSessionsContextMenu(fx);
+                fx.Robot.Click("CtxLoadComposer");
+                Assert.AreEqual(0, fx.ViewModel.SelectedToolsTabIndex);
+                OpenSessionsContextMenu(fx);
+                fx.Robot.Click("CtxReplay");
+            });
+
+            await fx.DispatchAsync(() =>
+            {
+                SelectOneSession(fx, fx.ViewModel.Sessions[0]);
+                Dispatcher.UIThread.Post(() => TryClickInOtherWindows(fx, "ExcludeHostCancel"), DispatcherPriority.Input);
+                OpenSessionsContextMenu(fx);
+                fx.Robot.Click("CtxExcludeHost");
+            });
+            await fx.WaitUntilAsync(
+                () =>
+                {
+                    if (!HasOtherWindows(fx))
+                        return true;
+                    TryClickInOtherWindows(fx, "ExcludeHostCancel");
+                    return !HasOtherWindows(fx);
+                },
+                TimeSpan.FromSeconds(10));
+
+            var saveBeforeCtxExport = 0;
+            await fx.DispatchAsync(() => saveBeforeCtxExport = fx.PathPicker.SaveCalls);
+            fx.PathPicker.SavePath = harPath;
+            await fx.DispatchAsync(() =>
+            {
+                SelectOneSession(fx, fx.ViewModel.Sessions[0]);
+                OpenSessionsContextMenu(fx);
+                fx.Robot.Click("CtxExportSelectedHar");
+            });
+            await fx.WaitUntilAsync(() => fx.PathPicker.SaveCalls > saveBeforeCtxExport, TimeSpan.FromSeconds(10));
+
+            await fx.DispatchAsync(() =>
+            {
+                SelectOneSession(fx, fx.ViewModel.Sessions[0]);
+                var before = fx.ViewModel.Sessions.Count;
+                OpenSessionsContextMenu(fx);
+                fx.Robot.Click("CtxRemoveSelected");
+                Assert.IsTrue(fx.ViewModel.Sessions.Count < before);
+
+                if (fx.ViewModel.HasSessions)
+                    fx.Robot.Click("MenuClearSessions");
+                Assert.AreEqual(0, fx.ViewModel.Sessions.Count);
+            });
+
+            await fx.DispatchAsync(async () =>
+            {
+                fx.Robot.Click("MenuStopCapture");
+                await InspectorUiRobot.WaitForAsync(() => !fx.Interception.IsRunning, TimeSpan.FromSeconds(10));
+            });
+        }
+        finally
+        {
+            TryDelete(harPath);
+            TryDelete(zipPath);
+            TryDelete(cerPath);
+        }
+    }
+
+    private static async Task ClickMenuAndDismissDialogAsync(
+        InspectorHeadlessFixture fx, string menuId, string dialogButtonId)
+    {
+        // Queue the dismiss before Execute so a nested ShowDialog dispatcher frame can
+        // still close the dialog (otherwise Headless RunJobs deadlocks on the modal).
+        await fx.DispatchAsync(() =>
+        {
+            Dispatcher.UIThread.Post(() => TryClickInOtherWindows(fx, dialogButtonId), DispatcherPriority.Input);
+            fx.Robot.Click(menuId);
+        });
+
+        await fx.WaitUntilAsync(
+            () =>
+            {
+                if (!HasOtherWindows(fx))
+                    return true;
+                TryClickInOtherWindows(fx, dialogButtonId);
+                return !HasOtherWindows(fx);
+            },
+            TimeSpan.FromSeconds(10));
+        Assert.IsFalse(
+            HasOtherWindows(fx),
+            $"Dialog still open after '{menuId}' (button '{dialogButtonId}'). Status={fx.ViewModel.StatusText}");
+    }
+
+    private static void SelectOneSession(InspectorHeadlessFixture fx, SessionSnapshot session)
+    {
+        fx.ViewModel.SelectedSession = session;
+        fx.ViewModel.SetSelectedSessions([session]);
+    }
+
+    private static void OpenSessionsContextMenu(InspectorHeadlessFixture fx)
+    {
+        Assert.IsTrue(fx.Robot.TryFind<Avalonia.Controls.DataGrid>("SessionsGrid", out var grid) && grid is not null);
+        Assert.IsNotNull(grid.ContextMenu);
+        grid.ContextMenu.Open(grid);
+        Dispatcher.UIThread.RunJobs();
+    }
+
+    private static bool HasOtherWindows(InspectorHeadlessFixture fx) =>
+        OtherWindows(fx).Any();
+
+    private static bool TryClickInOtherWindows(InspectorHeadlessFixture fx, string automationId)
+    {
+        foreach (var window in OtherWindows(fx))
+        {
+            var robot = new InspectorUiRobot(window);
+            if (!robot.TryFind<Control>(automationId, out _))
+                continue;
+            robot.Click(automationId);
+            return true;
+        }
+
+        return false;
+    }
+
+    private static IEnumerable<Window> OtherWindows(InspectorHeadlessFixture fx)
+    {
+        var seen = new HashSet<Window>();
+        if (Avalonia.Application.Current?.ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
+        {
+            foreach (var window in desktop.Windows)
+            {
+                if (!ReferenceEquals(window, fx.Window) && seen.Add(window))
+                    yield return window;
+            }
+        }
+
+        foreach (var window in fx.Window.OwnedWindows)
+        {
+            if (seen.Add(window))
+                yield return window;
+        }
+    }
+
+    [TestMethod]
+    [TestCategory("E2E-UI-Headless")]
+    public async Task CaptureMenu_DropsToolbarDuplicates_AndGroupsRootCertificate()
+    {
+        await using var fx = new InspectorHeadlessFixture();
+        await fx.StartAsync();
+        await fx.DispatchAsync(() =>
+        {
+            Assert.IsFalse(fx.Robot.TryFind<Control>("MenuDecryptHttps", out _));
+            Assert.IsFalse(fx.Robot.TryFind<Control>("MenuToggleSystemProxy", out _));
+            var root = fx.Robot.Find<MenuItem>("MenuRootCertificate");
+            foreach (var id in RootCertificateMenuIds)
+            {
+                var item = fx.Robot.Find<MenuItem>(id);
+                Assert.IsTrue(
+                    IsDescendantOf(item, root),
+                    id + " must be under MenuRootCertificate");
+            }
+        });
+    }
+
+    private static bool IsDescendantOf(Control child, Control ancestor)
+    {
+        for (Avalonia.LogicalTree.ILogical? current = child;
+             current is not null;
+             current = current.LogicalParent)
+        {
+            if (ReferenceEquals(current, ancestor))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static void TryDelete(string path)
+    {
+        try { File.Delete(path); } catch { /* ignore */ }
+    }
+}

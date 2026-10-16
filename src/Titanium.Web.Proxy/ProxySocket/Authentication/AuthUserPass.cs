@@ -32,6 +32,7 @@ using System;
 using System.Buffers;
 using System.Net.Sockets;
 using System.Text;
+using Titanium.Web.Proxy.Diagnostics;
 
 namespace Titanium.Web.Proxy.ProxySocket.Authentication;
 
@@ -41,11 +42,11 @@ namespace Titanium.Web.Proxy.ProxySocket.Authentication;
 internal sealed class AuthUserPass : AuthMethod
 {
     /// <summary>Holds the value of the Password property.</summary>
-    private string password;
+    private string password = string.Empty;
 
     // private variables
     /// <summary>Holds the value of the Username property.</summary>
-    private string username;
+    private string username = string.Empty;
 
     /// <summary>
     ///     Initializes a new AuthUserPass instance.
@@ -68,7 +69,7 @@ internal sealed class AuthUserPass : AuthMethod
     private string Username
     {
         get => username;
-        set => username = value ?? throw new ArgumentNullException();
+        set => username = value ?? throw new ArgumentNullException(nameof(value));
     }
 
     /// <summary>
@@ -79,7 +80,7 @@ internal sealed class AuthUserPass : AuthMethod
     private string Password
     {
         get => password;
-        set => password = value ?? throw new ArgumentNullException();
+        set => password = value ?? throw new ArgumentNullException(nameof(value));
     }
 
     /// <summary>
@@ -103,40 +104,6 @@ internal sealed class AuthUserPass : AuthMethod
     private int GetAuthenticationLength()
     {
         return 3 + Username.Length + Password.Length;
-    }
-
-    /// <summary>
-    ///     Starts the authentication process.
-    /// </summary>
-    public override void Authenticate()
-    {
-        var length = GetAuthenticationLength();
-        var buffer = ArrayPool<byte>.Shared.Rent(length);
-        try
-        {
-            GetAuthenticationBytes(buffer);
-            if (Server.Send(buffer, 0, length, SocketFlags.None) < length) throw new SocketException(10054);
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(buffer);
-        }
-
-        var received = 0;
-        while (received != 2)
-        {
-            var recv = Server.Receive(buffer, received, 2 - received, SocketFlags.None);
-            if (recv == 0)
-                throw new SocketException(10054);
-
-            received += recv;
-        }
-
-        if (buffer[1] != 0)
-        {
-            Server.Close();
-            throw new ProxyException("Username/password combination rejected.");
-        }
     }
 
     /// <summary>
@@ -201,7 +168,12 @@ internal sealed class AuthUserPass : AuthMethod
 
     private void OnCallBack(Exception? exception)
     {
-        ArrayPool<byte>.Shared.Return(Buffer);
+        // This buffer held the RFC 1929 username/password subnegotiation packet - the plaintext
+        // proxy password in the clear. Returning it to the shared pool without clearing it first
+        // would leave that plaintext sitting in a buffer any unrelated caller could rent next and,
+        // depending on how much of it they actually overwrite before reading, potentially observe.
+        ArrayPool<byte>.Shared.Return(TakeBuffer(), clearArray: true);
+        if (exception == null) ProxyMetrics.AuthRoundCompleted("socks5-userpass");
         CallBack(exception);
     }
 }

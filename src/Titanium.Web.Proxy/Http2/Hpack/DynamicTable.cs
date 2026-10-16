@@ -20,13 +20,13 @@ using Titanium.Web.Proxy.Models;
 
 namespace Titanium.Web.Proxy.Http2.Hpack;
 
-public class DynamicTable
+internal class DynamicTable
 {
     // a circular queue of header fields
 #if NET451 || NET45
-    private HttpHeader[] headerFields = new HttpHeader[0];
+    private HttpHeader?[] headerFields = new HttpHeader?[0];
 #else
-        HttpHeader[] headerFields = Array.Empty<HttpHeader>();
+    private HttpHeader?[] headerFields = Array.Empty<HttpHeader?>();
 #endif
     private int head;
     private int tail;
@@ -81,12 +81,13 @@ public class DynamicTable
     /// <param name="index">Index.</param>
     public HttpHeader GetEntry(int index)
     {
-        if (index <= 0 || index > Length()) throw new IndexOutOfRangeException();
+        if (index <= 0 || index > Length()) throw new ArgumentOutOfRangeException(nameof(index));
 
         var i = head - index;
-        if (i < 0) return headerFields[i + headerFields.Length]!;
+        if (i < 0) i += headerFields.Length;
 
-        return headerFields[i]!;
+        return headerFields[i] ??
+               throw new InvalidOperationException("The HPACK dynamic table contains an empty active entry.");
     }
 
     /// <summary>
@@ -122,7 +123,7 @@ public class DynamicTable
         if (removed == null) return null;
 
         Size -= removed.Size;
-        headerFields[tail++] = null!;
+        headerFields[tail++] = null;
         if (tail == headerFields.Length) tail = 0;
 
         return removed;
@@ -135,7 +136,7 @@ public class DynamicTable
     {
         while (tail != head)
         {
-            headerFields[tail++] = null!;
+            headerFields[tail++] = null;
             if (tail == headerFields.Length) tail = 0;
         }
 
@@ -170,17 +171,18 @@ public class DynamicTable
         if (capacity % HttpHeader.HttpHeaderOverhead != 0) maxEntries++;
 
         // check if capacity change requires us to reallocate the array
-        if (headerFields != null && headerFields.Length == maxEntries) return;
+        if (headerFields.Length == maxEntries) return;
 
-        var tmp = new HttpHeader[maxEntries];
+        var tmp = new HttpHeader?[maxEntries];
 
         // initially length will be 0 so there will be no copy
         var len = Length();
         var cursor = tail;
         for (var i = 0; i < len; i++)
         {
-            var entry = headerFields![cursor++];
-            tmp[i] = entry!;
+            var entry = headerFields[cursor++];
+            tmp[i] = entry ??
+                     throw new InvalidOperationException("The HPACK dynamic table contains an empty active entry.");
             if (cursor == headerFields.Length) cursor = 0;
         }
 

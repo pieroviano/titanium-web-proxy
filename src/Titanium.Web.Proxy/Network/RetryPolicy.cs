@@ -1,15 +1,22 @@
 ﻿using System;
 using System.Threading.Tasks;
+using Titanium.Web.Proxy.Diagnostics;
+using Titanium.Web.Proxy.Logging;
 using Titanium.Web.Proxy.Network.Tcp;
 
 namespace Titanium.Web.Proxy.Network;
 
+/// <summary>
+///     Retries an action on a fresh server connection when a typed failure is thrown.
+///     Exception-performance Ship 4 gate: do not result-shape this path until an origin/stale-pool
+///     load repro shows <c>RetryPolicy caught candidate for retry</c> / first-chance
+///     <c>RetryableServerConnectionException</c> volume is hot. Closing the browser is the wrong
+///     stimulus; use forced origin idle-close (see StaleKeepAliveTests) instead.
+/// </summary>
 internal class RetryPolicy<T> where T : Exception
 {
     private readonly int retries;
     private readonly TcpConnectionFactory tcpConnectionFactory;
-
-    private TcpServerConnection? currentConnection;
 
     internal RetryPolicy(int retries, TcpConnectionFactory tcpConnectionFactory)
     {
@@ -27,7 +34,7 @@ internal class RetryPolicy<T> where T : Exception
     internal async Task<RetryResult> ExecuteAsync(Func<TcpServerConnection, Task<bool>> action,
         Func<Task<TcpServerConnection>> generator, TcpServerConnection? initialConnection)
     {
-        currentConnection = initialConnection;
+        var currentConnection = initialConnection;
         var @continue = true;
         Exception? exception = null;
 
@@ -44,6 +51,8 @@ internal class RetryPolicy<T> where T : Exception
             }
             catch (Exception ex)
             {
+                ProxyDiagnostics.ReportCaught(ProxyDiagnostics.Logger,
+                    "RetryPolicy caught candidate for retry", ex);
                 exception = ex;
             }
 
@@ -52,6 +61,7 @@ internal class RetryPolicy<T> where T : Exception
             if (attempts < 0 || exception == null || !(exception is T)) break;
 
             exception = null;
+            ProxyMetrics.PoolRetried();
 
             // before retry clear connection
             await tcpConnectionFactory.Release(currentConnection, true);

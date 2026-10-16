@@ -17,8 +17,10 @@ namespace Titanium.Web.Proxy.Exceptions
         {
         }
 
+#pragma warning disable SYSLIB0051 // Formatter-based serialization is obsolete; the ctor is kept for binary-compatibility with consumers that still deserialize this exception.
         protected TitaniumException(SerializationInfo info, StreamingContext context) : base(info, context)
         {
         }
+#pragma warning restore SYSLIB0051
     }
 }

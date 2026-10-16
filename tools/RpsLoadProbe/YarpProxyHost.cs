@@ -1,0 +1,529 @@
+using System.Net;
+using System.Net.Security;
+using System.Net.Sockets;
+using System.Reflection;
+using System.Security.Authentication;
+using System.Security.Cryptography.X509Certificates;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Server.Kestrel.Core;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Yarp.ReverseProxy.Configuration;
+using Yarp.ReverseProxy.Forwarder;
+using Titanium.Web.Proxy.RpsLoadProbe.Support;
+
+namespace Titanium.Web.Proxy.RpsLoadProbe;
+
+/// <summary>
+/// Minimal managed reverse peer against the shared loopback origin.
+/// Process-split from managed origin server (via --serve-proxy) for fair compare with native reverse peer/TWP.
+/// </summary>
+internal sealed class YarpProxyHost : IDisposable
+{
+    private readonly WebApplication app;
+    private readonly X509Certificate2? serverCertificate;
+
+    public int Port { get; }
+    public string ListenUrl { get; }
+    public string Version { get; }
+
+    private YarpProxyHost(WebApplication app, int port, string listenUrl, X509Certificate2? serverCertificate)
+    {
+        this.app = app;
+        this.serverCertificate = serverCertificate;
+        Port = port;
+        ListenUrl = listenUrl;
+        Version = ResolveVersion();
+    }
+
+    public static string ResolveVersion()
+    {
+        var asm = typeof(IProxyConfigProvider).Assembly;
+        var info = asm.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+                   ?? asm.GetName().Version?.ToString()
+                   ?? "unknown";
+        var plus = info.IndexOf('+');
+        if (plus > 0)
+            info = info[..plus];
+        return "YARP " + info;
+    }
+
+    /// <summary>H1 cleartext → H1 cleartext.</summary>
+    public static Task<YarpProxyHost> StartHttp1Async(int originHttpPort) =>
+        StartAsync(new YarpListenOptions
+        {
+            UseTls = false,
+            InboundProtocols = HttpProtocols.Http1,
+            DestinationAddress = $"http://127.0.0.1:{originHttpPort}/",
+            OutboundVersion = HttpVersion.Version11,
+            OutboundVersionPolicy = HttpVersionPolicy.RequestVersionExact
+        });
+
+    /// <summary>H1 TLS terminate → H1 cleartext.</summary>
+    public static Task<YarpProxyHost> StartHttp1TlsAsync(int originHttpPort) =>
+        StartAsync(new YarpListenOptions
+        {
+            UseTls = true,
+            InboundProtocols = HttpProtocols.Http1,
+            DestinationAddress = $"http://127.0.0.1:{originHttpPort}/",
+            OutboundVersion = HttpVersion.Version11,
+            OutboundVersionPolicy = HttpVersionPolicy.RequestVersionExact
+        });
+
+    /// <summary>H1 cleartext → HTTPS HTTP/1 origin.</summary>
+    public static Task<YarpProxyHost> StartHttp1ToHttpsAsync(int originHttpsPort) =>
+        StartAsync(new YarpListenOptions
+        {
+            UseTls = false,
+            InboundProtocols = HttpProtocols.Http1,
+            DestinationAddress = $"https://127.0.0.1:{originHttpsPort}/",
+            OutboundVersion = HttpVersion.Version11,
+            OutboundVersionPolicy = HttpVersionPolicy.RequestVersionExact,
+            AcceptAnyServerCertificate = true
+        });
+
+    /// <summary>H2 TLS → HTTPS HTTP/2 origin.</summary>
+    public static Task<YarpProxyHost> StartHttp2ToHttpsAsync(int originHttpsPort) =>
+        StartAsync(new YarpListenOptions
+        {
+            UseTls = true,
+            InboundProtocols = HttpProtocols.Http1AndHttp2,
+            DestinationAddress = $"https://127.0.0.1:{originHttpsPort}/",
+            OutboundVersion = HttpVersion.Version20,
+            OutboundVersionPolicy = HttpVersionPolicy.RequestVersionExact,
+            AcceptAnyServerCertificate = true
+        });
+
+    /// <summary>H2 TLS → H1 cleartext (native reverse peer parity).</summary>
+    public static Task<YarpProxyHost> StartHttp2ToH1Async(int originHttpPort) =>
+        StartAsync(new YarpListenOptions
+        {
+            UseTls = true,
+            InboundProtocols = HttpProtocols.Http1AndHttp2,
+            DestinationAddress = $"http://127.0.0.1:{originHttpPort}/",
+            OutboundVersion = HttpVersion.Version11,
+            OutboundVersionPolicy = HttpVersionPolicy.RequestVersionExact
+        });
+
+    /// <summary>H2 TLS → prior-knowledge h2c.</summary>
+    public static Task<YarpProxyHost> StartHttp2ToH2cAsync(int originHttpPort) =>
+        StartAsync(new YarpListenOptions
+        {
+            UseTls = true,
+            InboundProtocols = HttpProtocols.Http1AndHttp2,
+            DestinationAddress = $"http://127.0.0.1:{originHttpPort}/",
+            OutboundVersion = HttpVersion.Version20,
+            OutboundVersionPolicy = HttpVersionPolicy.RequestVersionExact
+        });
+
+    /// <summary>h2c → H1 cleartext.</summary>
+    public static Task<YarpProxyHost> StartH2cToH1Async(int originHttpPort) =>
+        StartAsync(new YarpListenOptions
+        {
+            UseTls = false,
+            InboundProtocols = HttpProtocols.Http2,
+            DestinationAddress = $"http://127.0.0.1:{originHttpPort}/",
+            OutboundVersion = HttpVersion.Version11,
+            OutboundVersionPolicy = HttpVersionPolicy.RequestVersionExact
+        });
+
+    /// <summary>h2c → h2c.</summary>
+    public static Task<YarpProxyHost> StartH2cToH2cAsync(int originHttpPort) =>
+        StartAsync(new YarpListenOptions
+        {
+            UseTls = false,
+            InboundProtocols = HttpProtocols.Http2,
+            DestinationAddress = $"http://127.0.0.1:{originHttpPort}/",
+            OutboundVersion = HttpVersion.Version20,
+            OutboundVersionPolicy = HttpVersionPolicy.RequestVersionExact
+        });
+
+    /// <summary>h2c → HTTPS h2.</summary>
+    public static Task<YarpProxyHost> StartH2cToHttpsAsync(int originHttpsPort) =>
+        StartAsync(new YarpListenOptions
+        {
+            UseTls = false,
+            InboundProtocols = HttpProtocols.Http2,
+            DestinationAddress = $"https://127.0.0.1:{originHttpsPort}/",
+            OutboundVersion = HttpVersion.Version20,
+            OutboundVersionPolicy = HttpVersionPolicy.RequestVersionExact,
+            AcceptAnyServerCertificate = true
+        });
+
+    /// <summary>h2c → HTTP/3 origin.</summary>
+    public static Task<YarpProxyHost> StartH2cToHttp3Async(int originQuicPort) =>
+        StartAsync(new YarpListenOptions
+        {
+            UseTls = false,
+            InboundProtocols = HttpProtocols.Http2,
+            DestinationAddress = Http3OriginAddress(originQuicPort),
+            OutboundVersion = HttpVersion.Version30,
+            OutboundVersionPolicy = HttpVersionPolicy.RequestVersionExact,
+            AcceptAnyServerCertificate = true
+        });
+
+    /// <summary>H3 → H1 cleartext. Client uses quic-http3 (matched with TWP TransparentQuic arms).</summary>
+    public static Task<YarpProxyHost> StartHttp3CleartextAsync(int originHttpPort) =>
+        StartAsync(new YarpListenOptions
+        {
+            UseTls = true,
+            InboundProtocols = HttpProtocols.Http1AndHttp2AndHttp3,
+            DestinationAddress = $"http://127.0.0.1:{originHttpPort}/",
+            OutboundVersion = HttpVersion.Version11,
+            OutboundVersionPolicy = HttpVersionPolicy.RequestVersionExact
+        });
+
+    /// <summary>H1 TLS → HTTPS h2.</summary>
+    public static Task<YarpProxyHost> StartHttp1ToHttp2Async(int originHttpsPort) =>
+        StartAsync(new YarpListenOptions
+        {
+            UseTls = true,
+            InboundProtocols = HttpProtocols.Http1,
+            DestinationAddress = $"https://127.0.0.1:{originHttpsPort}/",
+            OutboundVersion = HttpVersion.Version20,
+            OutboundVersionPolicy = HttpVersionPolicy.RequestVersionExact,
+            AcceptAnyServerCertificate = true
+        });
+
+    /// <summary>H1 TLS → HTTP/3 origin.</summary>
+    public static Task<YarpProxyHost> StartHttp1ToHttp3Async(int originQuicPort) =>
+        StartAsync(new YarpListenOptions
+        {
+            UseTls = true,
+            InboundProtocols = HttpProtocols.Http1,
+            DestinationAddress = Http3OriginAddress(originQuicPort),
+            OutboundVersion = HttpVersion.Version30,
+            OutboundVersionPolicy = HttpVersionPolicy.RequestVersionExact,
+            AcceptAnyServerCertificate = true
+        });
+
+    /// <summary>H2 TLS → HTTP/3 origin.</summary>
+    public static Task<YarpProxyHost> StartHttp2ToHttp3Async(int originQuicPort) =>
+        StartAsync(new YarpListenOptions
+        {
+            UseTls = true,
+            InboundProtocols = HttpProtocols.Http1AndHttp2,
+            DestinationAddress = Http3OriginAddress(originQuicPort),
+            OutboundVersion = HttpVersion.Version30,
+            OutboundVersionPolicy = HttpVersionPolicy.RequestVersionExact,
+            AcceptAnyServerCertificate = true
+        });
+
+    /// <summary>H3 → HTTPS h2.</summary>
+    public static Task<YarpProxyHost> StartHttp3ToHttp2Async(int originHttpsPort) =>
+        StartAsync(new YarpListenOptions
+        {
+            UseTls = true,
+            InboundProtocols = HttpProtocols.Http1AndHttp2AndHttp3,
+            DestinationAddress = $"https://127.0.0.1:{originHttpsPort}/",
+            OutboundVersion = HttpVersion.Version20,
+            OutboundVersionPolicy = HttpVersionPolicy.RequestVersionExact,
+            AcceptAnyServerCertificate = true
+        });
+
+    /// <summary>H3 → prior-knowledge h2c.</summary>
+    public static Task<YarpProxyHost> StartHttp3ToH2cAsync(int originHttpPort) =>
+        StartAsync(new YarpListenOptions
+        {
+            UseTls = true,
+            InboundProtocols = HttpProtocols.Http1AndHttp2AndHttp3,
+            DestinationAddress = $"http://127.0.0.1:{originHttpPort}/",
+            OutboundVersion = HttpVersion.Version20,
+            OutboundVersionPolicy = HttpVersionPolicy.RequestVersionExact
+        });
+
+    /// <summary>H1 TLS → prior-knowledge h2c.</summary>
+    public static Task<YarpProxyHost> StartHttp1ToH2cAsync(int originHttpPort) =>
+        StartAsync(new YarpListenOptions
+        {
+            UseTls = true,
+            InboundProtocols = HttpProtocols.Http1,
+            DestinationAddress = $"http://127.0.0.1:{originHttpPort}/",
+            OutboundVersion = HttpVersion.Version20,
+            OutboundVersionPolicy = HttpVersionPolicy.RequestVersionExact
+        });
+
+    /// <summary>H1 plain → prior-knowledge h2c.</summary>
+    public static Task<YarpProxyHost> StartHttp1PlainToH2cAsync(int originHttpPort) =>
+        StartAsync(new YarpListenOptions
+        {
+            UseTls = false,
+            InboundProtocols = HttpProtocols.Http1,
+            DestinationAddress = $"http://127.0.0.1:{originHttpPort}/",
+            OutboundVersion = HttpVersion.Version20,
+            OutboundVersionPolicy = HttpVersionPolicy.RequestVersionExact
+        });
+
+    /// <summary>H1 plain → HTTPS h2.</summary>
+    public static Task<YarpProxyHost> StartHttp1PlainToHttp2Async(int originHttpsPort) =>
+        StartAsync(new YarpListenOptions
+        {
+            UseTls = false,
+            InboundProtocols = HttpProtocols.Http1,
+            DestinationAddress = $"https://127.0.0.1:{originHttpsPort}/",
+            OutboundVersion = HttpVersion.Version20,
+            OutboundVersionPolicy = HttpVersionPolicy.RequestVersionExact,
+            AcceptAnyServerCertificate = true
+        });
+
+    /// <summary>H1 plain → HTTP/3 origin.</summary>
+    public static Task<YarpProxyHost> StartHttp1PlainToHttp3Async(int originQuicPort) =>
+        StartAsync(new YarpListenOptions
+        {
+            UseTls = false,
+            InboundProtocols = HttpProtocols.Http1,
+            DestinationAddress = Http3OriginAddress(originQuicPort),
+            OutboundVersion = HttpVersion.Version30,
+            OutboundVersionPolicy = HttpVersionPolicy.RequestVersionExact,
+            AcceptAnyServerCertificate = true
+        });
+
+    /// <summary>h2c → HTTPS HTTP/1.</summary>
+    public static Task<YarpProxyHost> StartH2cToHttpsHttp1Async(int originHttpsPort) =>
+        StartAsync(new YarpListenOptions
+        {
+            UseTls = false,
+            InboundProtocols = HttpProtocols.Http2,
+            DestinationAddress = $"https://127.0.0.1:{originHttpsPort}/",
+            OutboundVersion = HttpVersion.Version11,
+            OutboundVersionPolicy = HttpVersionPolicy.RequestVersionExact,
+            AcceptAnyServerCertificate = true
+        });
+
+    /// <summary>H1 TLS → HTTPS HTTP/1 (dual-crypto).</summary>
+    public static Task<YarpProxyHost> StartHttp1TlsToHttpsAsync(int originHttpsPort) =>
+        StartAsync(new YarpListenOptions
+        {
+            UseTls = true,
+            InboundProtocols = HttpProtocols.Http1,
+            DestinationAddress = $"https://127.0.0.1:{originHttpsPort}/",
+            OutboundVersion = HttpVersion.Version11,
+            OutboundVersionPolicy = HttpVersionPolicy.RequestVersionExact,
+            AcceptAnyServerCertificate = true
+        });
+
+    /// <summary>H2 TLS → HTTPS HTTP/1.</summary>
+    public static Task<YarpProxyHost> StartHttp2ToHttpsHttp1Async(int originHttpsPort) =>
+        StartAsync(new YarpListenOptions
+        {
+            UseTls = true,
+            InboundProtocols = HttpProtocols.Http1AndHttp2,
+            DestinationAddress = $"https://127.0.0.1:{originHttpsPort}/",
+            OutboundVersion = HttpVersion.Version11,
+            OutboundVersionPolicy = HttpVersionPolicy.RequestVersionExact,
+            AcceptAnyServerCertificate = true
+        });
+
+    /// <summary>H3 → HTTPS HTTP/1.</summary>
+    public static Task<YarpProxyHost> StartHttp3ToHttpsHttp1Async(int originHttpsPort) =>
+        StartAsync(new YarpListenOptions
+        {
+            UseTls = true,
+            InboundProtocols = HttpProtocols.Http1AndHttp2AndHttp3,
+            DestinationAddress = $"https://127.0.0.1:{originHttpsPort}/",
+            OutboundVersion = HttpVersion.Version11,
+            OutboundVersionPolicy = HttpVersionPolicy.RequestVersionExact,
+            AcceptAnyServerCertificate = true
+        });
+
+    /// <summary>H3 → HTTP/3 origin.</summary>
+    public static Task<YarpProxyHost> StartHttp3ToHttp3Async(int originQuicPort) =>
+        StartAsync(new YarpListenOptions
+        {
+            UseTls = true,
+            InboundProtocols = HttpProtocols.Http1AndHttp2AndHttp3,
+            DestinationAddress = Http3OriginAddress(originQuicPort),
+            OutboundVersion = HttpVersion.Version30,
+            OutboundVersionPolicy = HttpVersionPolicy.RequestVersionExact,
+            AcceptAnyServerCertificate = true
+        });
+
+    /// <summary>
+    ///     Darwin/MsQuic HttpClient H3 to an IP literal often fails SNI (same class as inbound
+    ///     ListenUrl using localhost). TWP H3 origin arms already use ForwardHost=localhost.
+    /// </summary>
+    private static string Http3OriginAddress(int originQuicPort) =>
+        $"https://localhost:{originQuicPort}/";
+
+    private sealed class YarpListenOptions
+    {
+        public bool UseTls { get; init; }
+        public HttpProtocols InboundProtocols { get; init; }
+        public required string DestinationAddress { get; init; }
+        public required Version OutboundVersion { get; init; }
+        public HttpVersionPolicy OutboundVersionPolicy { get; init; }
+        public bool AcceptAnyServerCertificate { get; init; }
+    }
+
+    private static async Task<YarpProxyHost> StartAsync(YarpListenOptions options)
+    {
+        var port = GetFreeDualStackPort();
+        X509Certificate2? cert = null;
+        if (options.UseTls)
+            cert = LoopbackCertificateAuthority.ServerCertificate;
+
+        var builder = WebApplication.CreateBuilder(new WebApplicationOptions
+        {
+            EnvironmentName = Environments.Production
+        });
+        builder.Logging.ClearProviders();
+        builder.Logging.SetMinimumLevel(LogLevel.Warning);
+        // Prevent default http://localhost:5000 from colliding with our Listen() port
+        // (HTTP/3 especially fails hard when the host tries both default and explicit Listen() ports).
+        builder.WebHost.UseUrls();
+
+        builder.WebHost.ConfigureKestrel(kestrel =>
+        {
+            kestrel.Limits.MaxRequestBodySize = 10 * 1024 * 1024;
+            // HttpClient "localhost" prefers ::1; IPv4-only loopback surfaces as an ALPN failure.
+            // Bind both loopback families. ListenAnyIP (0.0.0.0 and ::) prompts Windows Defender Firewall.
+            void ConfigureListen(Microsoft.AspNetCore.Server.Kestrel.Core.ListenOptions listen)
+            {
+                listen.Protocols = options.InboundProtocols;
+                if (options.UseTls)
+                {
+                    listen.UseHttps(https =>
+                    {
+                        https.ServerCertificate = cert!;
+                        // HTTP/3 needs TLS 1.3; keep 1.2 for H1/H2 terminate arms.
+                        https.SslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13;
+                    });
+                }
+            }
+
+            if (options.InboundProtocols.HasFlag(HttpProtocols.Http3) && Socket.OSSupportsIPv6)
+                kestrel.Listen(IPAddress.IPv6Loopback, port, ConfigureListen);
+            kestrel.Listen(IPAddress.Loopback, port, ConfigureListen);
+        });
+
+        var routes = new[]
+        {
+            new RouteConfig
+            {
+                RouteId = "catch-all",
+                ClusterId = "origin",
+                Match = new RouteMatch { Path = "{**catch-all}" }
+            }
+        };
+        var clusters = new[]
+        {
+            new ClusterConfig
+            {
+                ClusterId = "origin",
+                Destinations = new Dictionary<string, DestinationConfig>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["d1"] = new DestinationConfig { Address = options.DestinationAddress }
+                },
+                HttpRequest = new ForwarderRequestConfig
+                {
+                    Version = options.OutboundVersion,
+                    VersionPolicy = options.OutboundVersionPolicy,
+                    ActivityTimeout = TimeSpan.FromSeconds(100)
+                },
+                HttpClient = options.AcceptAnyServerCertificate
+                    ? new HttpClientConfig
+                    {
+                        DangerousAcceptAnyServerCertificate = true,
+                        MaxConnectionsPerServer = 256,
+                        EnableMultipleHttp2Connections = true
+                    }
+                    : new HttpClientConfig
+                    {
+                        MaxConnectionsPerServer = 256,
+                        EnableMultipleHttp2Connections = true
+                    }
+            }
+        };
+
+        builder.Services.AddReverseProxy().LoadFromMemory(routes, clusters);
+
+        var app = builder.Build();
+        app.MapReverseProxy();
+        await app.StartAsync();
+
+        var scheme = options.UseTls ? "https" : "http";
+        // HttpClient H3 + IP literals often fails SNI; match TWP dual-listen ListenUrl host.
+        var host = options.InboundProtocols.HasFlag(HttpProtocols.Http3) ? "localhost" : "127.0.0.1";
+        return new YarpProxyHost(app, port, $"{scheme}://{host}:{port}/", cert);
+    }
+
+    public void Dispose()
+    {
+        try
+        {
+            app.StopAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult();
+        }
+        catch
+        {
+            // best effort
+        }
+
+        app.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        serverCertificate?.Dispose();
+    }
+
+    private static int GetFreeTcpPort()
+    {
+        var listener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        listener.Stop();
+        return port;
+    }
+
+    /// <summary>
+    ///     Pick a port free for both TCP and UDP. Kestrel H3 binds MsQuic on the same port; Windows
+    ///     TCP/UDP namespaces are independent so a TCP-only pick can fail QUIC with WSAEADDRINUSE.
+    /// </summary>
+    private static int GetFreeDualStackPort()
+    {
+        for (var i = 0; i < 20; i++)
+        {
+            var port = GetFreeTcpPort();
+            if (IsUdpPortFree(port) && IsIpv6TcpPortFree(port))
+                return port;
+        }
+
+        return GetFreeTcpPort();
+    }
+
+    private static bool IsUdpPortFree(int port)
+    {
+        try
+        {
+            // Probe the addresses we listen on. Binding 0.0.0.0 or :: is an inbound listen and
+            // prompts Windows Defender Firewall for this process.
+            using var v4 = new UdpClient(new IPEndPoint(IPAddress.Loopback, port));
+            if (Socket.OSSupportsIPv6)
+            {
+                using var v6 = new UdpClient(new IPEndPoint(IPAddress.IPv6Loopback, port));
+            }
+
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool IsIpv6TcpPortFree(int port)
+    {
+        if (!Socket.OSSupportsIPv6)
+            return true;
+
+        try
+        {
+            var listener = new TcpListener(IPAddress.IPv6Loopback, port);
+            listener.Start();
+            listener.Stop();
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+}

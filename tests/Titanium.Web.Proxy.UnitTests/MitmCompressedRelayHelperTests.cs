@@ -1,0 +1,341 @@
+using System;
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+using Titanium.Web.Proxy.Helpers;
+using Titanium.Web.Proxy.Http;
+
+namespace Titanium.Web.Proxy.UnitTests;
+
+[TestClass]
+public class MitmCompressedRelayHelperTests
+{
+    [TestMethod]
+    public void Unchanged_AllowsRelay_WithoutSnapshotDiff()
+    {
+        var headers = new HeaderCollection();
+        headers.AddHeader("accept", "text/html");
+        var baseline = MitmCompressedRelayHelper.HeaderRelayBaseline.Capture(headers);
+
+        Assert.IsTrue(MitmCompressedRelayHelper.AllowsCompressedRelay(
+            baseline, headers, MitmCompressedRelayHelper.DefaultMaxAppendHeaders, out var added));
+        Assert.AreEqual(0, added.Count);
+    }
+
+    [TestMethod]
+    public void AppendOneUniqueHeader_AllowsRelay()
+    {
+        var before = new HeaderCollection();
+        before.AddHeader("accept", "text/html");
+        var baseline = MitmCompressedRelayHelper.HeaderRelayBaseline.Capture(before);
+
+        var after = new HeaderCollection();
+        after.AddHeader("accept", "text/html");
+        after.AddHeader("X-Tracking-Id", "abc");
+
+        Assert.IsTrue(MitmCompressedRelayHelper.AllowsCompressedRelay(
+            baseline, after, MitmCompressedRelayHelper.DefaultMaxAppendHeaders, out var added));
+        Assert.AreEqual(1, added.Count);
+        Assert.AreEqual("X-Tracking-Id", added[0].Name);
+        Assert.AreEqual("abc", added[0].Value);
+    }
+
+    [TestMethod]
+    public void AppendTwoUniqueHeaders_AllowsRelay()
+    {
+        var before = new HeaderCollection();
+        before.AddHeader("accept", "*/*");
+        var baseline = MitmCompressedRelayHelper.HeaderRelayBaseline.Capture(before);
+
+        var after = new HeaderCollection();
+        after.AddHeader("accept", "*/*");
+        after.AddHeader("X-A", "1");
+        after.AddHeader("X-B", "2");
+
+        Assert.IsTrue(MitmCompressedRelayHelper.AllowsCompressedRelay(
+            baseline, after, MitmCompressedRelayHelper.DefaultMaxAppendHeaders, out var added));
+        Assert.AreEqual(2, added.Count);
+    }
+
+    [TestMethod]
+    public void AppendFiveUniqueHeaders_Rejected()
+    {
+        var before = new HeaderCollection();
+        before.AddHeader("accept", "*/*");
+        var baseline = MitmCompressedRelayHelper.HeaderRelayBaseline.Capture(before);
+
+        var after = new HeaderCollection();
+        after.AddHeader("accept", "*/*");
+        for (var i = 0; i < 5; i++)
+            after.AddHeader($"X-H{i}", "1");
+
+        Assert.IsFalse(MitmCompressedRelayHelper.AllowsCompressedRelay(
+            baseline, after, MitmCompressedRelayHelper.DefaultMaxAppendHeaders, out _));
+    }
+
+    [TestMethod]
+    public void RemoveAndAdd_Rejected()
+    {
+        var before = new HeaderCollection();
+        before.AddHeader("accept", "*/*");
+        before.AddHeader("user-agent", "test");
+        var baseline = MitmCompressedRelayHelper.HeaderRelayBaseline.Capture(before);
+
+        var after = new HeaderCollection();
+        after.AddHeader("accept", "*/*");
+        after.AddHeader("X-New", "1");
+
+        Assert.IsFalse(MitmCompressedRelayHelper.AllowsCompressedRelay(
+            baseline, after, MitmCompressedRelayHelper.DefaultMaxAppendHeaders, out _));
+    }
+
+    [TestMethod]
+    public void ReplaceExistingValue_Rejected()
+    {
+        var before = new HeaderCollection();
+        before.AddHeader("accept", "*/*");
+        var baseline = MitmCompressedRelayHelper.HeaderRelayBaseline.Capture(before);
+
+        var after = new HeaderCollection();
+        after.AddHeader("accept", "text/plain");
+
+        Assert.IsFalse(MitmCompressedRelayHelper.AllowsCompressedRelay(
+            baseline, after, MitmCompressedRelayHelper.DefaultMaxAppendHeaders, out _));
+    }
+
+    [TestMethod]
+    public void SecondSetCookie_NonUniqueGrowth_AllowedInV2()
+    {
+        var before = new HeaderCollection();
+        before.AddHeader("cookie", "a=1");
+        var baseline = MitmCompressedRelayHelper.HeaderRelayBaseline.Capture(before);
+
+        var after = new HeaderCollection();
+        after.AddHeader("cookie", "a=1");
+        after.AddHeader("cookie", "b=2");
+
+        Assert.IsTrue(MitmCompressedRelayHelper.AllowsCompressedRelay(
+            baseline, after, MitmCompressedRelayHelper.DefaultMaxAppendHeaders, out var added));
+        Assert.AreEqual(1, added.Count);
+        Assert.AreEqual("cookie", added[0].Name);
+        Assert.AreEqual("b=2", added[0].Value);
+    }
+
+    [TestMethod]
+    public void MutationCountOnlyGate_Unchanged_AllowsRelay()
+    {
+        var headers = new HeaderCollection();
+        headers.AddHeader("accept", "*/*");
+        var baselineCount = headers.MutationCount;
+
+        Assert.IsTrue(MitmCompressedRelayHelper.AllowsCompressedRelay(
+            baselineCount, headers, MitmCompressedRelayHelper.DefaultMaxAppendHeaders, out var added));
+        Assert.AreEqual(0, added.Count);
+    }
+
+    [TestMethod]
+    public void MutationCountOnlyGate_Diverged_RequiresSnapshot()
+    {
+        var headers = new HeaderCollection();
+        headers.AddHeader("accept", "*/*");
+        var baselineCount = headers.MutationCount;
+        headers.AddHeader("X-Tracking-Id", "1");
+
+        Assert.IsFalse(MitmCompressedRelayHelper.AllowsCompressedRelay(
+            baselineCount, headers, MitmCompressedRelayHelper.DefaultMaxAppendHeaders, out _));
+    }
+
+    [TestMethod]
+    public void AppendFourUniqueHeaders_AllowsRelay()
+    {
+        var before = new HeaderCollection();
+        before.AddHeader("accept", "*/*");
+        var baseline = MitmCompressedRelayHelper.HeaderRelayBaseline.Capture(before);
+
+        var after = new HeaderCollection();
+        after.AddHeader("accept", "*/*");
+        for (var i = 0; i < 4; i++)
+            after.AddHeader($"X-H{i}", "v");
+
+        Assert.IsTrue(MitmCompressedRelayHelper.AllowsCompressedRelay(
+            baseline, after, MitmCompressedRelayHelper.DefaultMaxAppendHeaders, out var added));
+        Assert.AreEqual(4, added.Count);
+    }
+
+    [TestMethod]
+    public void AddedHeaderBuffer_ContainsName_IgnoreCase()
+    {
+        var before = new HeaderCollection();
+        before.AddHeader("accept", "*/*");
+        var baseline = MitmCompressedRelayHelper.HeaderRelayBaseline.Capture(before);
+
+        var after = new HeaderCollection();
+        after.AddHeader("accept", "*/*");
+        after.AddHeader("Via", "3.0 proxy");
+
+        Assert.IsTrue(MitmCompressedRelayHelper.AllowsCompressedRelay(
+            baseline, after, MitmCompressedRelayHelper.DefaultMaxAppendHeaders, out var added));
+        Assert.IsTrue(added.ContainsName("via"));
+        Assert.IsFalse(added.ContainsName("accept"));
+    }
+
+    [TestMethod]
+    public void NonUniqueHeadersAtCapture_UnchangedMutationCount_AllowsRelay()
+    {
+        var before = new HeaderCollection();
+        before.AddHeader("set-cookie", "a=1");
+        before.AddHeader("set-cookie", "b=2");
+        var baseline = MitmCompressedRelayHelper.HeaderRelayBaseline.Capture(before);
+
+        var after = new HeaderCollection();
+        after.AddHeader("set-cookie", "a=1");
+        after.AddHeader("set-cookie", "b=2");
+
+        Assert.IsTrue(baseline.TryDiffAppendOnly(
+            after, MitmCompressedRelayHelper.DefaultMaxAppendHeaders, out var added));
+        Assert.AreEqual(0, added.Count);
+    }
+
+    [TestMethod]
+    public void MutationCountOnlyBaseline_Unchanged_AllowsRelay()
+    {
+        var headers = new HeaderCollection();
+        headers.AddHeader("accept", "text/html");
+        headers.ArmMitmRelayBaseline();
+        var baseline = headers.TakeMitmRelayBaseline();
+
+        Assert.IsTrue(baseline.IsMutationCountOnly);
+        Assert.IsTrue(MitmCompressedRelayHelper.AllowsCompressedRelay(
+            baseline, headers, MitmCompressedRelayHelper.DefaultMaxAppendHeaders, out var added));
+        Assert.AreEqual(0, added.Count);
+    }
+
+    [TestMethod]
+    public void MutationCountOnlyBaseline_Mutated_RefusesRelay()
+    {
+        var headers = new HeaderCollection();
+        headers.AddHeader("accept", "text/html");
+        headers.ArmMitmRelayBaseline();
+        var baseline = headers.TakeMitmRelayBaseline();
+        headers.AddHeader("x-probe", "1");
+
+        Assert.IsTrue(baseline.IsMutationCountOnly);
+        Assert.IsFalse(MitmCompressedRelayHelper.AllowsCompressedRelay(
+            baseline, headers, MitmCompressedRelayHelper.DefaultMaxAppendHeaders, out _));
+    }
+
+    [TestMethod]
+    public void AppendLogBaseline_AllowsRelayWithPrecomputedAdds()
+    {
+        var headers = new HeaderCollection();
+        headers.AddHeader("accept", "text/html");
+        headers.ArmMitmRelayBaseline();
+        headers.AddHeader("x-twp-rps-probe", "1");
+        var baseline = headers.TakeMitmRelayBaseline();
+
+        Assert.IsTrue(baseline.TryGetPrecomputedAppends(out var expected));
+        Assert.AreEqual(1, expected.Count);
+        Assert.IsTrue(MitmCompressedRelayHelper.AllowsCompressedRelay(
+            baseline, headers, MitmCompressedRelayHelper.DefaultMaxAppendHeaders, out var added));
+        Assert.AreEqual(1, added.Count);
+        Assert.AreEqual("x-twp-rps-probe", added[0].Name);
+    }
+
+    [TestMethod]
+    public void AppendLogBaseline_RequestHeaderSetStyle_SetOrAdd_AllowsRelay()
+    {
+        // Mirrors ReverseProxySessionDispatch applying RequestHeaderSet while COW is armed
+        // (TryApply before TakeMitmRelayBaseline).
+        var headers = new HeaderCollection();
+        headers.AddHeader("accept", "text/html");
+        headers.ArmMitmRelayBaseline();
+        headers.SetOrAddHeaderValue("X-Route-Probe", "yes");
+        var baseline = headers.TakeMitmRelayBaseline();
+
+        Assert.IsTrue(baseline.TryGetPrecomputedAppends(out var expected));
+        Assert.AreEqual(1, expected.Count);
+        Assert.IsTrue(MitmCompressedRelayHelper.AllowsCompressedRelay(
+            baseline, headers, MitmCompressedRelayHelper.DefaultMaxAppendHeaders, out var added));
+        Assert.AreEqual("X-Route-Probe", added[0].Name);
+        Assert.AreEqual("yes", added[0].Value);
+    }
+
+    [TestMethod]
+    public void HeaderCollection_NonUniqueMapsStayLazyUntilDuplicateName()
+    {
+        var headers = new HeaderCollection();
+        headers.AddHeader("accept", "text/html");
+        headers.AddHeader("host", "example.com");
+        Assert.AreEqual(0, headers.NonUniqueHeaders.Count);
+
+        headers.AddHeader("set-cookie", "a=1");
+        headers.AddHeader("set-cookie", "b=2");
+        Assert.AreEqual(1, headers.NonUniqueHeaders.Count);
+        Assert.AreEqual(2, headers.NonUniqueHeaders["set-cookie"].Count);
+    }
+
+    [TestMethod]
+    public void DropOnly_Rejected()
+    {
+        var before = new HeaderCollection();
+        before.AddHeader("accept", "*/*");
+        before.AddHeader("user-agent", "probe");
+        var baseline = MitmCompressedRelayHelper.HeaderRelayBaseline.Capture(before);
+
+        var after = new HeaderCollection();
+        after.AddHeader("accept", "*/*");
+
+        Assert.IsFalse(MitmCompressedRelayHelper.AllowsCompressedRelay(
+            baseline, after, MitmCompressedRelayHelper.DefaultMaxAppendHeaders, out _));
+    }
+
+    [TestMethod]
+    public void HopByHopConnectionAppend_IsUniqueAppend_AllowsRelay()
+    {
+        var before = new HeaderCollection();
+        before.AddHeader("accept", "*/*");
+        var baseline = MitmCompressedRelayHelper.HeaderRelayBaseline.Capture(before);
+
+        var after = new HeaderCollection();
+        after.AddHeader("accept", "*/*");
+        after.AddHeader("Connection", "close");
+
+        Assert.IsTrue(MitmCompressedRelayHelper.AllowsCompressedRelay(
+            baseline, after, MitmCompressedRelayHelper.DefaultMaxAppendHeaders, out var added));
+        Assert.AreEqual(1, added.Count);
+        Assert.AreEqual("Connection", added[0].Name);
+    }
+
+    [TestMethod]
+    public void MixedDropAndAppend_Rejected()
+    {
+        var before = new HeaderCollection();
+        before.AddHeader("accept", "*/*");
+        before.AddHeader("user-agent", "probe");
+        var baseline = MitmCompressedRelayHelper.HeaderRelayBaseline.Capture(before);
+
+        var after = new HeaderCollection();
+        after.AddHeader("accept", "*/*");
+        after.AddHeader("X-New", "1");
+
+        Assert.IsFalse(MitmCompressedRelayHelper.AllowsCompressedRelay(
+            baseline, after, MitmCompressedRelayHelper.DefaultMaxAppendHeaders, out _));
+    }
+
+    [TestMethod]
+    public void NonUniqueSetCookie_AppendExtraValue_AllowsRelay()
+    {
+        var before = new HeaderCollection();
+        before.AddHeader("set-cookie", "a=1");
+        before.AddHeader("set-cookie", "b=2");
+        var baseline = MitmCompressedRelayHelper.HeaderRelayBaseline.Capture(before);
+
+        var after = new HeaderCollection();
+        after.AddHeader("set-cookie", "a=1");
+        after.AddHeader("set-cookie", "b=2");
+        after.AddHeader("set-cookie", "c=3");
+
+        Assert.IsTrue(baseline.TryDiffAppendOnly(
+            after, MitmCompressedRelayHelper.DefaultMaxAppendHeaders, out var added));
+        Assert.AreEqual(1, added.Count);
+        Assert.AreEqual("c=3", added[0].Value);
+    }
+}

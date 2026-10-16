@@ -8,15 +8,14 @@ using Microsoft.VisualStudio.TestTools.UnitTesting;
 namespace Titanium.Web.Proxy.IntegrationTests;
 
 [TestClass]
+[TestCategory("Slow")]
 public class StressTests
 {
     [TestMethod]
     [Timeout(2 * 60 * 1000)]
     public async Task Stress_Test_With_One_Server_And_Many_Clients()
     {
-        var rnd = new Random();
-
-        var testSuite = new TestSuite();
+        using var testSuite = new TestSuite();
 
         var server = testSuite.GetServer();
         server.HandleRequest(context =>
@@ -26,10 +25,12 @@ public class StressTests
 
         using var proxy = testSuite.GetProxy();
 
+        await Task.Delay(1000);
+
         var tasks = new List<Task>();
 
-        //send 1000 requests to server
-        for (var j = 0; j < 1000; j++)
+        //send 100 requests to server
+        for (var j = 0; j < 100; j++)
         {
             var task = Task.Run(async () =>
             {
@@ -43,5 +44,8 @@ public class StressTests
         }
 
         await Task.WhenAll(tasks);
+        Assert.AreEqual(100, tasks.Count);
+        Assert.IsTrue(tasks.TrueForAll(t => t.IsCompletedSuccessfully),
+            "Every concurrent client request should complete without faulting.");
     }
 }

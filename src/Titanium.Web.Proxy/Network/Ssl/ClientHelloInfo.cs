@@ -1,8 +1,10 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Security.Authentication;
 using System.Text;
+using Titanium.Web.Proxy.Extensions;
 using Titanium.Web.Proxy.StreamExtended.Models;
 
 namespace Titanium.Web.Proxy.StreamExtended;
@@ -44,8 +46,9 @@ public class ClientHelloInfo
         {
             var time = DateTime.MinValue;
             if (Random.Length > 3)
-                time = new DateTime(1970, 1, 1, 0, 0, 0, 0, DateTimeKind.Utc)
-                    .AddSeconds(((uint)Random[3] << 24) + ((uint)Random[2] << 16) + ((uint)Random[1] << 8) + Random[0])
+                // RFC 5246: gmt_unix_time is the first 4 bytes of Random, big-endian.
+                time = DateTime.UnixEpoch
+                    .AddSeconds(((uint)Random[0] << 24) + ((uint)Random[1] << 16) + ((uint)Random[2] << 8) + Random[3])
                     .ToLocalTime();
 
             return time;
@@ -71,20 +74,32 @@ public class ClientHelloInfo
             var major = MajorVersion;
             var minor = MinorVersion;
             if (major == 3 && minor == 3)
+            {
+                var protocols = this.GetSslProtocols();
+                if (protocols != null && protocols.Contains("Tls1.3"))
+                {
+                    return SslProtocols.Tls12 | SslProtocols.Tls13;
+                }
+
                 return SslProtocols.Tls12;
+            }
 
             if (major == 3 && minor == 2)
-                return SslProtocols.Tls11;
+#pragma warning disable SYSLIB0039 // Report the legacy protocol advertised by this ClientHello.
+                return SslProtocols.Tls11; // NOSONAR S4423 - reporting ClientHello advertisement only
+#pragma warning restore SYSLIB0039
 
             if (major == 3 && minor == 1)
-                return SslProtocols.Tls;
+#pragma warning disable SYSLIB0039 // Report the legacy protocol advertised by this ClientHello.
+                return SslProtocols.Tls; // NOSONAR S4423 - reporting ClientHello advertisement only
+#pragma warning restore SYSLIB0039
 
 #pragma warning disable 618
             if (major == 3 && minor == 0)
-                return SslProtocols.Ssl3;
+                return SslProtocols.Ssl3; // NOSONAR S4423 - reporting ClientHello advertisement only
 
             if (major == 2 && minor == 0)
-                return SslProtocols.Ssl2;
+                return SslProtocols.Ssl2; // NOSONAR S4423 - reporting ClientHello advertisement only
 #pragma warning restore 618
 
             return SslProtocols.None;
@@ -121,9 +136,9 @@ public class ClientHelloInfo
             $"A SSLv{HandshakeVersion}-compatible ClientHello handshake was found. Titanium extracted the parameters below.");
         sb.AppendLine();
         sb.AppendLine($"Version: {SslVersionToString(MajorVersion, MinorVersion)}");
-        sb.AppendLine($"Random: {string.Join(" ", Random.Select(x => x.ToString("X2")))}");
+        sb.AppendLine($"Random: {StringExtensions.ByteArrayToHexString(Random)}");
         sb.AppendLine($"\"Time\": {Time}");
-        sb.AppendLine($"SessionID: {string.Join(" ", SessionId.Select(x => x.ToString("X2")))}");
+        sb.AppendLine($"SessionID: {StringExtensions.ByteArrayToHexString(SessionId)}");
 
         if (Extensions != null)
         {

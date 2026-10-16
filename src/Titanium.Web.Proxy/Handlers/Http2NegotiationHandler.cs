@@ -1,0 +1,679 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
+using System.Net;
+using System.Net.Security;
+using System.Net.Sockets;
+using System.Threading;
+using System.Threading.Tasks;
+using Titanium.Web.Proxy.EventArguments;
+using Titanium.Web.Proxy.Exceptions;
+using Titanium.Web.Proxy.Extensions;
+using Titanium.Web.Proxy.Helpers;
+using Titanium.Web.Proxy.Http2;
+using Titanium.Web.Proxy.Logging;
+using Titanium.Web.Proxy.Models;
+using Titanium.Web.Proxy.Network.Tcp;
+using SslExtensions = Titanium.Web.Proxy.Extensions.SslExtensions;
+
+namespace Titanium.Web.Proxy;
+
+public partial class ProxyServer
+{
+    /// <summary>
+    ///     Shared HTTP/2 origin-capability negotiation used by both the explicit and transparent client
+    ///     handlers. Decides whether HTTP/2 can be offered to the client for this route, and retains
+    ///     ownership of any origin connection opened while doing so, so the caller can adopt that same
+    ///     connection for the session instead of opening a second one right after it.
+    /// </summary>
+    /// <param name="sessionArgs">
+    ///     The in-flight tunnel/session event args used for TLS certificate-validation context, custom
+    ///     upstream proxy resolution, and timeline tracking while opening the connection.
+    /// </param>
+    /// <param name="remoteHostName">
+    ///     The origin identity used for TLS SNI/certificate validation (the CONNECT target for explicit
+    ///     tunnels, or the client's SNI/generic-certificate hostname for transparent connections).
+    /// </param>
+    /// <param name="remotePort">The origin identity port, paired with <paramref name="remoteHostName" />.</param>
+    /// <param name="connectHost">
+    ///     The actual TCP connect destination, when a fixed forward target overrides
+    ///     <paramref name="remoteHostName" />; null when the TCP destination is the same as the identity.
+    /// </param>
+    /// <param name="connectPort">The actual TCP connect destination port, paired with <paramref name="connectHost" />.</param>
+    /// <param name="enablePrefetch">
+    ///     Whether a cache hit should speculatively open the correctly-keyed connection ahead of the
+    ///     client TLS handshake completing. A cold cache always opens exactly one discovery connection
+    ///     regardless of this flag. Callers never wait on this task before ServerHello; a completed
+    ///     probe (cache hit) is applied immediately and an in-flight cold probe is applied after TLS.
+    /// </param>
+    /// <param name="cancellationToken">
+    ///     Cancellation for the mandatory cold-cache discovery connection only; the optional cache-hit
+    ///     prefetch intentionally never observes cancellation so a client disconnecting mid-handshake
+    ///     cannot leave a half-started connect racing a torn-down session.
+    /// </param>
+    private async Task<Http2NegotiationResult> NegotiateHttp2Async(SessionEventArgsBase sessionArgs,
+        string remoteHostName, int remotePort, string? connectHost, int? connectPort, bool enablePrefetch,
+        CancellationToken cancellationToken)
+    {
+        var customUpStreamProxy = sessionArgs.CustomUpStreamProxy;
+        if (customUpStreamProxy == null && GetCustomUpStreamProxyFunc != null)
+            customUpStreamProxy = await GetCustomUpStreamProxyFunc(sessionArgs);
+        sessionArgs.CustomUpStreamProxyUsed = customUpStreamProxy;
+
+        // resolve the effective proxy (post-bypass) so the key matches the connection's actual route, the
+        // same way TcpConnectionFactory itself resolves it before opening or keying a connection.
+        var externalProxy = TcpConnectionFactory.GetEffectiveUpstreamProxy(
+            customUpStreamProxy ?? UpStreamHttpsProxy, remoteHostName, remotePort);
+        var upStreamEndPoint = sessionArgs.HttpClient.UpStreamEndPoint ?? UpStreamEndPoint;
+
+        // Keyed on the same destination, forward target, local upstream endpoint, and effective external
+        // proxy dimensions used for connection pooling (but never on ALPN, which is what this negotiation
+        // itself decides), so two routes to the same origin host through different upstream
+        // proxies/local endpoints/fixed forward targets never share a capability result, and the exact
+        // same key is used to both look up and later pool the adopted connection.
+        var capabilityCacheKey = TcpConnectionFactory.GetConnectionCacheKey(remoteHostName, remotePort, true,
+            null, upStreamEndPoint, externalProxy, connectHost, connectPort);
+
+        var learnableOriginTlsFailure = false;
+        TcpServerConnection? adoptedColdProbe = null;
+        if (!Http2OriginCapabilityCache.TryGet(capabilityCacheKey, out var cachedSupport))
+        {
+            Diagnostics.ProxyMetrics.Http2CapabilityLookup(cacheHit: false);
+            // Coalesce concurrent cold probes: browsers open many CONNECTs to the same host at once.
+            // Each used to block AuthenticateAsServer on its own origin TLS probe; Chrome then aborted
+            // waiting tunnels (EOF / "Couldn't authenticate host"). One in-flight probe feeds them all.
+            // Only the probe leader adopts the discovery socket as the session connection; waiters
+            // receive the cached bool and open their own connection when needed.
+            (cachedSupport, learnableOriginTlsFailure, adoptedColdProbe) =
+                await CoalesceHttp2CapabilityProbeAsync(capabilityCacheKey, sessionArgs, remoteHostName,
+                    remotePort, connectHost, connectPort, upStreamEndPoint, externalProxy,
+                    cancellationToken);
+        }
+        else
+        {
+            Diagnostics.ProxyMetrics.Http2CapabilityLookup(cacheHit: true);
+            ProxyLog.Http2ProbeResult(logger, capabilityCacheKey, true, cachedSupport, null);
+        }
+
+        Task<TcpServerConnection?>? retained = null;
+        // Do not start a MITM session prefetch when the cold probe already showed a learnable TLS
+        // failure — same-CONNECT opaque fallback will discard it; awaiting that handshake only
+        // delays ClientHello relay.
+        if (adoptedColdProbe != null && !learnableOriginTlsFailure)
+            // Cold-cache leader: the ALPN discovery connection is already correctly keyed — reuse it
+            // as the session connection (same as pre-coalesce behavior) so we do not open a second
+            // origin socket for this tunnel.
+            retained = Task.FromResult<TcpServerConnection?>(adoptedColdProbe);
+        else if (enablePrefetch && !learnableOriginTlsFailure)
+            // Cache hit or coalesce waiter: correctly keyed prefetch started while the client TLS
+            // handshake is still in progress becomes the session connection.
+            // Don't pass cancellationToken here - it could leave a floating server connection if the
+            // client disconnects before this completes.
+            retained = TcpConnectionFactory.GetServerConnection(this, remoteHostName, remotePort,
+                HttpHeader.Version20, true, cachedSupport ? SslExtensions.Http2ProtocolAsList : null, true,
+                sessionArgs, upStreamEndPoint, externalProxy, false, true, CancellationToken.None,
+                connectHost, connectPort);
+        else if (adoptedColdProbe != null)
+            await TcpConnectionFactory.Release(adoptedColdProbe, true).ConfigureAwait(false);
+
+        return new Http2NegotiationResult(cachedSupport, retained,
+            learnableOriginTlsFailure: learnableOriginTlsFailure);
+    }
+
+    /// <summary>
+    ///     Runs at most one cold HTTP/2 ALPN probe per capability-cache key; concurrent callers await the
+    ///     same capability result. Definitive ALPN rejection (<c>SEC_E_NO_APPLICATION_PROTOCOL</c>) is
+    ///     cached as unsupported; transient network/cert failures are not cached. Only the probe leader
+    ///     receives the discovery connection for session adoption; waiters get
+    ///     <see langword="null" /> and must open their own connection.
+    /// </summary>
+    // Parameter count mirrors GetServerConnection; packing into a heap type would allocate per probe.
+    [SuppressMessage("Major Code Smell", "S107:Methods should not have too many parameters",
+        Justification = "Hot-path probe: keep stack args; do not allocate a parameter object per CONNECT.")]
+    private async Task<(bool Supported, bool LearnableFailure, TcpServerConnection? AdoptedProbe)>
+        CoalesceHttp2CapabilityProbeAsync(
+        string capabilityCacheKey, SessionEventArgsBase sessionArgs, string remoteHostName, int remotePort,
+        string? connectHost, int? connectPort, IPEndPoint? upStreamEndPoint, IExternalProxy? externalProxy,
+        CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            if (Http2OriginCapabilityCache.TryGet(capabilityCacheKey, out var racedCache))
+                return (racedCache, false, null);
+
+            var probeTcs = new TaskCompletionSource<(bool Supported, bool LearnableFailure)>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            var probeTask = pendingHttp2CapabilityProbes.GetOrAdd(capabilityCacheKey, probeTcs.Task);
+            if (!ReferenceEquals(probeTask, probeTcs.Task))
+            {
+                var (supported, learnable) = await probeTask.ConfigureAwait(false);
+                return (supported, learnable, null);
+            }
+
+            var probeStarted = System.Diagnostics.Stopwatch.StartNew();
+            try
+            {
+                var (supported, learnable, adopted) = await ProbeHttp2CapabilityOnceAsync(
+                    capabilityCacheKey, sessionArgs, remoteHostName, remotePort, connectHost, connectPort,
+                    upStreamEndPoint, externalProxy, cancellationToken, probeStarted).ConfigureAwait(false);
+                probeTcs.TrySetResult((supported, learnable));
+                return (supported, learnable, adopted);
+            }
+            catch (Exception ex)
+            {
+                probeTcs.TrySetException(ex);
+                throw;
+            }
+            finally
+            {
+                pendingHttp2CapabilityProbes.TryRemove(capabilityCacheKey, out _);
+            }
+        }
+    }
+
+    [SuppressMessage("Major Code Smell", "S107:Methods should not have too many parameters",
+        Justification = "Hot-path probe: keep stack args; do not allocate a parameter object per CONNECT.")]
+    private async Task<(bool Supported, bool LearnableFailure, TcpServerConnection? AdoptedProbe)>
+        ProbeHttp2CapabilityOnceAsync(
+        string capabilityCacheKey, SessionEventArgsBase sessionArgs, string remoteHostName, int remotePort,
+        string? connectHost, int? connectPort, IPEndPoint? upStreamEndPoint, IExternalProxy? externalProxy,
+        CancellationToken cancellationToken, System.Diagnostics.Stopwatch probeStarted)
+    {
+        TcpServerConnection? connection = null;
+        try
+        {
+            connection = await TcpConnectionFactory.GetServerConnection(this, remoteHostName, remotePort,
+                HttpHeader.Version20, true, SslExtensions.Http2ProtocolAsList, true, sessionArgs, upStreamEndPoint,
+                externalProxy, true, true, cancellationToken, connectHost, connectPort).ConfigureAwait(false);
+
+            var supported = connection != null &&
+                             connection.NegotiatedApplicationProtocol == SslApplicationProtocol.Http2;
+
+            Http2OriginCapabilityCache.Set(capabilityCacheKey, supported);
+            Diagnostics.ProxyMetrics.Http2ProbeCompleted(probeStarted.Elapsed.TotalMilliseconds);
+            ProxyLog.Http2ProbeResult(logger, capabilityCacheKey, false, supported, null);
+            // Transfer ownership to the leader; do not Release here.
+            var adopted = connection;
+            connection = null;
+            return (supported, false, adopted);
+        }
+        catch (Exception ex)
+        {
+            // ALPN rejection is definitive for this offer (h2); cache false so parallel CONNECT
+            // tunnels do not each re-probe and delay browser AuthenticateAsServer. Transient
+            // network/cert failures must not be cached — they would pin the host to HTTP/1.1.
+            if (AlpnNegotiation.IsAlpnNegotiationFailure(ex))
+                Http2OriginCapabilityCache.Set(capabilityCacheKey, false);
+
+            Diagnostics.ProxyMetrics.Http2ProbeCompleted(probeStarted.Elapsed.TotalMilliseconds);
+            ProxyLog.Http2ProbeResult(logger, capabilityCacheKey, false, false, ex);
+            return (false, DecryptFailureLearning.IsLearnableOriginTlsFailure(ex), null);
+        }
+        finally
+        {
+            if (connection != null)
+                await TcpConnectionFactory.Release(connection, true).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    ///     Guards against a stale positive HTTP/2 capability cache entry after the client has already
+    ///     been offered <c>h2</c>. Evicts the entry; when translation is allowed, returns
+    ///     <see langword="null" /> so the caller can route through the H2→H1.1 bridge; otherwise fails
+    ///     the tunnel without writing HTTP/2 frames to a non-HTTP/2 origin.
+    /// </summary>
+    private async Task<TcpServerConnection?> EnsureHttp2OriginConnectionAsync(
+        TcpServerConnection? connection, string capabilityCacheKey, SessionEventArgsBase sessionArgs,
+        bool allowHttpProtocolTranslation)
+    {
+        if (connection != null &&
+            (connection.NegotiatedApplicationProtocol == SslApplicationProtocol.Http2 || connection.Http2Cleartext))
+            return connection;
+
+        Diagnostics.ProxyMetrics.Http2CapabilityMismatch();
+        Http2OriginCapabilityCache.Evict(capabilityCacheKey);
+
+        if (connection != null)
+            await TcpConnectionFactory.Release(connection, true);
+
+        if (allowHttpProtocolTranslation)
+            return null;
+
+        throw new ProxyConnectException(
+            $"Cached HTTP/2 capability for '{capabilityCacheKey}' was stale: the origin did not " +
+            "speak HTTP/2 (TLS ALPN h2 or cleartext prior-knowledge h2c). AllowHttpProtocolTranslation is " +
+            "disabled, so the tunnel cannot be recovered via the H2→H1.1 bridge.",
+            new NotSupportedException("Origin does not support HTTP/2."),
+            sessionArgs);
+    }
+
+    /// <summary>
+    ///     Resolves whether HTTP/2 should be offered to the client for this connection, honoring the
+    ///     connection-scoped <paramref name="upstreamHttpProtocol" />/<paramref name="allowHttpProtocolTranslation" />
+    ///     policy (see <see cref="UpstreamHttpProtocol" />) instead of always coupling the client offer 1:1 to
+    ///     the origin's actual capability. Shared by the explicit and transparent handlers so the policy
+    ///     rules are enforced identically for both.
+    /// </summary>
+    /// <param name="originIsHttps">
+    ///     When <see langword="false"/> (transparent <c>ForwardCleartext</c>), forced
+    ///     <see cref="UpstreamHttpProtocol.Http2"/> opens cleartext h2c prior-knowledge instead of TLS ALPN.
+    ///     Auto mode always probes TLS ALPN and ignores this flag.
+    /// </param>
+    private async Task<Http2NegotiationResult> ResolveHttp2ForClientAsync(SessionEventArgsBase sessionArgs, // NOSONAR S3776 -- This protocol/state-machine path shares mutable parsing or transport state; splitting it further would create disproportionate regression risk.
+        bool clientOffersHttp2, string remoteHostName, int remotePort, string? connectHost, int? connectPort,
+        UpstreamHttpProtocol upstreamHttpProtocol, bool allowHttpProtocolTranslation, bool enablePrefetch,
+        CancellationToken cancellationToken, bool originIsHttps = true)
+    {
+        switch (upstreamHttpProtocol)
+        {
+            case UpstreamHttpProtocol.Http11:
+                // The origin-facing protocol is pinned to HTTP/1.1: never probed, never cached, and the
+                // capability decision never bleeds into the shared Http2OriginCapabilityCache that Auto-mode
+                // routes to the same host rely on. A client that also only supports HTTP/1.1 needs nothing
+                // further. A client that supports HTTP/2 is routed through the h2-client-to-HTTP/1.1
+                // translation bridge (SendHttp2ToHttp11Bridge) instead of the normal protocol-symmetric relay -
+                // the caller is told this via RequiresHttp11Bridge rather than an origin connection to adopt.
+                if (clientOffersHttp2 && allowHttpProtocolTranslation)
+                    return new Http2NegotiationResult(false, null, true);
+
+                // AllowHttpProtocolTranslation == false (the default): rather than fail, simply never offer
+                // "h2" to the client either, so it transparently negotiates HTTP/1.1 too and no mismatch -
+                // and therefore no translation - is ever needed.
+                return new Http2NegotiationResult(false, null);
+
+            case UpstreamHttpProtocol.Http2:
+            {
+                // The origin-facing protocol is pinned to HTTP/2. This bypasses the shared capability cache
+                // (both read and write) and always performs a live, uncached probe, because Auto-mode's
+                // cached "does this host support h2" answer is not sufficient here - this policy additionally
+                // requires the connection to actually succeed as h2, every time, unconditionally.
+                var customUpStreamProxy = sessionArgs.CustomUpStreamProxy;
+                if (customUpStreamProxy == null && GetCustomUpStreamProxyFunc != null)
+                    customUpStreamProxy = await GetCustomUpStreamProxyFunc(sessionArgs);
+                sessionArgs.CustomUpStreamProxyUsed = customUpStreamProxy;
+
+                var externalProxy = TcpConnectionFactory.GetEffectiveUpstreamProxy(
+                    customUpStreamProxy ?? (originIsHttps ? UpStreamHttpsProxy : UpStreamHttpProxy),
+                    remoteHostName, remotePort);
+                var upStreamEndPoint = sessionArgs.HttpClient.UpStreamEndPoint ?? UpStreamEndPoint;
+
+                TcpServerConnection? connection;
+                try
+                {
+                    if (originIsHttps)
+                    {
+                        connection = await TcpConnectionFactory.GetServerConnection(this, remoteHostName, remotePort,
+                            HttpHeader.Version20, true, SslExtensions.Http2ProtocolAsList, true, sessionArgs,
+                            upStreamEndPoint, externalProxy, true, true, cancellationToken, connectHost, connectPort);
+                    }
+                    else
+                    {
+                        // Outbound h2c: cleartext TCP; preface is written when the session starts (MITM or
+                        // Http2OriginConnection.CreateAsync). Mark Http2Cleartext so Ensure/Release treat it
+                        // as an h2-intent socket without TLS ALPN.
+                        connection = await TcpConnectionFactory.GetServerConnection(this, remoteHostName, remotePort,
+                            HttpHeader.Version20, false, null, true, sessionArgs,
+                            upStreamEndPoint, externalProxy, true, true, cancellationToken, connectHost, connectPort);
+                        if (connection != null)
+                            connection.Http2Cleartext = true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    var how = originIsHttps
+                        ? "did not negotiate HTTP/2 via ALPN (the connection attempt itself failed)"
+                        : "could not open a cleartext HTTP/2 (h2c) TCP connection";
+                    throw new ProxyConnectException(
+                        $"UpstreamHttpProtocol.Http2 was required for '{remoteHostName}:{remotePort}' but the " +
+                        $"origin server {how}. " +
+                        "A translation bridge cannot fabricate HTTP/2 support at an origin that does not have it.",
+                        ex, sessionArgs);
+                }
+
+                if (connection == null ||
+                    (originIsHttps
+                        ? connection.NegotiatedApplicationProtocol != SslApplicationProtocol.Http2
+                        : !connection.Http2Cleartext))
+                {
+                    await TcpConnectionFactory.Release(connection, true);
+                    var how = originIsHttps
+                        ? "did not negotiate HTTP/2 via ALPN"
+                        : "did not accept cleartext HTTP/2 (h2c) prior-knowledge";
+                    throw new ProxyConnectException(
+                        $"UpstreamHttpProtocol.Http2 was required for '{remoteHostName}:{remotePort}' but the " +
+                        $"origin server {how}. A translation bridge cannot fabricate " +
+                        "HTTP/2 support at an origin that does not have it.",
+                        new NotSupportedException("Origin does not support HTTP/2."), sessionArgs);
+                }
+
+                if (!clientOffersHttp2)
+                {
+                    if (!allowHttpProtocolTranslation)
+                    {
+                        await TcpConnectionFactory.Release(connection, true);
+                        throw new ProxyConnectException(
+                            "UpstreamHttpProtocol.Http2 requires an HTTP/2 origin connection, but the client " +
+                            "does not support HTTP/2 and AllowHttpProtocolTranslation is disabled.",
+                            new NotSupportedException("Client does not support HTTP/2."), sessionArgs);
+                    }
+
+                    // The client stays HTTP/1.1 (it never offered "h2", so nothing about what is negotiated
+                    // with it changes), but every request on this connection must be translated onto this
+                    // already-established h2 origin connection via the HTTP/1.1-client-to-h2-origin bridge
+                    // (SendHttp11ToHttp2Bridge) instead of the normal protocol-symmetric HTTP/1.1 pipeline.
+                    // The connection opened above becomes the bridge's origin connection - it is not probed
+                    // and discarded like the mandatory cold-cache discovery connection in NegotiateHttp2Async.
+                    return new Http2NegotiationResult(true, Task.FromResult<TcpServerConnection?>(connection),
+                        requiresH2OriginBridge: true);
+                }
+
+                return new Http2NegotiationResult(true, Task.FromResult<TcpServerConnection?>(connection));
+            }
+
+            default:
+                // Auto (and any other unvalidated value, defensively - the public setters already reject
+                // unknown enum values): existing coupled behavior, unchanged. Skip origin negotiation
+                // entirely (and thus never touch the capability cache) when the client did not even offer
+                // "h2", exactly like before this policy API existed. Auto never probes h2c.
+                if (!clientOffersHttp2) return new Http2NegotiationResult(false, null);
+
+                return await NegotiateHttp2Async(sessionArgs, remoteHostName, remotePort, connectHost, connectPort,
+                    enablePrefetch, cancellationToken);
+        }
+    }
+
+    /// <summary>
+    ///     Computes the same connection-pool cache key that <see cref="NegotiateHttp2Async" /> and the
+    ///     eventual h2 session connection use, so callers can validate a retained/prefetched connection
+    ///     against it before adopting that connection.
+    /// </summary>
+    private string GetHttp2ConnectionCacheKey(SessionEventArgsBase sessionArgs, string remoteHostName,
+        int remotePort, string? connectHost, int? connectPort, bool originIsHttps = true)
+    {
+        var externalProxy = TcpConnectionFactory.GetEffectiveUpstreamProxy(
+            sessionArgs.CustomUpStreamProxyUsed ?? (originIsHttps ? UpStreamHttpsProxy : UpStreamHttpProxy),
+            remoteHostName, remotePort);
+        var upStreamEndPoint = sessionArgs.HttpClient.UpStreamEndPoint ?? UpStreamEndPoint;
+
+        return TcpConnectionFactory.GetConnectionCacheKey(remoteHostName, remotePort, originIsHttps,
+            originIsHttps ? SslExtensions.Http2ProtocolAsList : null, upStreamEndPoint, externalProxy, connectHost,
+            connectPort);
+    }
+
+    /// <summary>
+    ///     Computes the HTTP/2 capability-cache key used by <see cref="NegotiateHttp2Async" /> (ALPN is
+    ///     deliberately omitted — the capability decision is what chooses ALPN).
+    /// </summary>
+    private string GetHttp2CapabilityCacheKey(SessionEventArgsBase sessionArgs, string remoteHostName,
+        int remotePort, string? connectHost, int? connectPort, bool originIsHttps = true)
+    {
+        var externalProxy = TcpConnectionFactory.GetEffectiveUpstreamProxy(
+            sessionArgs.CustomUpStreamProxyUsed ?? (originIsHttps ? UpStreamHttpsProxy : UpStreamHttpProxy),
+            remoteHostName, remotePort);
+        var upStreamEndPoint = sessionArgs.HttpClient.UpStreamEndPoint ?? UpStreamEndPoint;
+
+        return TcpConnectionFactory.GetConnectionCacheKey(remoteHostName, remotePort, originIsHttps,
+            null, upStreamEndPoint, externalProxy, connectHost, connectPort);
+    }
+
+    /// <summary>
+    ///     Awaits a retained/prefetched connection produced by <see cref="NegotiateHttp2Async" /> and
+    ///     validates that it is still usable as the actual session connection - matching route/cache key,
+    ///     an acceptable negotiated ALPN protocol, and a live socket - before handing it to the caller. A
+    ///     stale, mismatched, cancelled, or broken connection is released (pooled if still healthy, closed
+    ///     otherwise) and null is returned so the caller opens a fresh, correctly keyed connection instead.
+    /// </summary>
+    private async Task<TcpServerConnection?> AdoptRetainedConnectionAsync(
+        Task<TcpServerConnection?>? retainedConnectionTask, string expectedCacheKey,
+        List<SslApplicationProtocol>? expectedApplicationProtocols)
+    {
+        if (retainedConnectionTask == null) return null;
+
+        TcpServerConnection? connection;
+        try
+        {
+            connection = await retainedConnectionTask;
+        }
+        catch (SocketException e) when (e.SocketErrorCode == SocketError.HostNotFound)
+        {
+            ProxyDiagnostics.ReportCaught(logger,
+                "Http2Negotiation retained connection HostNotFound; opening a fresh connection", e);
+            return null;
+        }
+        catch (Exception adoptEx)
+        {
+            ProxyDiagnostics.ReportCaught(logger,
+                "Http2Negotiation retained connection failed; opening a fresh connection", adoptEx);
+            return null;
+        }
+
+        if (connection == null) return null;
+
+        if (connection.CacheKey != expectedCacheKey
+            || !IsApplicationProtocolCompatible(connection.NegotiatedApplicationProtocol,
+                expectedApplicationProtocols)
+            || !connection.TcpSocket.IsGoodConnection())
+        {
+            // stale, mismatched, or broken: release rather than adopt so the caller always ends up with a
+            // fresh, correctly keyed connection instead of one that cannot serve this request.
+            await TcpConnectionFactory.Release(connection, false);
+            return null;
+        }
+
+        return connection;
+    }
+
+    /// <summary>
+    ///     Opens an additional HTTP/2 origin TCP connection for multi-leg same-protocol relay
+    ///     (<see cref="ProxyResourceLimits.MaxOriginHttp2ConnectionsPerAuthority" />).
+    /// </summary>
+    private async Task<TcpServerConnection> OpenAdditionalOriginHttp2ConnectionAsync(
+        string remoteHostName, int remotePort, string? connectHost, int? connectPort,
+        bool originIsHttps, SessionEventArgs sessionArgs, CancellationToken cancellationToken)
+    {
+        var connection = (await TcpConnectionFactory.GetServerConnection(this, remoteHostName, remotePort,
+            HttpHeader.Version20, originIsHttps,
+            originIsHttps ? SslExtensions.Http2ProtocolAsList : null,
+            true, sessionArgs, UpStreamEndPoint,
+            originIsHttps ? UpStreamHttpsProxy : UpStreamHttpProxy, true, false,
+            cancellationToken, connectHost, connectPort))!;
+        if (connection is { Http2Cleartext: false } && !originIsHttps)
+            connection.Http2Cleartext = true;
+        return connection;
+    }
+
+    private static bool IsApplicationProtocolCompatible(SslApplicationProtocol negotiated,
+        List<SslApplicationProtocol>? requestedProtocols)
+    {
+        if (requestedProtocols == null || requestedProtocols.Count == 0) return true;
+
+        // default => not a TLS/ALPN connection (plain HTTP) or unknown; nothing to verify.
+        if (negotiated == default) return true;
+
+        return requestedProtocols.Contains(negotiated);
+    }
+
+    /// <summary>
+    ///     Splits a "host" or "host:port" authority string (e.g. an explicit CONNECT target) into its
+    ///     host and port parts, defaulting the port to <paramref name="defaultPort" /> when absent.
+    /// </summary>
+    private static (string Host, int Port) ParseHostAndPort(string authority, int defaultPort)
+    {
+        return AuthorityParser.Parse(authority, defaultPort);
+    }
+
+    /// <summary>
+    ///     How long a cold HTTP/2 origin probe may block after the MITM leaf certificate is ready.
+    ///     Callers start the probe in parallel with certificate generation so this wait does not stack on
+    ///     first-leaf BouncyCastle cost. Chrome/Edge abort MITM TLS (EOF) and show
+    ///     <c>net::ERR_HTTP2_PROTOCOL_ERROR</c> when ServerHello is delayed by origin I/O plus cert work.
+    ///     Cache hits complete without origin I/O and still win this wait.
+    /// </summary>
+    internal static readonly TimeSpan Http2ServerHelloProbeBudget = TimeSpan.FromMilliseconds(200);
+
+    /// <summary>
+    ///     Returns the negotiation result when it is already complete or finishes inside
+    ///     <see cref="Http2ServerHelloProbeBudget" />; otherwise <see langword="null"/> so the caller can
+    ///     offer <c>h2</c> speculatively without stalling ServerHello further.
+    /// </summary>
+    internal static async Task<Http2NegotiationResult?> TryCompleteHttp2NegotiationBeforeClientAlpnAsync(
+        Task<Http2NegotiationResult> negotiationTask, CancellationToken cancellationToken)
+    {
+        if (negotiationTask.IsCompleted)
+            return await negotiationTask.ConfigureAwait(false);
+
+        try
+        {
+            return await negotiationTask.WaitAsync(Http2ServerHelloProbeBudget, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (TimeoutException) when (!negotiationTask.IsCompleted)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    ///     Applies the result of a completed HTTP/2 negotiation <em>before</em> the client TLS
+    ///     <c>AuthenticateAsServerAsync</c> call, deciding what ALPN to offer in the ServerHello.
+    ///     <para>
+    ///         <b>Speculative h2 correctness:</b>
+    ///         <list type="bullet">
+    ///             <item>
+    ///                 Probe done before ServerHello (warm cache or probe finishes within
+    ///                 <see cref="Http2ServerHelloProbeBudget" />): <paramref name="negotiation" /> is not null.
+    ///                 <c>http2Supported</c> is set correctly — h2 is offered only if the origin actually
+    ///                 supports it and <see cref="TunnelConnectEventArgs.AllowHttpProtocolTranslation" /> is
+    ///                 respected for the h1-only origin case (no false h2 promise to the client).
+    ///             </item>
+    ///             <item>
+    ///                 Probe not done (slow cold start): speculation offers h2 if the client offered it.
+    ///                 Once TLS completes, <see cref="ApplyDeferredHttp2Negotiation" /> applies the real
+    ///                 result. If origin is h1-only the bridge is activated transparently — the browser
+    ///                 never sees a protocol violation. If the probe failed entirely the bridge is still
+    ///                 activated (h2-over-h1.1 fallback) — the browser retries at h1.1 semantics through
+    ///                 the bridge without knowing about the origin error.
+    ///             </item>
+    ///         </list>
+    ///     </para>
+    ///     <para>
+    ///         <b>AllowHttpProtocolTranslation=false:</b> honoured only when the probe finishes before
+    ///         ServerHello (the common warm path). In the rare cold-start speculative case the bridge is
+    ///         always activated when needed because the ALPN cannot be revised after ServerHello.
+    ///     </para>
+    /// </summary>
+    private static void ApplyHttp2NegotiationBeforeClientAlpn(
+        Http2NegotiationResult negotiation,
+        out bool http2Supported,
+        out bool requiresHttp11Bridge,
+        out bool requiresH2OriginBridge,
+        out Task<TcpServerConnection?>? retained)
+    {
+        requiresHttp11Bridge = negotiation.RequiresHttp11Bridge;
+        requiresH2OriginBridge = negotiation.RequiresH2OriginBridge;
+        retained = negotiation.RetainedConnectionTask;
+        http2Supported = (negotiation.OriginSupportsHttp2 && !requiresH2OriginBridge)
+                         || requiresHttp11Bridge;
+    }
+
+    internal static void ApplyDeferredHttp2Negotiation(
+        Http2NegotiationResult negotiation,
+        bool clientHttp2AlreadyOffered,
+        bool allowHttpProtocolTranslation,
+        ref bool requiresHttp11Bridge,
+        ref bool requiresH2OriginBridge,
+        ref Task<TcpServerConnection?>? prefetchConnectionTask)
+    {
+        requiresHttp11Bridge = negotiation.RequiresHttp11Bridge;
+        requiresH2OriginBridge = negotiation.RequiresH2OriginBridge;
+        if (negotiation.RetainedConnectionTask != null)
+            prefetchConnectionTask = negotiation.RetainedConnectionTask;
+
+        _ = allowHttpProtocolTranslation;
+
+        // Speculative client h2 cannot be undone: ServerHello already advertised h2. Bridge onto
+        // HTTP/1.1 whenever the origin is not h2, including AllowHttpProtocolTranslation=false —
+        // otherwise Chrome/Edge see net::ERR_HTTP2_PROTOCOL_ERROR on a committed h2 ALPN.
+        // A learnable origin TLS failure records bypass for the next CONNECT instead of opening a
+        // doomed H1 origin handshake.
+        if (clientHttp2AlreadyOffered && !negotiation.OriginSupportsHttp2 && !requiresH2OriginBridge
+            && !negotiation.LearnableOriginTlsFailure)
+            requiresHttp11Bridge = true;
+    }
+
+    private async Task<(bool RequiresHttp11Bridge, bool RequiresH2OriginBridge, Task<TcpServerConnection?>? Prefetch)>
+        AwaitAndApplyDeferredHttp2NegotiationAsync(
+            Task<Http2NegotiationResult> deferred,
+            string hostForBypass,
+            bool clientHttp2AlreadyOffered,
+            bool allowHttpProtocolTranslation,
+            Task<TcpServerConnection?>? existingPrefetch,
+            CancellationToken cancellationToken)
+    {
+        Http2NegotiationResult negotiation;
+        try
+        {
+            negotiation = await deferred.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (ProxyConnectException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            ProxyLog.Http2ProbeDeferredFailed(logger, hostForBypass, ex);
+            // If h2 was already speculatively committed in the ServerHello, bridge to h1.1
+            // so the client does not get ERR_HTTP2_PROTOCOL_ERROR. If h1.1 was offered
+            // (probe completed before AuthenticateAsServer), no bridging is needed.
+            return (clientHttp2AlreadyOffered, false, existingPrefetch);
+        }
+
+        if (EnableDecryptFailureBypass && negotiation.LearnableOriginTlsFailure)
+            TryRecordDecryptFailure(hostForBypass, error: null, forceBypass: true);
+
+        var requiresHttp11Bridge = negotiation.RequiresHttp11Bridge;
+        var requiresH2OriginBridge = negotiation.RequiresH2OriginBridge;
+        var prefetch = existingPrefetch;
+
+        // Client ALPN is already http/1.1 and this is not an H1→H2 origin bridge: do not
+        // adopt an h2 discovery socket on the HTTP/1.1 pipeline.
+        if (!clientHttp2AlreadyOffered && negotiation.OriginSupportsHttp2 &&
+            !negotiation.RequiresH2OriginBridge && negotiation.RetainedConnectionTask != null)
+        {
+            _ = TcpConnectionFactory.Release(negotiation.RetainedConnectionTask, true);
+            ApplyDeferredHttp2Negotiation(
+                new Http2NegotiationResult(negotiation.OriginSupportsHttp2, null,
+                    negotiation.RequiresHttp11Bridge, negotiation.RequiresH2OriginBridge,
+                    negotiation.LearnableOriginTlsFailure),
+                clientHttp2AlreadyOffered, allowHttpProtocolTranslation,
+                ref requiresHttp11Bridge, ref requiresH2OriginBridge, ref prefetch);
+            return (requiresHttp11Bridge, requiresH2OriginBridge, prefetch);
+        }
+
+        ApplyDeferredHttp2Negotiation(negotiation, clientHttp2AlreadyOffered, allowHttpProtocolTranslation,
+            ref requiresHttp11Bridge, ref requiresH2OriginBridge, ref prefetch);
+        return (requiresHttp11Bridge, requiresH2OriginBridge, prefetch);
+    }
+
+    private void AbandonDeferredHttp2Negotiation(Task<Http2NegotiationResult>? deferred)
+    {
+        if (deferred == null)
+            return;
+
+        _ = ReleaseAbandonedHttp2NegotiationAsync(deferred);
+    }
+
+    private async Task ReleaseAbandonedHttp2NegotiationAsync(Task<Http2NegotiationResult> deferred)
+    {
+        try
+        {
+            var result = await deferred.ConfigureAwait(false);
+            if (result.RetainedConnectionTask != null)
+                await TcpConnectionFactory.Release(result.RetainedConnectionTask, true).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Probe failed independently of the aborted client handshake.
+        }
+    }
+}

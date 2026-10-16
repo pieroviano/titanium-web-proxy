@@ -2,11 +2,10 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFrameworks>net48;net5.0</TargetFrameworks>
-    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
-    <IncludeSymbols Condition="'$(Configuration)'=='Debug'">true</IncludeSymbols>
-    <SymbolPackageFormat Condition="'$(Configuration)'=='Debug'">snupkg</SymbolPackageFormat>
-    <IncludeSymbols Condition="'$(Configuration)'!='Debug'">false</IncludeSymbols>
+    <TargetFramework>net10.0</TargetFramework>
+    <ApplicationIcon>app.ico</ApplicationIcon>
+    <AssemblyTitle>Titanium Web Proxy</AssemblyTitle>
+    <Product>Titanium Web Proxy</Product>
   </PropertyGroup>
 
   <PropertyGroup>
@@ -15,6 +14,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Titanium.Web.Proxy\Titanium.Web.Proxy.csproj" />
+    <ProjectReference Include="..\Titanium.Web.Proxy.Examples.Shared\Titanium.Web.Proxy.Examples.Shared.csproj" />
   </ItemGroup>
 
 </Project>

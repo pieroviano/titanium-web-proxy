@@ -1,6 +1,8 @@
-﻿using System;
+using System;
 using System.Net.Security;
 using System.Security.Cryptography.X509Certificates;
+using System.Threading;
+using System.Threading.Tasks;
 using Titanium.Web.Proxy.EventArguments;
 using Titanium.Web.Proxy.Extensions;
 
@@ -17,21 +19,32 @@ public partial class ProxyServer
     /// <param name="chain">The certificate chain.</param>
     /// <param name="sslPolicyErrors">Ssl policy errors</param>
     /// <returns>Return true if valid certificate.</returns>
-    internal bool ValidateServerCertificate(object sender, SessionEventArgsBase sessionArgs,
-        X509Certificate certificate, X509Chain chain,
+    internal bool ValidateServerCertificate(object sender, SessionEventArgsBase? sessionArgs,
+        X509Certificate? certificate, X509Chain? chain,
         SslPolicyErrors sslPolicyErrors)
     {
         // if user callback is registered then do it
-        if (ServerCertificateValidationCallback != null)
+        if (ServerCertificateValidationCallback != null && sessionArgs != null)
         {
             var args = new CertificateValidationEventArgs(sessionArgs, certificate, chain, sslPolicyErrors);
 
-            // why is the sender null?
-            ServerCertificateValidationCallback.InvokeAsync(this, args, ExceptionFunc).Wait();
+            // Prefer completing synchronously when handlers return completed tasks — .Wait() on the
+            // handshake path parked a worker even for Task.CompletedTask (probe loopback CA).
+            // When not already completed, run on the ThreadPool so a user callback that posts back to
+            // a captured SynchronizationContext cannot deadlock the handshake thread.
+            // Opt out of session cancellation explicitly (S8949): observing sessionArgs.CancellationToken
+            // here surfaces OperationCanceledException as a first-chance on keep-alive happy paths when
+            // the token races the handshake, and canceling mid-callback would leave SslStream half-done.
+            var pending = ServerCertificateValidationCallback.InvokeAsync(this, args, logger);
+            if (!pending.IsCompletedSuccessfully)
+                Task.Run(() => pending, CancellationToken.None).GetAwaiter().GetResult();
             return args.IsValid;
         }
 
         if (sslPolicyErrors == SslPolicyErrors.None) return true;
+
+        if (IgnoreServerCertificateErrors)
+            return true;
 
         // By default
         // do not allow this client to communicate with unauthenticated servers.
@@ -48,10 +61,10 @@ public partial class ProxyServer
     /// <param name="remoteCertificate">The remote certificate of server.</param>
     /// <param name="acceptableIssuers">The acceptable issues for client certificate as listed by server.</param>
     /// <returns></returns>
-    internal X509Certificate? SelectClientCertificate(object sender, SessionEventArgsBase sessionArgs,
+    internal X509Certificate? SelectClientCertificate(object sender, SessionEventArgsBase? sessionArgs,
         string targetHost,
-        X509CertificateCollection localCertificates,
-        X509Certificate remoteCertificate, string[] acceptableIssuers)
+        X509CertificateCollection? localCertificates,
+        X509Certificate? remoteCertificate, string[]? acceptableIssuers)
     {
         X509Certificate? clientCertificate = null;
 
@@ -70,16 +83,18 @@ public partial class ProxyServer
             clientCertificate = localCertificates[0];
 
         // If user call back is registered
-        if (ClientCertificateSelectionCallback != null)
+        if (ClientCertificateSelectionCallback != null && sessionArgs != null)
         {
-            var args = new CertificateSelectionEventArgs(sessionArgs, targetHost, localCertificates, remoteCertificate,
-                acceptableIssuers)
+            var args = new CertificateSelectionEventArgs(sessionArgs, targetHost,
+                localCertificates ?? new X509CertificateCollection(), remoteCertificate,
+                acceptableIssuers ?? Array.Empty<string>())
             {
                 ClientCertificate = clientCertificate
             };
 
 
-            ClientCertificateSelectionCallback.InvokeAsync(this, args, ExceptionFunc).Wait();
+            ClientCertificateSelectionCallback.InvokeAsync(this, args, logger)
+                .Wait(sessionArgs.CancellationToken);
             return args.ClientCertificate;
         }
 

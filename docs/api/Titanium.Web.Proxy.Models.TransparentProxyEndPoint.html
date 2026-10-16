@@ -1,23 +1,21 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <!--[if IE]><![endif]-->
 <html>
-  
+
   <head>
     <meta charset="utf-8">
-    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
-    <title>Class TransparentProxyEndPoint
-   | Titanium Web Proxy </title>
-    <meta name="viewport" content="width=device-width">
-    <meta name="title" content="Class TransparentProxyEndPoint
-   | Titanium Web Proxy ">
-    <meta name="generator" content="docfx 2.59.4.0">
+      <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+      <title>Class TransparentProxyEndPoint | Titanium Web Proxy </title>
+      <meta name="viewport" content="width=device-width">
+      <meta name="title" content="Class TransparentProxyEndPoint | Titanium Web Proxy ">
     
-    <link rel="shortcut icon" href="../favicon.ico">
-    <link rel="stylesheet" href="../styles/docfx.vendor.css">
-    <link rel="stylesheet" href="../styles/docfx.css">
-    <link rel="stylesheet" href="../styles/main.css">
-    <meta property="docfx:navrel" content="">
-    <meta property="docfx:tocrel" content="toc.html">
+    <meta name="description" content="A proxy end point client is not aware of. Useful when requests are redirected to this proxy end point through port forwarding via router.      When  is true (and      is enabled with ),     the endpoint also listens for HTTP/3 on the same IP:port over UDP and injects     Alt-Svc: h3=&quot;:PORT&quot; into H1/H2 responses — reverse HTTPS with Alt-Svc advertisement.">
+      <link rel="shortcut icon" href="../favicon.ico">
+      <link rel="stylesheet" href="../styles/docfx.vendor.min.css">
+      <link rel="stylesheet" href="../styles/docfx.css">
+      <link rel="stylesheet" href="../styles/main.css">
+      <meta property="docfx:navrel" content="">
+      <meta property="docfx:tocrel" content="toc.html">
     
     <meta property="docfx:rel" content="../">
     
@@ -25,7 +23,7 @@
   <body data-spy="scroll" data-target="#affix" data-offset="120">
     <div id="wrapper">
       <header>
-        
+
         <nav id="autocollapse" class="navbar navbar-inverse ng-scope" role="navigation">
           <div class="container">
             <div class="navbar-header">
@@ -35,7 +33,7 @@
                 <span class="icon-bar"></span>
                 <span class="icon-bar"></span>
               </button>
-              
+
               <a class="navbar-brand" href="../index.html">
                 <img id="logo" class="svg" src="../logo.svg" alt="">
               </a>
@@ -49,7 +47,7 @@
             </div>
           </div>
         </nav>
-        
+
         <div class="subnav navbar navbar-default">
           <div class="container hide-when-search" id="breadcrumb">
             <ul class="breadcrumb">
@@ -59,17 +57,17 @@
         </div>
       </header>
       <div class="container body-content">
-        
+
         <div id="search-results">
           <div class="search-list">Search Results for <span></span></div>
           <div class="sr-items">
             <p><i class="glyphicon glyphicon-refresh index-loading"></i></p>
           </div>
-          <ul id="pagination" data-first="First" data-prev="Previous" data-next="Next" data-last="Last"></ul>
+          <ul id="pagination" data-first=First data-prev=Previous data-next=Next data-last=Last></ul>
         </div>
       </div>
       <div role="main" class="container body-content hide-when-search">
-        
+
         <div class="sidenav hide-when-search">
           <a class="btn toc-toggle collapse" data-toggle="collapse" href="#sidetoggle" aria-expanded="false" aria-controls="sidetoggle">Show / Hide Table of Contents</a>
           <div class="sidetoggle collapse" id="sidetoggle">
@@ -79,23 +77,38 @@
         <div class="article row grid-right">
           <div class="col-md-10">
             <article class="content wrap" id="_content" data-uid="Titanium.Web.Proxy.Models.TransparentProxyEndPoint">
-  
-  
-  <h1 id="Titanium_Web_Proxy_Models_TransparentProxyEndPoint" data-uid="Titanium.Web.Proxy.Models.TransparentProxyEndPoint" class="text-break">Class TransparentProxyEndPoint
-  </h1>
+
+
+
+  <h1 id="Titanium_Web_Proxy_Models_TransparentProxyEndPoint" data-uid="Titanium.Web.Proxy.Models.TransparentProxyEndPoint" class="text-break">Class TransparentProxyEndPoint</h1>
   <div class="markdown level0 summary"><p>A proxy end point client is not aware of.
 Useful when requests are redirected to this proxy end point through port forwarding via router.</p>
+<p>
+    When <a class="xref" href="Titanium.Web.Proxy.Models.TransparentProxyEndPoint.html#Titanium_Web_Proxy_Models_TransparentProxyEndPoint_EnableHttp3">EnableHttp3</a> is <a href="https://learn.microsoft.com/dotnet/csharp/language-reference/builtin-types/bool">true</a> (and
+    <a class="xref" href="Titanium.Web.Proxy.ProxyServer.html#Titanium_Web_Proxy_ProxyServer_EnableHttp3">EnableHttp3</a> is enabled with <a class="xref" href="Titanium.Web.Proxy.Models.ProxyEndPoint.html#Titanium_Web_Proxy_Models_ProxyEndPoint_DecryptSsl">DecryptSsl</a>),
+    the endpoint also listens for HTTP/3 on the same IP:port over UDP and injects
+    <code>Alt-Svc: h3=":PORT"</code> into H1/H2 responses — reverse HTTPS with Alt-Svc advertisement.
+</p>
 </div>
   <div class="markdown level0 conceptual"></div>
   <div class="inheritance">
     <h5>Inheritance</h5>
-    <div class="level0"><a class="xref" href="https://learn.microsoft.com/dotnet/api/system.object">Object</a></div>
+    <div class="level0"><a class="xref" href="https://learn.microsoft.com/dotnet/api/system.object">object</a></div>
     <div class="level1"><a class="xref" href="Titanium.Web.Proxy.Models.ProxyEndPoint.html">ProxyEndPoint</a></div>
     <div class="level2"><a class="xref" href="Titanium.Web.Proxy.Models.TransparentBaseProxyEndPoint.html">TransparentBaseProxyEndPoint</a></div>
     <div class="level3"><span class="xref">TransparentProxyEndPoint</span></div>
   </div>
   <div class="inheritedMembers">
     <h5>Inherited Members</h5>
+    <div>
+      <a class="xref" href="Titanium.Web.Proxy.Models.TransparentBaseProxyEndPoint.html#Titanium_Web_Proxy_Models_TransparentBaseProxyEndPoint_ForwardHost">TransparentBaseProxyEndPoint.ForwardHost</a>
+    </div>
+    <div>
+      <a class="xref" href="Titanium.Web.Proxy.Models.TransparentBaseProxyEndPoint.html#Titanium_Web_Proxy_Models_TransparentBaseProxyEndPoint_ForwardPort">TransparentBaseProxyEndPoint.ForwardPort</a>
+    </div>
+    <div>
+      <a class="xref" href="Titanium.Web.Proxy.Models.TransparentBaseProxyEndPoint.html#Titanium_Web_Proxy_Models_TransparentBaseProxyEndPoint_ForwardCleartext">TransparentBaseProxyEndPoint.ForwardCleartext</a>
+    </div>
     <div>
       <a class="xref" href="Titanium.Web.Proxy.Models.ProxyEndPoint.html#Titanium_Web_Proxy_Models_ProxyEndPoint_IpAddress">ProxyEndPoint.IpAddress</a>
     </div>
@@ -109,53 +122,65 @@ Useful when requests are redirected to this proxy end point through port forward
       <a class="xref" href="Titanium.Web.Proxy.Models.ProxyEndPoint.html#Titanium_Web_Proxy_Models_ProxyEndPoint_GenericCertificate">ProxyEndPoint.GenericCertificate</a>
     </div>
     <div>
-      <a class="xref" href="https://learn.microsoft.com/dotnet/api/system.object.tostring#system-object-tostring">Object.ToString()</a>
+      <a class="xref" href="Titanium.Web.Proxy.Models.ProxyEndPoint.html#Titanium_Web_Proxy_Models_ProxyEndPoint_MaxCachedConnections">ProxyEndPoint.MaxCachedConnections</a>
     </div>
     <div>
-      <a class="xref" href="https://learn.microsoft.com/dotnet/api/system.object.equals#system-object-equals(system-object)">Object.Equals(Object)</a>
+      <a class="xref" href="Titanium.Web.Proxy.Models.ProxyEndPoint.html#Titanium_Web_Proxy_Models_ProxyEndPoint_MaxConcurrentClients">ProxyEndPoint.MaxConcurrentClients</a>
     </div>
     <div>
-      <a class="xref" href="https://learn.microsoft.com/dotnet/api/system.object.equals#system-object-equals(system-object-system-object)">Object.Equals(Object, Object)</a>
+      <a class="xref" href="Titanium.Web.Proxy.Models.ProxyEndPoint.html#Titanium_Web_Proxy_Models_ProxyEndPoint_EnableHttpInterception">ProxyEndPoint.EnableHttpInterception</a>
     </div>
     <div>
-      <a class="xref" href="https://learn.microsoft.com/dotnet/api/system.object.referenceequals#system-object-referenceequals(system-object-system-object)">Object.ReferenceEquals(Object, Object)</a>
+      <a class="xref" href="Titanium.Web.Proxy.Models.ProxyEndPoint.html#Titanium_Web_Proxy_Models_ProxyEndPoint_AdmittedClientCount">ProxyEndPoint.AdmittedClientCount</a>
     </div>
     <div>
-      <a class="xref" href="https://learn.microsoft.com/dotnet/api/system.object.gethashcode#system-object-gethashcode">Object.GetHashCode()</a>
+      <a class="xref" href="https://learn.microsoft.com/dotnet/api/system.object.equals#system-object-equals(system-object)">object.Equals(object)</a>
     </div>
     <div>
-      <a class="xref" href="https://learn.microsoft.com/dotnet/api/system.object.gettype#system-object-gettype">Object.GetType()</a>
+      <a class="xref" href="https://learn.microsoft.com/dotnet/api/system.object.equals#system-object-equals(system-object-system-object)">object.Equals(object, object)</a>
     </div>
     <div>
-      <a class="xref" href="https://learn.microsoft.com/dotnet/api/system.object.memberwiseclone#system-object-memberwiseclone">Object.MemberwiseClone()</a>
+      <a class="xref" href="https://learn.microsoft.com/dotnet/api/system.object.gethashcode">object.GetHashCode()</a>
+    </div>
+    <div>
+      <a class="xref" href="https://learn.microsoft.com/dotnet/api/system.object.gettype">object.GetType()</a>
+    </div>
+    <div>
+      <a class="xref" href="https://learn.microsoft.com/dotnet/api/system.object.memberwiseclone">object.MemberwiseClone()</a>
+    </div>
+    <div>
+      <a class="xref" href="https://learn.microsoft.com/dotnet/api/system.object.referenceequals">object.ReferenceEquals(object, object)</a>
+    </div>
+    <div>
+      <a class="xref" href="https://learn.microsoft.com/dotnet/api/system.object.tostring">object.ToString()</a>
     </div>
   </div>
-  <h6><strong>Namespace</strong>: <a class="xref" href="Titanium.Web.Proxy.Models.html">Titanium.Web.Proxy.Models</a></h6>
+  <h6><strong>Namespace</strong>: <span class="xref">Titanium</span>.<span class="xref">Web</span>.<a class="xref" href="Titanium.Web.Proxy.html">Proxy</a>.<a class="xref" href="Titanium.Web.Proxy.Models.html">Models</a></h6>
   <h6><strong>Assembly</strong>: Titanium.Web.Proxy.dll</h6>
   <h5 id="Titanium_Web_Proxy_Models_TransparentProxyEndPoint_syntax">Syntax</h5>
   <div class="codewrapper">
     <pre><code class="lang-csharp hljs">public class TransparentProxyEndPoint : TransparentBaseProxyEndPoint</code></pre>
   </div>
   <h3 id="constructors">Constructors
-  </h3>
+</h3>
   <span class="small pull-right mobile-hide">
     <span class="divider">|</span>
-    <a href="https://github.com/pieroviano/titanium-web-proxy/new/develop/apiSpec/new?filename=Titanium_Web_Proxy_Models_TransparentProxyEndPoint__ctor_System_Net_IPAddress_System_Int32_System_Boolean_.md&amp;value=---%0Auid%3A%20Titanium.Web.Proxy.Models.TransparentProxyEndPoint.%23ctor(System.Net.IPAddress%2CSystem.Int32%2CSystem.Boolean)%0Asummary%3A%20'*You%20can%20override%20summary%20for%20the%20API%20here%20using%20*MARKDOWN*%20syntax'%0A---%0A%0A*Please%20type%20below%20more%20information%20about%20this%20API%3A*%0A%0A">Improve this Doc</a>
+    <a href="https://github.com/justcoding121/titanium-web-proxy/new/develop/apiSpec/new?filename=Titanium_Web_Proxy_Models_TransparentProxyEndPoint__ctor_System_Net_IPAddress_System_Int32_System_Boolean_.md&amp;value=---%0Auid%3A%20Titanium.Web.Proxy.Models.TransparentProxyEndPoint.%23ctor(System.Net.IPAddress%2CSystem.Int32%2CSystem.Boolean)%0Asummary%3A%20&#39;*You%20can%20override%20summary%20for%20the%20API%20here%20using%20*MARKDOWN*%20syntax&#39;%0A---%0A%0A*Please%20type%20below%20more%20information%20about%20this%20API%3A*%0A%0A">Edit this page</a>
   </span>
   <span class="small pull-right mobile-hide">
-    <a href="https://github.com/pieroviano/titanium-web-proxy/blob/develop/src/Titanium.Web.Proxy/Models/TransparentProxyEndPoint.cs/#L22">View Source</a>
+    <a href="https://github.com/justcoding121/titanium-web-proxy/blob/develop/src/Titanium.Web.Proxy/Models/TransparentProxyEndPoint.cs/#L37">View Source</a>
   </span>
   <a id="Titanium_Web_Proxy_Models_TransparentProxyEndPoint__ctor_" data-uid="Titanium.Web.Proxy.Models.TransparentProxyEndPoint.#ctor*"></a>
-  <h4 id="Titanium_Web_Proxy_Models_TransparentProxyEndPoint__ctor_System_Net_IPAddress_System_Int32_System_Boolean_" data-uid="Titanium.Web.Proxy.Models.TransparentProxyEndPoint.#ctor(System.Net.IPAddress,System.Int32,System.Boolean)">TransparentProxyEndPoint(IPAddress, Int32, Boolean)</h4>
+  <h4 id="Titanium_Web_Proxy_Models_TransparentProxyEndPoint__ctor_System_Net_IPAddress_System_Int32_System_Boolean_" data-uid="Titanium.Web.Proxy.Models.TransparentProxyEndPoint.#ctor(System.Net.IPAddress,System.Int32,System.Boolean)">TransparentProxyEndPoint(IPAddress, int, bool)</h4>
   <div class="markdown level1 summary"><p>Initialize a new instance.</p>
 </div>
   <div class="markdown level1 conceptual"></div>
-  <h5 class="decalaration">Declaration</h5>
+  <h5 class="declaration">Declaration</h5>
   <div class="codewrapper">
     <pre><code class="lang-csharp hljs">public TransparentProxyEndPoint(IPAddress ipAddress, int port, bool decryptSsl = true)</code></pre>
   </div>
   <h5 class="parameters">Parameters</h5>
-  <table class="table table-bordered table-striped table-condensed">
+  <table class="table table-bordered table-condensed">
     <thead>
       <tr>
         <th>Type</th>
@@ -171,13 +196,13 @@ Useful when requests are redirected to this proxy end point through port forward
 </td>
       </tr>
       <tr>
-        <td><a class="xref" href="https://learn.microsoft.com/dotnet/api/system.int32">Int32</a></td>
+        <td><a class="xref" href="https://learn.microsoft.com/dotnet/api/system.int32">int</a></td>
         <td><span class="parametername">port</span></td>
         <td><p>Listening port.</p>
 </td>
       </tr>
       <tr>
-        <td><a class="xref" href="https://learn.microsoft.com/dotnet/api/system.boolean">Boolean</a></td>
+        <td><a class="xref" href="https://learn.microsoft.com/dotnet/api/system.boolean">bool</a></td>
         <td><span class="parametername">decryptSsl</span></td>
         <td><p>Should we decrypt ssl?</p>
 </td>
@@ -185,26 +210,32 @@ Useful when requests are redirected to this proxy end point through port forward
     </tbody>
   </table>
   <h3 id="properties">Properties
-  </h3>
+</h3>
   <span class="small pull-right mobile-hide">
     <span class="divider">|</span>
-    <a href="https://github.com/pieroviano/titanium-web-proxy/new/develop/apiSpec/new?filename=Titanium_Web_Proxy_Models_TransparentProxyEndPoint_GenericCertificateName.md&amp;value=---%0Auid%3A%20Titanium.Web.Proxy.Models.TransparentProxyEndPoint.GenericCertificateName%0Asummary%3A%20'*You%20can%20override%20summary%20for%20the%20API%20here%20using%20*MARKDOWN*%20syntax'%0A---%0A%0A*Please%20type%20below%20more%20information%20about%20this%20API%3A*%0A%0A">Improve this Doc</a>
+    <a href="https://github.com/justcoding121/titanium-web-proxy/new/develop/apiSpec/new?filename=Titanium_Web_Proxy_Models_TransparentProxyEndPoint_EnableHttp3.md&amp;value=---%0Auid%3A%20Titanium.Web.Proxy.Models.TransparentProxyEndPoint.EnableHttp3%0Asummary%3A%20&#39;*You%20can%20override%20summary%20for%20the%20API%20here%20using%20*MARKDOWN*%20syntax&#39;%0A---%0A%0A*Please%20type%20below%20more%20information%20about%20this%20API%3A*%0A%0A">Edit this page</a>
   </span>
   <span class="small pull-right mobile-hide">
-    <a href="https://github.com/pieroviano/titanium-web-proxy/blob/develop/src/Titanium.Web.Proxy/Models/TransparentProxyEndPoint.cs/#L32">View Source</a>
+    <a href="https://github.com/justcoding121/titanium-web-proxy/blob/develop/src/Titanium.Web.Proxy/Models/TransparentProxyEndPoint.cs/#L58">View Source</a>
   </span>
-  <a id="Titanium_Web_Proxy_Models_TransparentProxyEndPoint_GenericCertificateName_" data-uid="Titanium.Web.Proxy.Models.TransparentProxyEndPoint.GenericCertificateName*"></a>
-  <h4 id="Titanium_Web_Proxy_Models_TransparentProxyEndPoint_GenericCertificateName" data-uid="Titanium.Web.Proxy.Models.TransparentProxyEndPoint.GenericCertificateName">GenericCertificateName</h4>
-  <div class="markdown level1 summary"><p>Name of the Certificate need to be sent (same as the hostname we want to proxy).
-This is valid only when UseServerNameIndication is set to false.</p>
+  <a id="Titanium_Web_Proxy_Models_TransparentProxyEndPoint_EnableHttp3_" data-uid="Titanium.Web.Proxy.Models.TransparentProxyEndPoint.EnableHttp3*"></a>
+  <h4 id="Titanium_Web_Proxy_Models_TransparentProxyEndPoint_EnableHttp3" data-uid="Titanium.Web.Proxy.Models.TransparentProxyEndPoint.EnableHttp3">EnableHttp3</h4>
+  <div class="markdown level1 summary"><p>When <a href="https://learn.microsoft.com/dotnet/csharp/language-reference/builtin-types/bool">true</a>, also accept inbound HTTP/3 (QUIC) on the same IP:port as the
+TCP listener and advertise it via <code>Alt-Svc</code> on H1/H2 responses. Requires
+<a class="xref" href="Titanium.Web.Proxy.ProxyServer.html#Titanium_Web_Proxy_ProxyServer_EnableHttp3">EnableHttp3</a> and <a class="xref" href="Titanium.Web.Proxy.Models.ProxyEndPoint.html#Titanium_Web_Proxy_Models_ProxyEndPoint_DecryptSsl">DecryptSsl</a>.
+Default: <a href="https://learn.microsoft.com/dotnet/csharp/language-reference/builtin-types/bool">false</a>.</p>
+<p>
+    <b>Experimental:</b> Suppress <code>TWP001</code> to opt in.
+</p>
 </div>
   <div class="markdown level1 conceptual"></div>
-  <h5 class="decalaration">Declaration</h5>
+  <h5 class="declaration">Declaration</h5>
   <div class="codewrapper">
-    <pre><code class="lang-csharp hljs">public override string GenericCertificateName { get; set; }</code></pre>
+    <pre><code class="lang-csharp hljs">[Experimental(&quot;TWP001&quot;)]
+public bool EnableHttp3 { get; set; }</code></pre>
   </div>
   <h5 class="propertyValue">Property Value</h5>
-  <table class="table table-bordered table-striped table-condensed">
+  <table class="table table-bordered table-condensed">
     <thead>
       <tr>
         <th>Type</th>
@@ -213,32 +244,258 @@ This is valid only when UseServerNameIndication is set to false.</p>
     </thead>
     <tbody>
       <tr>
-        <td><a class="xref" href="https://learn.microsoft.com/dotnet/api/system.string">String</a></td>
+        <td><a class="xref" href="https://learn.microsoft.com/dotnet/api/system.boolean">bool</a></td>
+        <td></td>
+      </tr>
+    </tbody>
+  </table>
+  <span class="small pull-right mobile-hide">
+    <span class="divider">|</span>
+    <a href="https://github.com/justcoding121/titanium-web-proxy/new/develop/apiSpec/new?filename=Titanium_Web_Proxy_Models_TransparentProxyEndPoint_GenericCertificateName.md&amp;value=---%0Auid%3A%20Titanium.Web.Proxy.Models.TransparentProxyEndPoint.GenericCertificateName%0Asummary%3A%20&#39;*You%20can%20override%20summary%20for%20the%20API%20here%20using%20*MARKDOWN*%20syntax&#39;%0A---%0A%0A*Please%20type%20below%20more%20information%20about%20this%20API%3A*%0A%0A">Edit this page</a>
+  </span>
+  <span class="small pull-right mobile-hide">
+    <a href="https://github.com/justcoding121/titanium-web-proxy/blob/develop/src/Titanium.Web.Proxy/Models/TransparentProxyEndPoint.cs/#L47">View Source</a>
+  </span>
+  <a id="Titanium_Web_Proxy_Models_TransparentProxyEndPoint_GenericCertificateName_" data-uid="Titanium.Web.Proxy.Models.TransparentProxyEndPoint.GenericCertificateName*"></a>
+  <h4 id="Titanium_Web_Proxy_Models_TransparentProxyEndPoint_GenericCertificateName" data-uid="Titanium.Web.Proxy.Models.TransparentProxyEndPoint.GenericCertificateName">GenericCertificateName</h4>
+  <div class="markdown level1 summary"><p>Name of the Certificate need to be sent (same as the hostname we want to proxy).
+This is valid only when UseServerNameIndication is set to false.</p>
+</div>
+  <div class="markdown level1 conceptual"></div>
+  <h5 class="declaration">Declaration</h5>
+  <div class="codewrapper">
+    <pre><code class="lang-csharp hljs">public override string GenericCertificateName { get; set; }</code></pre>
+  </div>
+  <h5 class="propertyValue">Property Value</h5>
+  <table class="table table-bordered table-condensed">
+    <thead>
+      <tr>
+        <th>Type</th>
+        <th>Description</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><a class="xref" href="https://learn.microsoft.com/dotnet/api/system.string">string</a></td>
         <td></td>
       </tr>
     </tbody>
   </table>
   <h5 class="overrides">Overrides</h5>
   <div><a class="xref" href="Titanium.Web.Proxy.Models.TransparentBaseProxyEndPoint.html#Titanium_Web_Proxy_Models_TransparentBaseProxyEndPoint_GenericCertificateName">TransparentBaseProxyEndPoint.GenericCertificateName</a></div>
-  <h3 id="events">Events
-  </h3>
   <span class="small pull-right mobile-hide">
     <span class="divider">|</span>
-    <a href="https://github.com/pieroviano/titanium-web-proxy/new/develop/apiSpec/new?filename=Titanium_Web_Proxy_Models_TransparentProxyEndPoint_BeforeSslAuthenticate.md&amp;value=---%0Auid%3A%20Titanium.Web.Proxy.Models.TransparentProxyEndPoint.BeforeSslAuthenticate%0Asummary%3A%20'*You%20can%20override%20summary%20for%20the%20API%20here%20using%20*MARKDOWN*%20syntax'%0A---%0A%0A*Please%20type%20below%20more%20information%20about%20this%20API%3A*%0A%0A">Improve this Doc</a>
+    <a href="https://github.com/justcoding121/titanium-web-proxy/new/develop/apiSpec/new?filename=Titanium_Web_Proxy_Models_TransparentProxyEndPoint_HandshakeTimeout.md&amp;value=---%0Auid%3A%20Titanium.Web.Proxy.Models.TransparentProxyEndPoint.HandshakeTimeout%0Asummary%3A%20&#39;*You%20can%20override%20summary%20for%20the%20API%20here%20using%20*MARKDOWN*%20syntax&#39;%0A---%0A%0A*Please%20type%20below%20more%20information%20about%20this%20API%3A*%0A%0A">Edit this page</a>
   </span>
   <span class="small pull-right mobile-hide">
-    <a href="https://github.com/pieroviano/titanium-web-proxy/blob/develop/src/Titanium.Web.Proxy/Models/TransparentProxyEndPoint.cs/#L37">View Source</a>
+    <a href="https://github.com/justcoding121/titanium-web-proxy/blob/develop/src/Titanium.Web.Proxy/Models/TransparentProxyEndPoint.cs/#L83">View Source</a>
+  </span>
+  <a id="Titanium_Web_Proxy_Models_TransparentProxyEndPoint_HandshakeTimeout_" data-uid="Titanium.Web.Proxy.Models.TransparentProxyEndPoint.HandshakeTimeout*"></a>
+  <h4 id="Titanium_Web_Proxy_Models_TransparentProxyEndPoint_HandshakeTimeout" data-uid="Titanium.Web.Proxy.Models.TransparentProxyEndPoint.HandshakeTimeout">HandshakeTimeout</h4>
+  <div class="markdown level1 summary"><p>Maximum time allowed for the QUIC handshake when <a class="xref" href="Titanium.Web.Proxy.Models.TransparentProxyEndPoint.html#Titanium_Web_Proxy_Models_TransparentProxyEndPoint_EnableHttp3">EnableHttp3</a> is on.
+Default: 30 seconds.</p>
+</div>
+  <div class="markdown level1 conceptual"></div>
+  <h5 class="declaration">Declaration</h5>
+  <div class="codewrapper">
+    <pre><code class="lang-csharp hljs">[Experimental(&quot;TWP001&quot;)]
+public TimeSpan HandshakeTimeout { get; set; }</code></pre>
+  </div>
+  <h5 class="propertyValue">Property Value</h5>
+  <table class="table table-bordered table-condensed">
+    <thead>
+      <tr>
+        <th>Type</th>
+        <th>Description</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><a class="xref" href="https://learn.microsoft.com/dotnet/api/system.timespan">TimeSpan</a></td>
+        <td></td>
+      </tr>
+    </tbody>
+  </table>
+  <span class="small pull-right mobile-hide">
+    <span class="divider">|</span>
+    <a href="https://github.com/justcoding121/titanium-web-proxy/new/develop/apiSpec/new?filename=Titanium_Web_Proxy_Models_TransparentProxyEndPoint_IdleTimeout.md&amp;value=---%0Auid%3A%20Titanium.Web.Proxy.Models.TransparentProxyEndPoint.IdleTimeout%0Asummary%3A%20&#39;*You%20can%20override%20summary%20for%20the%20API%20here%20using%20*MARKDOWN*%20syntax&#39;%0A---%0A%0A*Please%20type%20below%20more%20information%20about%20this%20API%3A*%0A%0A">Edit this page</a>
+  </span>
+  <span class="small pull-right mobile-hide">
+    <a href="https://github.com/justcoding121/titanium-web-proxy/blob/develop/src/Titanium.Web.Proxy/Models/TransparentProxyEndPoint.cs/#L89">View Source</a>
+  </span>
+  <a id="Titanium_Web_Proxy_Models_TransparentProxyEndPoint_IdleTimeout_" data-uid="Titanium.Web.Proxy.Models.TransparentProxyEndPoint.IdleTimeout*"></a>
+  <h4 id="Titanium_Web_Proxy_Models_TransparentProxyEndPoint_IdleTimeout" data-uid="Titanium.Web.Proxy.Models.TransparentProxyEndPoint.IdleTimeout">IdleTimeout</h4>
+  <div class="markdown level1 summary"><p>QUIC connection idle timeout when <a class="xref" href="Titanium.Web.Proxy.Models.TransparentProxyEndPoint.html#Titanium_Web_Proxy_Models_TransparentProxyEndPoint_EnableHttp3">EnableHttp3</a> is on. Default: 60 seconds.</p>
+</div>
+  <div class="markdown level1 conceptual"></div>
+  <h5 class="declaration">Declaration</h5>
+  <div class="codewrapper">
+    <pre><code class="lang-csharp hljs">[Experimental(&quot;TWP001&quot;)]
+public TimeSpan IdleTimeout { get; set; }</code></pre>
+  </div>
+  <h5 class="propertyValue">Property Value</h5>
+  <table class="table table-bordered table-condensed">
+    <thead>
+      <tr>
+        <th>Type</th>
+        <th>Description</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><a class="xref" href="https://learn.microsoft.com/dotnet/api/system.timespan">TimeSpan</a></td>
+        <td></td>
+      </tr>
+    </tbody>
+  </table>
+  <span class="small pull-right mobile-hide">
+    <span class="divider">|</span>
+    <a href="https://github.com/justcoding121/titanium-web-proxy/new/develop/apiSpec/new?filename=Titanium_Web_Proxy_Models_TransparentProxyEndPoint_MaxInboundBidirectionalStreams.md&amp;value=---%0Auid%3A%20Titanium.Web.Proxy.Models.TransparentProxyEndPoint.MaxInboundBidirectionalStreams%0Asummary%3A%20&#39;*You%20can%20override%20summary%20for%20the%20API%20here%20using%20*MARKDOWN*%20syntax&#39;%0A---%0A%0A*Please%20type%20below%20more%20information%20about%20this%20API%3A*%0A%0A">Edit this page</a>
+  </span>
+  <span class="small pull-right mobile-hide">
+    <a href="https://github.com/justcoding121/titanium-web-proxy/blob/develop/src/Titanium.Web.Proxy/Models/TransparentProxyEndPoint.cs/#L65">View Source</a>
+  </span>
+  <a id="Titanium_Web_Proxy_Models_TransparentProxyEndPoint_MaxInboundBidirectionalStreams_" data-uid="Titanium.Web.Proxy.Models.TransparentProxyEndPoint.MaxInboundBidirectionalStreams*"></a>
+  <h4 id="Titanium_Web_Proxy_Models_TransparentProxyEndPoint_MaxInboundBidirectionalStreams" data-uid="Titanium.Web.Proxy.Models.TransparentProxyEndPoint.MaxInboundBidirectionalStreams">MaxInboundBidirectionalStreams</h4>
+  <div class="markdown level1 summary"><p>Maximum concurrent inbound client-initiated bidirectional streams per QUIC connection when
+<a class="xref" href="Titanium.Web.Proxy.Models.TransparentProxyEndPoint.html#Titanium_Web_Proxy_Models_TransparentProxyEndPoint_EnableHttp3">EnableHttp3</a> is on. Default: 100.</p>
+</div>
+  <div class="markdown level1 conceptual"></div>
+  <h5 class="declaration">Declaration</h5>
+  <div class="codewrapper">
+    <pre><code class="lang-csharp hljs">[Experimental(&quot;TWP001&quot;)]
+public int MaxInboundBidirectionalStreams { get; set; }</code></pre>
+  </div>
+  <h5 class="propertyValue">Property Value</h5>
+  <table class="table table-bordered table-condensed">
+    <thead>
+      <tr>
+        <th>Type</th>
+        <th>Description</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><a class="xref" href="https://learn.microsoft.com/dotnet/api/system.int32">int</a></td>
+        <td></td>
+      </tr>
+    </tbody>
+  </table>
+  <span class="small pull-right mobile-hide">
+    <span class="divider">|</span>
+    <a href="https://github.com/justcoding121/titanium-web-proxy/new/develop/apiSpec/new?filename=Titanium_Web_Proxy_Models_TransparentProxyEndPoint_MaxInboundUnidirectionalStreams.md&amp;value=---%0Auid%3A%20Titanium.Web.Proxy.Models.TransparentProxyEndPoint.MaxInboundUnidirectionalStreams%0Asummary%3A%20&#39;*You%20can%20override%20summary%20for%20the%20API%20here%20using%20*MARKDOWN*%20syntax&#39;%0A---%0A%0A*Please%20type%20below%20more%20information%20about%20this%20API%3A*%0A%0A">Edit this page</a>
+  </span>
+  <span class="small pull-right mobile-hide">
+    <a href="https://github.com/justcoding121/titanium-web-proxy/blob/develop/src/Titanium.Web.Proxy/Models/TransparentProxyEndPoint.cs/#L72">View Source</a>
+  </span>
+  <a id="Titanium_Web_Proxy_Models_TransparentProxyEndPoint_MaxInboundUnidirectionalStreams_" data-uid="Titanium.Web.Proxy.Models.TransparentProxyEndPoint.MaxInboundUnidirectionalStreams*"></a>
+  <h4 id="Titanium_Web_Proxy_Models_TransparentProxyEndPoint_MaxInboundUnidirectionalStreams" data-uid="Titanium.Web.Proxy.Models.TransparentProxyEndPoint.MaxInboundUnidirectionalStreams">MaxInboundUnidirectionalStreams</h4>
+  <div class="markdown level1 summary"><p>Maximum concurrent inbound client-initiated unidirectional streams per QUIC connection when
+<a class="xref" href="Titanium.Web.Proxy.Models.TransparentProxyEndPoint.html#Titanium_Web_Proxy_Models_TransparentProxyEndPoint_EnableHttp3">EnableHttp3</a> is on. Values below 3 are clamped to 3. Default: 3.</p>
+</div>
+  <div class="markdown level1 conceptual"></div>
+  <h5 class="declaration">Declaration</h5>
+  <div class="codewrapper">
+    <pre><code class="lang-csharp hljs">[Experimental(&quot;TWP001&quot;)]
+public int MaxInboundUnidirectionalStreams { get; set; }</code></pre>
+  </div>
+  <h5 class="propertyValue">Property Value</h5>
+  <table class="table table-bordered table-condensed">
+    <thead>
+      <tr>
+        <th>Type</th>
+        <th>Description</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><a class="xref" href="https://learn.microsoft.com/dotnet/api/system.int32">int</a></td>
+        <td></td>
+      </tr>
+    </tbody>
+  </table>
+  <h3 id="events">Events
+</h3>
+  <span class="small pull-right mobile-hide">
+    <span class="divider">|</span>
+    <a href="https://github.com/justcoding121/titanium-web-proxy/new/develop/apiSpec/new?filename=Titanium_Web_Proxy_Models_TransparentProxyEndPoint_BeforeHttpAuthenticate.md&amp;value=---%0Auid%3A%20Titanium.Web.Proxy.Models.TransparentProxyEndPoint.BeforeHttpAuthenticate%0Asummary%3A%20&#39;*You%20can%20override%20summary%20for%20the%20API%20here%20using%20*MARKDOWN*%20syntax&#39;%0A---%0A%0A*Please%20type%20below%20more%20information%20about%20this%20API%3A*%0A%0A">Edit this page</a>
+  </span>
+  <span class="small pull-right mobile-hide">
+    <a href="https://github.com/justcoding121/titanium-web-proxy/blob/develop/src/Titanium.Web.Proxy/Models/TransparentProxyEndPoint.cs/#L108">View Source</a>
+  </span>
+  <h4 id="Titanium_Web_Proxy_Models_TransparentProxyEndPoint_BeforeHttpAuthenticate" data-uid="Titanium.Web.Proxy.Models.TransparentProxyEndPoint.BeforeHttpAuthenticate">BeforeHttpAuthenticate</h4>
+  <div class="markdown level1 summary"><p>Before handling a cleartext (non-TLS) client session — including prior-knowledge HTTP/2 (h2c) —
+this event is fired so upstream protocol policy can be set without a ClientHello.</p>
+</div>
+  <div class="markdown level1 conceptual"></div>
+  <h5 class="declaration">Declaration</h5>
+  <div class="codewrapper">
+    <pre><code class="lang-csharp hljs">public event AsyncEventHandler&lt;BeforeHttpAuthenticateEventArgs&gt;? BeforeHttpAuthenticate</code></pre>
+  </div>
+  <h5 class="eventType">Event Type</h5>
+  <table class="table table-bordered table-condensed">
+    <thead>
+      <tr>
+        <th>Type</th>
+        <th>Description</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><a class="xref" href="Titanium.Web.Proxy.EventArguments.AsyncEventHandler-1.html">AsyncEventHandler</a>&lt;<a class="xref" href="Titanium.Web.Proxy.EventArguments.BeforeHttpAuthenticateEventArgs.html">BeforeHttpAuthenticateEventArgs</a>&gt;</td>
+        <td></td>
+      </tr>
+    </tbody>
+  </table>
+  <span class="small pull-right mobile-hide">
+    <span class="divider">|</span>
+    <a href="https://github.com/justcoding121/titanium-web-proxy/new/develop/apiSpec/new?filename=Titanium_Web_Proxy_Models_TransparentProxyEndPoint_BeforeQuicAuthenticate.md&amp;value=---%0Auid%3A%20Titanium.Web.Proxy.Models.TransparentProxyEndPoint.BeforeQuicAuthenticate%0Asummary%3A%20&#39;*You%20can%20override%20summary%20for%20the%20API%20here%20using%20*MARKDOWN*%20syntax&#39;%0A---%0A%0A*Please%20type%20below%20more%20information%20about%20this%20API%3A*%0A%0A">Edit this page</a>
+  </span>
+  <span class="small pull-right mobile-hide">
+    <a href="https://github.com/justcoding121/titanium-web-proxy/blob/develop/src/Titanium.Web.Proxy/Models/TransparentProxyEndPoint.cs/#L97">View Source</a>
+  </span>
+  <h4 id="Titanium_Web_Proxy_Models_TransparentProxyEndPoint_BeforeQuicAuthenticate" data-uid="Titanium.Web.Proxy.Models.TransparentProxyEndPoint.BeforeQuicAuthenticate">BeforeQuicAuthenticate</h4>
+  <div class="markdown level1 summary"><p>Fired before the QUIC TLS handshake completes for each inbound HTTP/3 connection when
+<a class="xref" href="Titanium.Web.Proxy.Models.TransparentProxyEndPoint.html#Titanium_Web_Proxy_Models_TransparentProxyEndPoint_EnableHttp3">EnableHttp3</a> is on.</p>
+</div>
+  <div class="markdown level1 conceptual"></div>
+  <h5 class="declaration">Declaration</h5>
+  <div class="codewrapper">
+    <pre><code class="lang-csharp hljs">[Experimental(&quot;TWP001&quot;)]
+public event AsyncEventHandler&lt;BeforeQuicAuthenticateEventArgs&gt;? BeforeQuicAuthenticate</code></pre>
+  </div>
+  <h5 class="eventType">Event Type</h5>
+  <table class="table table-bordered table-condensed">
+    <thead>
+      <tr>
+        <th>Type</th>
+        <th>Description</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><a class="xref" href="Titanium.Web.Proxy.EventArguments.AsyncEventHandler-1.html">AsyncEventHandler</a>&lt;<a class="xref" href="Titanium.Web.Proxy.EventArguments.BeforeQuicAuthenticateEventArgs.html">BeforeQuicAuthenticateEventArgs</a>&gt;</td>
+        <td></td>
+      </tr>
+    </tbody>
+  </table>
+  <span class="small pull-right mobile-hide">
+    <span class="divider">|</span>
+    <a href="https://github.com/justcoding121/titanium-web-proxy/new/develop/apiSpec/new?filename=Titanium_Web_Proxy_Models_TransparentProxyEndPoint_BeforeSslAuthenticate.md&amp;value=---%0Auid%3A%20Titanium.Web.Proxy.Models.TransparentProxyEndPoint.BeforeSslAuthenticate%0Asummary%3A%20&#39;*You%20can%20override%20summary%20for%20the%20API%20here%20using%20*MARKDOWN*%20syntax&#39;%0A---%0A%0A*Please%20type%20below%20more%20information%20about%20this%20API%3A*%0A%0A">Edit this page</a>
+  </span>
+  <span class="small pull-right mobile-hide">
+    <a href="https://github.com/justcoding121/titanium-web-proxy/blob/develop/src/Titanium.Web.Proxy/Models/TransparentProxyEndPoint.cs/#L102">View Source</a>
   </span>
   <h4 id="Titanium_Web_Proxy_Models_TransparentProxyEndPoint_BeforeSslAuthenticate" data-uid="Titanium.Web.Proxy.Models.TransparentProxyEndPoint.BeforeSslAuthenticate">BeforeSslAuthenticate</h4>
   <div class="markdown level1 summary"><p>Before Ssl authentication this event is fired.</p>
 </div>
   <div class="markdown level1 conceptual"></div>
-  <h5 class="decalaration">Declaration</h5>
+  <h5 class="declaration">Declaration</h5>
   <div class="codewrapper">
-    <pre><code class="lang-csharp hljs">public event AsyncEventHandler&lt;BeforeSslAuthenticateEventArgs&gt; BeforeSslAuthenticate</code></pre>
+    <pre><code class="lang-csharp hljs">public event AsyncEventHandler&lt;BeforeSslAuthenticateEventArgs&gt;? BeforeSslAuthenticate</code></pre>
   </div>
   <h5 class="eventType">Event Type</h5>
-  <table class="table table-bordered table-striped table-condensed">
+  <table class="table table-bordered table-condensed">
     <thead>
       <tr>
         <th>Type</th>
@@ -252,30 +509,31 @@ This is valid only when UseServerNameIndication is set to false.</p>
       </tr>
     </tbody>
   </table>
+
 </article>
           </div>
-          
+
           <div class="hidden-sm col-md-2" role="complementary">
             <div class="sideaffix">
               <div class="contribution">
                 <ul class="nav">
                   <li>
-                    <a href="https://github.com/pieroviano/titanium-web-proxy/new/develop/apiSpec/new?filename=Titanium_Web_Proxy_Models_TransparentProxyEndPoint.md&amp;value=---%0Auid%3A%20Titanium.Web.Proxy.Models.TransparentProxyEndPoint%0Asummary%3A%20'*You%20can%20override%20summary%20for%20the%20API%20here%20using%20*MARKDOWN*%20syntax'%0A---%0A%0A*Please%20type%20below%20more%20information%20about%20this%20API%3A*%0A%0A" class="contribution-link">Improve this Doc</a>
+                    <a href="https://github.com/justcoding121/titanium-web-proxy/new/develop/apiSpec/new?filename=Titanium_Web_Proxy_Models_TransparentProxyEndPoint.md&amp;value=---%0Auid%3A%20Titanium.Web.Proxy.Models.TransparentProxyEndPoint%0Asummary%3A%20&#39;*You%20can%20override%20summary%20for%20the%20API%20here%20using%20*MARKDOWN*%20syntax&#39;%0A---%0A%0A*Please%20type%20below%20more%20information%20about%20this%20API%3A*%0A%0A" class="contribution-link">Edit this page</a>
                   </li>
                   <li>
-                    <a href="https://github.com/pieroviano/titanium-web-proxy/blob/develop/src/Titanium.Web.Proxy/Models/TransparentProxyEndPoint.cs/#L13" class="contribution-link">View Source</a>
+                    <a href="https://github.com/justcoding121/titanium-web-proxy/blob/develop/src/Titanium.Web.Proxy/Models/TransparentProxyEndPoint.cs/#L26" class="contribution-link">View Source</a>
                   </li>
                 </ul>
               </div>
               <nav class="bs-docs-sidebar hidden-print hidden-xs hidden-sm affix" id="affix">
-                <h5>In This Article</h5>
+                <h5>In this article</h5>
                 <div></div>
               </nav>
             </div>
           </div>
         </div>
       </div>
-      
+
       <footer>
         <div class="grad-bottom"></div>
         <div class="footer">
@@ -283,14 +541,14 @@ This is valid only when UseServerNameIndication is set to false.</p>
             <span class="pull-right">
               <a href="#top">Back to top</a>
             </span>
-            
-            <span>Generated by <strong>DocFX</strong></span>
+      
+      <span>Generated by <strong>DocFX</strong></span>
           </div>
         </div>
       </footer>
     </div>
-    
-    <script type="text/javascript" src="../styles/docfx.vendor.js"></script>
+
+    <script type="text/javascript" src="../styles/docfx.vendor.min.js"></script>
     <script type="text/javascript" src="../styles/docfx.js"></script>
     <script type="text/javascript" src="../styles/main.js"></script>
   </body>

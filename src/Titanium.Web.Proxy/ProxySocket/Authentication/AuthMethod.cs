@@ -41,7 +41,8 @@ namespace Titanium.Web.Proxy.ProxySocket.Authentication;
 internal abstract class AuthMethod
 {
     /// <summary>Holds the address of the method to call when the proxy has authenticated the client.</summary>
-    protected HandShakeComplete CallBack;
+    private HandShakeComplete? callback;
+    private byte[]? buffer;
 
     // private variables
 
@@ -52,9 +53,9 @@ internal abstract class AuthMethod
     ///     Initializes an AuthMethod instance.
     /// </summary>
     /// <param name="server">The socket connection with the proxy server.</param>
-    public AuthMethod(Socket server)
+    protected AuthMethod(Socket server)
     {
-        Server = server;
+        this.server = server ?? throw new ArgumentNullException(nameof(server));
     }
 
     /// <summary>
@@ -64,29 +65,37 @@ internal abstract class AuthMethod
     protected Socket Server
     {
         get => server;
-        set => server = value ?? throw new ArgumentNullException();
+        set => server = value ?? throw new ArgumentNullException(nameof(value));
     }
 
     /// <summary>
     ///     Gets or sets a byt array that can be used to store data.
     /// </summary>
     /// <value>A byte array to store data.</value>
-    protected byte[] Buffer { get; set; }
+    protected HandShakeComplete CallBack
+    {
+        get => callback ?? throw new InvalidOperationException("Authentication callback has not been assigned.");
+        set => callback = value ?? throw new ArgumentNullException(nameof(value));
+    }
+
+    protected byte[] Buffer
+    {
+        get => buffer ?? throw new InvalidOperationException("Authentication buffer has not been assigned.");
+        set => buffer = value ?? throw new ArgumentNullException(nameof(value));
+    }
+
+    protected byte[] TakeBuffer()
+    {
+        var value = Buffer;
+        buffer = null;
+        return value;
+    }
 
     /// <summary>
     ///     Gets or sets the number of bytes that have been received from the remote proxy server.
     /// </summary>
     /// <value>An integer that holds the number of bytes that have been received from the remote proxy server.</value>
     protected int Received { get; set; }
-
-    /// <summary>
-    ///     Authenticates the user.
-    /// </summary>
-    /// <exception cref="ProxyException">Authentication with the proxy server failed.</exception>
-    /// <exception cref="ProtocolViolationException">The proxy server uses an invalid protocol.</exception>
-    /// <exception cref="SocketException">An operating system error occurs while accessing the Socket.</exception>
-    /// <exception cref="ObjectDisposedException">The Socket has been closed.</exception>
-    public abstract void Authenticate();
 
     /// <summary>
     ///     Authenticates the user asynchronously.

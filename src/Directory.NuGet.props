@@ -9,7 +9,7 @@
         <VersionBuildSuffix Condition="'$(VersionBuildSuffix)'==''">*</VersionBuildSuffix>
         <NuGetPackageRoot Condition="'$(NuGetPackageRoot)'==''">$(USERPROFILE)\.nuget\packages\</NuGetPackageRoot>
         <ObfuscarVersion>2.2.37</ObfuscarVersion>
-        <TitaniumWebProxyVersion>2.1.0</TitaniumWebProxyVersion>
+        <TitaniumWebProxyVersion>7.0.24</TitaniumWebProxyVersion>
     </PropertyGroup>
     <PropertyGroup>
         <MinimalDirectoryNuGetProps Condition="'$(MinimalDirectoryNuGetProps)'==''">true</MinimalDirectoryNuGetProps>

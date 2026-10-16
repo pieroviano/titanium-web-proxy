@@ -8,6 +8,8 @@ namespace Titanium.Web.Proxy.Helpers;
 
 internal sealed class HttpServerStream : HttpStream
 {
+    protected override bool IsRetryableHeaderWriteFailure => true;
+
     internal HttpServerStream(ProxyServer server, Stream stream, IBufferPool bufferPool,
         CancellationToken cancellationToken)
         : base(server, stream, bufferPool, cancellationToken)
@@ -20,24 +22,89 @@ internal sealed class HttpServerStream : HttpStream
     /// <param name="request">The request object.</param>
     /// <param name="cancellationToken">Optional cancellation token for this async task.</param>
     /// <returns></returns>
-    internal async ValueTask WriteRequestAsync(Request request, CancellationToken cancellationToken = default)
+    internal ValueTask WriteRequestAsync(Request request, CancellationToken cancellationToken = default)
     {
-        var headerBuilder = new HeaderBuilder();
-        headerBuilder.WriteRequestLine(request.Method, request.RequestUriString, request.HttpVersion);
-        await WriteAsync(request, headerBuilder, cancellationToken);
+        var headerBuilder = HeaderBuilder.Rent();
+        try
+        {
+            headerBuilder.WriteRequestLine(request.Method, request.RequestUriString, request.HttpVersion);
+            var writeVt = WriteAsync(request, headerBuilder, cancellationToken);
+            if (writeVt.IsCompletedSuccessfully)
+            {
+                HeaderBuilder.Return(headerBuilder);
+                return default;
+            }
+
+            return AwaitAndReturnHeaderBuilder(writeVt, headerBuilder);
+        }
+        catch
+        {
+            HeaderBuilder.Return(headerBuilder);
+            throw;
+        }
     }
 
-    internal async ValueTask<ResponseStatusInfo> ReadResponseStatus(CancellationToken cancellationToken = default)
+    /// <summary>
+    ///     Reads the HTTP response status line.
+    /// </summary>
+    /// <returns>
+    ///     The parsed status info, or <c>null</c> when the peer closed the connection before sending
+    ///     any status line (normal EOF / keep-alive idle close). Malformed status lines still throw.
+    /// </returns>
+    internal ValueTask<ResponseStatusInfo?> ReadResponseStatus(CancellationToken cancellationToken = default)
     {
-        var httpStatus = await ReadLineAsync(cancellationToken) ??
-                         throw new IOException("Invalid http status code.");
+        if (TryParseResponseLineFromBuffer(out var version, out var statusCode, out var description,
+                out var emptyLine))
+        {
+            if (!emptyLine)
+            {
+                return new ValueTask<ResponseStatusInfo?>(new ResponseStatusInfo
+                {
+                    Version = version, StatusCode = statusCode, Description = description
+                });
+            }
 
-        if (httpStatus == string.Empty)
-            // is this really possible?
-            httpStatus = await ReadLineAsync(cancellationToken) ??
-                         throw new IOException("Response status is empty.");
+            // Blank line before status — try again from the buffer, else fill.
+            if (TryParseResponseLineFromBuffer(out version, out statusCode, out description, out emptyLine)
+                && !emptyLine)
+            {
+                return new ValueTask<ResponseStatusInfo?>(new ResponseStatusInfo
+                {
+                    Version = version, StatusCode = statusCode, Description = description
+                });
+            }
+        }
 
-        Response.ParseResponseLine(httpStatus, out var version, out var statusCode, out var description);
-        return new ResponseStatusInfo { Version = version, StatusCode = statusCode, Description = description };
+        return ReadResponseStatusFillAsync(cancellationToken);
+    }
+
+    private async ValueTask<ResponseStatusInfo?> ReadResponseStatusFillAsync(CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            if (!await FillBufferAsync(cancellationToken))
+                return null;
+
+            if (!TryParseResponseLineFromBuffer(out var version, out var statusCode, out var description,
+                    out var emptyLine))
+                continue;
+
+            if (emptyLine)
+                continue;
+
+            return new ResponseStatusInfo { Version = version, StatusCode = statusCode, Description = description };
+        }
+    }
+
+    private static async ValueTask AwaitAndReturnHeaderBuilder(ValueTask writeVt, HeaderBuilder headerBuilder)
+    {
+        try
+        {
+            await writeVt;
+        }
+        finally
+        {
+            HeaderBuilder.Return(headerBuilder);
+        }
     }
 }

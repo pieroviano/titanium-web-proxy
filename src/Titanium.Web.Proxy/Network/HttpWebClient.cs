@@ -1,9 +1,14 @@
 ﻿using System;
+using System.IO;
 using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
+using Titanium.Web.Proxy.Diagnostics;
+using Titanium.Web.Proxy.Exceptions;
 using Titanium.Web.Proxy.Extensions;
+using Titanium.Web.Proxy.Helpers;
 using Titanium.Web.Proxy.Models;
+using Titanium.Web.Proxy.Network.Quic;
 using Titanium.Web.Proxy.Network.Tcp;
 
 namespace Titanium.Web.Proxy.Http;
@@ -15,11 +20,30 @@ public class HttpWebClient
 {
     private TcpServerConnection? connection;
 
+    /// <summary>
+    ///     Upstream transport connection identity for multiplexed H2/H3 (and any path that binds an id
+    ///     without transferring HTTP/1.1 TCP ownership via <see cref="SetConnection" />).
+    /// </summary>
+    private long? upstreamConnectionId;
+
+    /// <summary>
+    ///     Upstream peer endpoint paired with <see cref="upstreamConnectionId" /> for Bind-only
+    ///     multiplexed sessions (H2/H3), so <c>ServerRemoteEndPoint</c> works without
+    ///     <see cref="HasConnection" />.
+    /// </summary>
+    private IPEndPoint? upstreamRemoteEndPoint;
+
+    /// <summary>
+    ///     Establishment timing of the connection paired with <see cref="upstreamConnectionId" /> for
+    ///     Bind-only multiplexed sessions (H2/H3), so <c>UpstreamConnectionTiming</c> works without
+    ///     <see cref="HasConnection" />. Only populated when timing capture is enabled.
+    /// </summary>
+    private UpstreamConnectionTiming? upstreamConnectionTiming;
+
     internal HttpWebClient(ConnectRequest? connectRequest, Request request, Lazy<int> processIdFunc)
     {
         ConnectRequest = connectRequest;
         Request = request;
-        Response = new Response();
         ProcessId = processIdFunc;
     }
 
@@ -30,7 +54,7 @@ public class HttpWebClient
     {
         get
         {
-            if (connection == null) throw new Exception("Connection is null");
+            if (connection == null) throw new InvalidOperationException("Connection is null");
 
             return connection;
         }
@@ -39,14 +63,36 @@ public class HttpWebClient
     internal bool HasConnection => connection != null;
 
     /// <summary>
+    ///     Upstream connection identity when bound via <see cref="BindUpstreamConnection(TcpServerConnection)" />
+    ///     or <see cref="SetConnection" />; otherwise <see langword="null" />.
+    /// </summary>
+    internal long? UpstreamConnectionId => upstreamConnectionId ?? connection?.Id;
+
+    /// <summary>
+    ///     Upstream peer endpoint when bound via <see cref="BindUpstreamConnection(TcpServerConnection)" />
+    ///     or <see cref="SetConnection" />; otherwise <see langword="null" />.
+    /// </summary>
+    internal IPEndPoint? UpstreamRemoteEndPoint => upstreamRemoteEndPoint ?? connection?.RemoteEndPoint;
+
+    /// <summary>
+    ///     Establishment timing of the upstream connection when bound via
+    ///     <see cref="BindUpstreamConnection(TcpServerConnection)" /> or <see cref="SetConnection" />;
+    ///     <see langword="null" /> when timing capture is disabled or nothing is bound yet.
+    /// </summary>
+    internal UpstreamConnectionTiming? UpstreamConnectionTiming =>
+        upstreamConnectionTiming ?? connection?.Timing;
+
+    /// <summary>
     ///     Should we close the server connection at the end of this HTTP request/response session.
     /// </summary>
     internal bool CloseServerConnection { get; set; }
 
     /// <summary>
-    ///     Stores internal data for the session.
+    ///     Stores internal data for the session (lazy — most H2/H3 Lite streams never touch it).
     /// </summary>
-    internal InternalDataStore Data { get; } = new();
+    internal InternalDataStore Data => data ??= new();
+
+    private InternalDataStore? data;
 
     /// <summary>
     ///     Gets or sets the user data.
@@ -54,9 +100,23 @@ public class HttpWebClient
     public object? UserData { get; set; }
 
     /// <summary>
-    ///     Override UpStreamEndPoint for this request; Local NIC via request is made
+    ///     Override UpStreamEndPoint for this request; Local NIC via request is made.
+    ///     Ignored for a destination whose address family does not match; prefer
+    ///     <see cref="UpStreamEndPointIPv4" /> / <see cref="UpStreamEndPointIPv6" /> for dual-stack.
     /// </summary>
     public IPEndPoint? UpStreamEndPoint { get; set; }
+
+    /// <summary>
+    ///     Per-request local bind for IPv4 upstream destinations (overrides server
+    ///     <c>UpStreamEndPointIPv4</c>).
+    /// </summary>
+    public IPEndPoint? UpStreamEndPointIPv4 { get; set; }
+
+    /// <summary>
+    ///     Per-request local bind for IPv6 upstream destinations (overrides server
+    ///     <c>UpStreamEndPointIPv6</c>).
+    /// </summary>
+    public IPEndPoint? UpStreamEndPointIPv6 { get; set; }
 
     /// <summary>
     ///     Headers passed with Connect.
@@ -66,16 +126,35 @@ public class HttpWebClient
     /// <summary>
     ///     Web Request.
     /// </summary>
-    public Request Request { get; }
+    public Request Request { get; private set; }
 
     /// <summary>
-    ///     Web Response.
+    ///     Web Response. Created on first access so H2/H3 MITM Lite request-only work
+    ///     does not allocate a Response + HeaderCollection graph per stream up front.
+    ///     CompareExchange: H2 request/response legs can race the first access.
     /// </summary>
-    public Response Response { get; internal set; }
+    public Response Response
+    {
+        get
+        {
+            var existing = response;
+            if (existing != null)
+                return existing;
+            var created = new Response();
+            return Interlocked.CompareExchange(ref response, created, null) ?? created;
+        }
+        internal set => response = value;
+    }
+
+    /// <summary>True when a response object has already been materialized for this exchange.</summary>
+    internal bool HasResponse => response != null;
+
+    private Response? response;
 
     /// <summary>
-    ///     PID of the process that is created the current session when client is running in this machine
-    ///     If client is remote then this will return
+    ///     PID of the local client process for this session (Windows, Linux, and macOS).
+    ///     Remote clients, unsupported platforms, and unresolved sockets yield a non-positive value.
+    ///     See <see cref="ClientProcessId.IsSupported"/>.
     /// </summary>
     public Lazy<int> ProcessId { get; internal set; }
 
@@ -92,14 +171,67 @@ public class HttpWebClient
     {
         serverConnection.LastAccess = DateTime.UtcNow;
         connection = serverConnection;
+        // Overwrite any previously bound multiplexed (e.g. QUIC) metadata so TCP fallback is accurate.
+        BindUpstreamConnection(serverConnection);
+    }
+
+    /// <summary>
+    ///     Bind the metadata of a multiplexed HTTP/2 origin connection without transferring HTTP/1.1 TCP
+    ///     stream ownership, so <c>ServerConnectionId</c>, <c>ServerRemoteEndPoint</c> and
+    ///     <c>UpstreamConnectionTiming</c> are visible while <see cref="HasConnection" /> stays false
+    ///     (H1 syphon/drain must not touch the shared socket).
+    /// </summary>
+    internal void BindUpstreamConnection(TcpServerConnection serverConnection)
+    {
+        BindUpstreamConnection(serverConnection.Id, serverConnection.RemoteEndPoint, serverConnection.Timing);
+    }
+
+    /// <summary>
+    ///     Bind the metadata of a multiplexed QUIC (HTTP/3) origin connection. A later
+    ///     <see cref="SetConnection" /> overwrites it, keeping TCP fallback accurate.
+    /// </summary>
+    internal void BindUpstreamConnection(QuicServerConnection quicConnection)
+    {
+        BindUpstreamConnection(quicConnection.Id, quicConnection.RemoteEndPoint, quicConnection.Timing);
+    }
+
+    /// <summary>
+    ///     Snapshots upstream connection metadata by value. Read eagerly rather than through the
+    ///     connection object because the socket/QUIC handle may be torn down before a consumer reads
+    ///     <c>ServerRemoteEndPoint</c> in a later event.
+    /// </summary>
+    internal void BindUpstreamConnection(long id, IPEndPoint? remoteEndPoint,
+        UpstreamConnectionTiming? timing)
+    {
+        upstreamConnectionId = id;
+        upstreamRemoteEndPoint = remoteEndPoint;
+        upstreamConnectionTiming = timing;
+    }
+
+    /// <summary>
+    ///     Resolves the HTTP version that will actually be declared to the origin on the request line, per
+    ///     <paramref name="originHttpVersionPolicy" />. Exposed so a caller that needs to know the outcome
+    ///     <em>before</em> <see cref="SendRequest" /> writes headers - e.g. to decide whether
+    ///     <c>Transfer-Encoding: chunked</c> must first be downgraded to buffered <c>Content-Length</c>
+    ///     framing, since HTTP/1.0 has no chunked transfer-coding at all - does not have to re-derive this
+    ///     logic and risk it drifting out of sync with what <see cref="SendRequest" /> actually sends.
+    /// </summary>
+    internal static Version ResolveOriginHttpVersion(Version requestHttpVersion,
+        OriginHttpVersionPolicy originHttpVersionPolicy)
+    {
+        if (originHttpVersionPolicy == OriginHttpVersionPolicy.NormalizeToHttp11 &&
+            requestHttpVersion == HttpHeader.Version10)
+            return HttpHeader.Version11;
+
+        return requestHttpVersion;
     }
 
     /// <summary>
     ///     Prepare and send the http(s) request
     /// </summary>
     /// <returns></returns>
-    internal async Task SendRequest(bool enable100ContinueBehaviour, bool isTransparent,
-        CancellationToken cancellationToken)
+    internal ValueTask SendRequest(bool enable100ContinueBehaviour, bool isTransparent, // NOSONAR S3776 -- This protocol/state-machine path shares mutable parsing or transport state; splitting it further would create disproportionate regression risk.
+        OriginHttpVersionPolicy originHttpVersionPolicy, CancellationToken cancellationToken)
     {
         var upstreamProxy = Connection.UpStreamProxy;
 
@@ -111,70 +243,215 @@ public class HttpWebClient
         string? upstreamProxyUserName = null;
         string? upstreamProxyPassword = null;
 
-        string url;
-        if (isTransparent)
+        string? url = null;
+        if (useUpstreamProxy)
         {
-            url = Request.RequestUriString;
+            // Upstream HTTP proxies require absolute-form targets and may need Proxy-Authorization.
+            // This applies to both explicit and transparent client-facing endpoints (#964): previously
+            // the transparent branch skipped credential injection, so Basic-auth upstream proxies
+            // returned 407 for plain HTTP even when UserName/Password were configured.
+            //
+            // Preserve the original request target verbatim rather than serialising through
+            // System.Uri, which may normalise percent-encoding or drop non-ASCII characters.
+            // Request.Url builds the absolute-form URL directly from the raw RequestUriString8
+            // bytes (decoded/re-encoded via ISO-8859-1), so the upstream proxy receives exactly
+            // what the client sent (or what a BeforeRequest handler wrote).
+            url = Request.Url;
+
+            if (!upstreamProxy!.UseDefaultCredentials &&
+                !string.IsNullOrEmpty(upstreamProxy.UserName) && upstreamProxy.Password != null)
+            {
+                upstreamProxyUserName = upstreamProxy.UserName;
+                upstreamProxyPassword = upstreamProxy.Password;
+            }
         }
-        else if (!useUpstreamProxy)
+        else if (!isTransparent)
         {
             if (UriExtensions.GetScheme(Request.RequestUriString8).Length == 0)
                 url = Request.RequestUriString;
             else
                 url = Request.RequestUri.GetOriginalPathAndQuery();
         }
-        else
-        {
-            url = Request.RequestUri.ToString();
-
-            // Send Authentication to Upstream proxy if needed
-            if (!string.IsNullOrEmpty(upstreamProxy!.UserName) && upstreamProxy.Password != null)
-            {
-                upstreamProxyUserName = upstreamProxy.UserName;
-                upstreamProxyPassword = upstreamProxy.Password;
-            }
-        }
 
         if (url == string.Empty) url = "/";
 
-        // prepare the request & headers
-        var headerBuilder = new HeaderBuilder();
-        headerBuilder.WriteRequestLine(Request.Method, url, Request.HttpVersion);
-        headerBuilder.WriteHeaders(Request.Headers, !isTransparent, upstreamProxyUserName, upstreamProxyPassword);
+        // The origin-bound wire version defaults to whatever the client itself declared (pass-through); it is
+        // never written back onto Request.HttpVersion itself, which stays the client-facing version that event
+        // handlers observe (see OriginHttpVersionPolicy).
+        var originHttpVersion = ResolveOriginHttpVersion(Request.HttpVersion, originHttpVersionPolicy);
+        if (originHttpVersion == HttpHeader.Version11 && Request.HttpVersion == HttpHeader.Version10)
+        {
+            // Some origins that are only conditionally HTTP/1.1-compliant still mirror the persistence implied
+            // by whatever version/headers they were sent rather than trusting HTTP/1.1's persistent-by-default
+            // rule; explicitly asking for "keep-alive" maximizes compatibility with that class of origin. An
+            // explicit client "Connection: close" is still honored verbatim - normalizing the origin-facing
+            // version never overrides an explicit request to close.
+            var connectionHeader = Request.Headers.GetHeaderValueOrNull(KnownHeaders.Connection);
+            if (connectionHeader == null ||
+                connectionHeader.EqualsIgnoreCase(KnownHeaders.ConnectionKeepAlive.String))
+                Request.Headers.SetOrAddHeaderValue(KnownHeaders.Connection,
+                    KnownHeaders.ConnectionKeepAlive.String);
+        }
 
-        // write request headers
-        await serverStream.WriteHeadersAsync(headerBuilder, cancellationToken);
+        // prepare the request & headers
+        var headerBuilder = HeaderBuilder.Rent();
+        ValueTask writeVt;
+        try
+        {
+            if (url != null)
+                headerBuilder.WriteRequestLine(Request.Method, url, originHttpVersion);
+            else
+                headerBuilder.WriteRequestLine(Request.Method, Request.RequestUriString8, originHttpVersion);
+            // Transparent reverse: strip hop-by-hop Connection: close so NC clients do not force
+            // the origin to close (keeps the upstream pool warm). HTTP/1.0 Connection: keep-alive
+            // is left intact — 1.0 is non-persistent unless the origin sees that opt-in.
+            if (isTransparent)
+                Request.StripHopByHopConnectionForTransparentOrigin();
+            headerBuilder.WriteHeaders(Request.Headers, !isTransparent, upstreamProxyUserName,
+                upstreamProxyPassword, Request.UpstreamCleartextHostOverride);
+
+            writeVt = serverStream.WriteHeadersAsync(headerBuilder, cancellationToken);
+        }
+        catch
+        {
+            HeaderBuilder.Return(headerBuilder);
+            throw;
+        }
+
+        if (writeVt.IsCompletedSuccessfully)
+        {
+            HeaderBuilder.Return(headerBuilder);
+            if (enable100ContinueBehaviour && Request.ExpectContinue)
+                return SendRequestExpectContinueAsync(cancellationToken);
+
+            return default;
+        }
+
+        return SendRequestAwaitWriteAsync(writeVt, headerBuilder, enable100ContinueBehaviour,
+            cancellationToken);
+    }
+
+    private async ValueTask SendRequestAwaitWriteAsync(ValueTask writeVt, HeaderBuilder headerBuilder,
+        bool enable100ContinueBehaviour, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await writeVt;
+        }
+        finally
+        {
+            HeaderBuilder.Return(headerBuilder);
+        }
 
         if (enable100ContinueBehaviour && Request.ExpectContinue)
-        {
-            // wait for expectation response from server
-            await ReceiveResponse(cancellationToken);
+            await SendRequestExpectContinueAsync(cancellationToken);
+    }
 
-            if (Response.StatusCode == (int)HttpStatusCode.Continue)
-                Request.ExpectationSucceeded = true;
-            else
-                Request.ExpectationFailed = true;
-        }
+    private async ValueTask SendRequestExpectContinueAsync(CancellationToken cancellationToken)
+    {
+        await ReceiveResponse(cancellationToken);
+
+        if (Response.StatusCode == (int)HttpStatusCode.Continue)
+            Request.ExpectationSucceeded = true;
+        else
+            Request.ExpectationFailed = true;
     }
 
     /// <summary>
     ///     Receive and parse the http response from server
     /// </summary>
     /// <returns></returns>
-    internal async Task ReceiveResponse(CancellationToken cancellationToken)
+    internal ValueTask ReceiveResponse(CancellationToken cancellationToken)
     {
         // return if this is already read
-        if (Response.StatusCode != 0) return;
+        if (Response.StatusCode != 0) return default;
 
         Response.RequestMethod = Request.Method;
 
-        var httpStatus = await Connection.Stream.ReadResponseStatus(cancellationToken);
-        Response.HttpVersion = httpStatus.Version;
-        Response.StatusCode = httpStatus.StatusCode;
-        Response.StatusDescription = httpStatus.Description;
+        ValueTask<ResponseStatusInfo?> statusVt;
+        try
+        {
+            statusVt = Connection.Stream.ReadResponseStatus(cancellationToken);
+        }
+        catch (FormatException ex) when (CanRetryMalformedStatusLine())
+        {
+            throw MalformedStatusLine(ex);
+        }
 
-        // Read the response headers in to unique and non-unique header collections
-        await HeaderParser.ReadHeaders(Connection.Stream, Response.Headers, cancellationToken);
+        if (!statusVt.IsCompletedSuccessfully)
+            return ReceiveResponseSlowAsync(statusVt, cancellationToken);
+
+        return ReceiveResponseAfterStatus(statusVt.Result, cancellationToken);
+    }
+
+    private ValueTask ReceiveResponseAfterStatus(ResponseStatusInfo? httpStatus,
+        CancellationToken cancellationToken)
+    {
+        if (httpStatus == null)
+        {
+            // EOF before any response bytes: typically a stale pooled keep-alive connection.
+            // Only replay-safe for idempotent methods with a replayable body (same gate as
+            // malformed status). A POST that already reached the origin must not be replayed.
+            if (CanRetryEofBeforeResponse())
+                throw new RetryableServerConnectionException(
+                    "Server connection was closed before any response was received.");
+
+            throw new IOException("Server closed the connection before sending a response.");
+        }
+
+        Response.HttpVersion = httpStatus.Value.Version;
+        Response.StatusCode = httpStatus.Value.StatusCode;
+        Response.StatusDescription = httpStatus.Value.Description;
+
+        var headersVt = HeaderParser.TryReadHeadersAsync(Connection.Stream, Response.Headers, cancellationToken,
+            Connection.Stream.HeaderBudget(isRequest: false));
+        if (headersVt.IsCompletedSuccessfully)
+        {
+            if (!headersVt.Result)
+                cancellationToken.ThrowIfCancellationRequested();
+            return default;
+        }
+
+        return ReceiveResponseAwaitHeadersAsync(headersVt, cancellationToken);
+    }
+
+    private async ValueTask ReceiveResponseSlowAsync(ValueTask<ResponseStatusInfo?> statusVt,
+        CancellationToken cancellationToken)
+    {
+        ResponseStatusInfo? httpStatus;
+        try
+        {
+            httpStatus = await statusVt;
+        }
+        catch (FormatException ex) when (CanRetryMalformedStatusLine())
+        {
+            throw MalformedStatusLine(ex);
+        }
+
+        await ReceiveResponseAfterStatus(httpStatus, cancellationToken);
+    }
+
+    /// <summary>
+    ///     A status-line <see cref="FormatException"/> happens before any response bytes are committed
+    ///     to the client, so a replay is possible when the request is replayable (no body, or buffered).
+    ///     Unlike EOF-before-response, the origin did answer (with leftover bytes of a desynced
+    ///     keep-alive) and has very likely processed the request, so only idempotent GET/HEAD are
+    ///     replayed: a POST/PATCH replay could be applied twice.
+    /// </summary>
+    private bool CanRetryMalformedStatusLine() =>
+        (!Request.HasBody || Request.IsBodyRead)
+        && Routing.StreamDestinationDispatch.IsIdempotentMethod(Request.Method);
+
+    private bool CanRetryEofBeforeResponse() => CanRetryMalformedStatusLine();
+
+    private static RetryableServerConnectionException MalformedStatusLine(FormatException ex) =>
+        new("Server returned a response that did not start with an HTTP status line.", ex);
+
+    private static async ValueTask ReceiveResponseAwaitHeadersAsync(ValueTask<bool> headersVt,
+        CancellationToken cancellationToken)
+    {
+        if (!await headersVt)
+            cancellationToken.ThrowIfCancellationRequested();
     }
 
     /// <summary>
@@ -183,6 +460,9 @@ public class HttpWebClient
     internal void FinishSession()
     {
         connection = null;
+        upstreamConnectionId = null;
+        upstreamRemoteEndPoint = null;
+        upstreamConnectionTiming = null;
 
         ConnectRequest?.FinishSession();
         Request?.FinishSession();
@@ -191,4 +471,44 @@ public class HttpWebClient
         Data.Clear();
         UserData = null;
     }
+
+    /// <summary>
+    ///     Unbinds the origin socket and resets request/response in place for the next keep-alive GET.
+    /// </summary>
+    internal void ResetForKeepAlive()
+    {
+        connection = null;
+        upstreamConnectionId = null;
+        upstreamRemoteEndPoint = null;
+        upstreamConnectionTiming = null;
+        CloseServerConnection = false;
+        Request.ResetForKeepAlive();
+        response?.ResetForKeepAlive();
+        data?.Clear();
+        UserData = null;
+    }
+
+    /// <summary>
+    ///     Rebind a pooled lite client onto a new request without allocating a new
+    ///     <see cref="HttpWebClient"/> / response shell (H1 terminate-lite hot path).
+    /// </summary>
+    internal void RebindForTerminateLite(Request request)
+    {
+        connection = null;
+        upstreamConnectionId = null;
+        upstreamRemoteEndPoint = null;
+        upstreamConnectionTiming = null;
+        CloseServerConnection = false;
+        Request = request;
+        if (response is not null)
+            response.ResetForKeepAlive();
+        else
+            response = new Response();
+        data?.Clear();
+        UserData = null;
+        UpStreamEndPoint = null;
+        UpStreamEndPointIPv4 = null;
+        UpStreamEndPointIPv6 = null;
+    }
+
 }

@@ -1,6 +1,7 @@
 ﻿using System;
 using System.ComponentModel;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 using Titanium.Web.Proxy.Compression;
@@ -20,11 +21,54 @@ public abstract class RequestResponseBase
     /// </summary>
     private string? bodyString;
 
+    /// <summary>
+    ///     Backing field for <see cref="TrailingHeaders" />, lazily allocated so the common case (a message
+    ///     with no trailers) does not pay for an empty <see cref="HeaderCollection" /> on every request/response.
+    /// </summary>
+    private HeaderCollection? trailingHeaders;
+
     internal Task? Http2BeforeHandlerTask;
+
+    /// <summary>
+    ///     Off-loop (static-HPACK MITM) response dispatch only: completes as soon as HEADERS are queued or the
+    ///     handler asked for the body, never when the user handler itself finishes. The frame loop gates DATA
+    ///     on this; gating on <see cref="Http2BeforeHandlerTask" /> would deadlock a handler awaiting
+    ///     GetResponseBody on the inline (dynamic-HPACK / bridge) path, where that task is the raw handler.
+    /// </summary>
+    internal Task? Http2ResponseDispatchGate;
 
     internal MemoryStream? Http2BodyData;
 
     internal bool Http2IgnoreBodyFrames;
+
+    /// <summary>True once this message's HEADERS have been queued toward the peer. SendBody must not send them again.</summary>
+    internal bool Http2HeadersQueued;
+
+    /// <summary>
+    ///     Requests that carry a body: completes once this request's origin decision is final and its HEADERS
+    ///     are queued (or it will never be sent). The next request's dispatch chains on it so the origin
+    ///     observes newly opened streams in increasing stream-id order (RFC 9113 §5.1.1) even when this
+    ///     request's HEADERS are only sent after its buffered body arrived. Never awaited by the frame loop.
+    /// </summary>
+    internal TaskCompletionSource<bool>? Http2OriginAdmitted;
+
+    /// <summary>
+    ///     Admission of the previous request on the connection; a buffered-body request queues its HEADERS
+    ///     only after this completes. Set when the HEADERS are deferred until the body arrived.
+    /// </summary>
+    internal Task? Http2AdmitAfter;
+
+    /// <summary>True when the HEADERS were deferred until the buffered body was complete.</summary>
+    internal bool Http2HeadersDeferred;
+
+    /// <summary>
+    ///     Native HTTP/2 response whose handler asked for the body (GetResponseBody) so the response is
+    ///     <see cref="Locked" /> while the origin body is still being buffered, although no HEADERS have been sent
+    ///     to the client yet. While set, the still-running BeforeResponse handler may replace the response
+    ///     (Respond / RespondStreaming) once the body has arrived; the frame loop then emits the replacement
+    ///     instead of the buffered original. Cleared when the handler has finished.
+    /// </summary>
+    internal bool Http2ReplaceableUntilBodyEnd;
 
     /// <summary>
     ///     Priority used only in HTTP/2
@@ -80,17 +124,47 @@ public abstract class RequestResponseBase
     public HeaderCollection Headers { get; } = new();
 
     /// <summary>
+    ///     Trailing headers ("trailers") carried after the body, per RFC 9110 §6.5 / RFC 7230 §4.1.2
+    ///     (HTTP/1.1 chunked) and as a second HEADERS block after DATA on HTTP/2/HTTP/3.
+    ///     Empty by default (lazily allocated on first access). Trailers are not defined for, and are
+    ///     always ignored on, fixed <c>Content-Length</c> bodies.
+    ///     <para>
+    ///         On the read side, this is populated once the body has actually been consumed (streamed,
+    ///         buffered, or drained) - it is <b>not</b> guaranteed to be populated yet during
+    ///         <c>BeforeRequest</c>/<c>BeforeResponse</c>. It is reliably observable in <c>AfterResponse</c>
+    ///         for streaming pass-through, or earlier only when the body was explicitly buffered
+    ///         (e.g. via <c>GetResponseBody</c>/<c>GetRequestBody</c>).
+    ///     </para>
+    ///     <para>
+    ///         On the write side, entries added here before the body finishes writing are emitted as the
+    ///         HTTP/1.1 trailer block after the terminating zero-length chunk, or as trailer HEADERS on
+    ///         HTTP/2/HTTP/3. A small set of framing/routing header fields (e.g. <c>Transfer-Encoding</c>,
+    ///         <c>Content-Length</c>, <c>Trailer</c>, <c>Host</c>) are forbidden in a trailer and will fail
+    ///         with a clear exception rather than being silently dropped.
+    ///     </para>
+    /// </summary>
+    public HeaderCollection TrailingHeaders => trailingHeaders ??= new HeaderCollection();
+
+    /// <summary>
+    ///     True if any trailing headers have been recorded, without forcing the lazy allocation that the
+    ///     public <see cref="TrailingHeaders" /> getter performs.
+    /// </summary>
+    internal bool HasTrailingHeaders => trailingHeaders != null && trailingHeaders.Any();
+
+    /// <summary>
     ///     Length of the body.
     /// </summary>
     public long ContentLength
     {
         get
         {
-            var headerValue = Headers.GetHeaderValueOrNull(KnownHeaders.ContentLength);
-
-            if (headerValue == null) return -1;
-
-            if (long.TryParse(headerValue, out var contentLen) && contentLen >= 0) return contentLen;
+            // Prefer ValueData parse — GetHeaderValueOrNull → header.Value allocates a string per call,
+            // and HasBody/framing hit this multiple times on the transparent keep-alive path.
+            if ((Headers.TryGetUniqueHeader(KnownHeaders.ContentLength, out var header)
+                || Headers.TryGetUniqueHeader(KnownHeaders.ContentLengthHttp2, out header))
+                && System.Buffers.Text.Utf8Parser.TryParse(header.ValueData.Span, out long contentLen, out _)
+                && contentLen >= 0)
+                return contentLen;
 
             return -1;
         }
@@ -138,8 +212,9 @@ public abstract class RequestResponseBase
     {
         get
         {
-            var headerValue = Headers.GetHeaderValueOrNull(KnownHeaders.TransferEncoding);
-            return headerValue != null && headerValue.ContainsIgnoreCase(KnownHeaders.TransferEncodingChunked.String);
+            if (!Headers.TryGetUniqueHeader(KnownHeaders.TransferEncoding, out var header))
+                return false;
+            return header.ValueData.SpanContainsIgnoreCaseAscii(KnownHeaders.TransferEncodingChunked.String8.Span);
         }
 
         set
@@ -177,10 +252,25 @@ public abstract class RequestResponseBase
         {
             BodyInternal = value;
             bodyString = null;
+            // Assignments are plain unless a wire-materialize site re-sets BodyIsWireEncoded.
+            BodyIsWireEncoded = false;
 
             // If there is a content length header update it
             UpdateContentLength();
         }
+    }
+
+    /// <summary>
+    ///     Drop the body reference without touching headers (e.g. after writing a rented buffer).
+    /// </summary>
+    internal void ClearBodyReference()
+    {
+        BodyInternal = null;
+        bodyString = null;
+        BodyIsWireEncoded = false;
+        IsBodyRead = false;
+        IsBodyReceived = false;
+        IsBodySent = false;
     }
 
     /// <summary>
@@ -206,11 +296,30 @@ public abstract class RequestResponseBase
     /// </summary>
     internal bool Locked { get; set; }
 
+    /// <summary>
+    ///     True when this message was produced by <c>SessionEventArgs.Respond</c> / Ok / GenericResponse
+    ///     (or equivalent), not received from the origin.
+    /// </summary>
+    internal bool IsSynthetic { get; set; }
+
+    /// <summary>
+    ///     True when field names were already lowercased for HTTP/2 (bridge prepare).
+    ///     EncodeHeaderBlock can skip the per-header ASCII scan under writeLock.
+    /// </summary>
+    internal bool HeaderNamesAreHttp2Normalized { get; set; }
+
     internal bool BodyAvailable => BodyInternal != null;
 
     internal bool IsBodyReceived { get; set; }
 
     internal bool IsBodySent { get; set; }
+
+    /// <summary>
+    ///     True when <see cref="BodyInternal"/> already matches <see cref="ContentEncoding"/> on the wire
+    ///     (eager-buffer / coalesce / H2 origin materialize). <see cref="CompressBodyAndUpdateContentLength"/>
+    ///     must not re-compress — that double-encodes and browsers show garbled HTML after one decompress.
+    /// </summary>
+    internal bool BodyIsWireEncoded { get; set; }
 
     internal abstract void EnsureBodyAvailable(bool throwWhenNotReadYet = true);
 
@@ -220,7 +329,7 @@ public abstract class RequestResponseBase
     /// <param name="encodingType"></param>
     /// <param name="body"></param>
     /// <returns></returns>
-    internal byte[] GetCompressedBody(HttpCompression encodingType, byte[] body)
+    internal static byte[] GetCompressedBody(HttpCompression encodingType, byte[] body)
     {
         using (var ms = new MemoryStream())
         {
@@ -233,24 +342,40 @@ public abstract class RequestResponseBase
         }
     }
 
-    internal byte[]? CompressBodyAndUpdateContentLength()
+    internal byte[]? CompressBodyAndUpdateContentLength() // NOSONAR S3776 -- Body compress/framing path shares mutable header state; splitting adds regression risk.
     {
         if (!IsBodyRead && BodyInternal == null) return null;
 
         var isChunked = IsChunked;
         var contentEncoding = ContentEncoding;
 
-        if (HasBody)
+        // Prefer a buffered body over HasBody framing heuristics. HasBody can flip false when
+        // Transfer-Encoding is stripped (HTTP/2 emit) while Content-Length is still -1, which used
+        // to discard already-read response bytes and advertise content-length: 0.
+        if (BodyInternal != null || HasBody)
         {
-            var body = Body;
-            if (contentEncoding != null && body != null)
+            var body = BodyInternal ?? Body;
+            if (contentEncoding != null && body is { Length: > 0 })
             {
-                body = GetCompressedBody(CompressionUtil.CompressionNameToEnum(contentEncoding), body);
+                // Eager-buffer paths store bytes that already match Content-Encoding. Re-applying
+                // gzip/br here double-compresses; Chrome then shows replacement-character garbage.
+                if (!BodyIsWireEncoded)
+                {
+                    var kind = CompressionUtil.CompressionNameToEnum(contentEncoding);
+                    // dcb/dcz/zstd etc.: leave wire bytes alone (cannot re-encode without the dict).
+                    if (kind != HttpCompression.Unsupported)
+                        body = GetCompressedBody(kind, body);
+                }
 
-                if (isChunked == false)
+                if (!isChunked)
                     ContentLength = body.Length;
                 else
                     ContentLength = -1;
+            }
+            else if (BodyInternal != null && !isChunked && ContentLength < 0)
+            {
+                // Buffered body with no Content-Length (e.g. H2/H3 origin) — publish the length.
+                ContentLength = body.Length;
             }
 
             return body;
@@ -298,6 +423,45 @@ public abstract class RequestResponseBase
             BodyInternal = null;
             bodyString = null;
         }
+    }
+
+    /// <summary>
+    ///     Clears wire/body state so this instance can carry the next keep-alive message.
+    ///     Does not replace <see cref="Headers"/> — the collection is reused.
+    /// </summary>
+    internal void ResetWireState()
+    {
+        Headers.Clear();
+        trailingHeaders?.Clear();
+        trailingHeaders = null;
+        BodyInternal = null;
+        bodyString = null;
+        IsBodyRead = false;
+        IsBodyReceived = false;
+        IsBodySent = false;
+        BodyIsWireEncoded = false;
+        Locked = false;
+        IsSynthetic = false;
+        KeepBody = false;
+        HeaderNamesAreHttp2Normalized = false;
+        OriginalHasBody = false;
+        OriginalContentLength = 0;
+        OriginalIsChunked = false;
+        OriginalContentEncoding = null;
+        HttpVersion = HttpHeader.VersionUnknown;
+        Http2BeforeHandlerTask = null;
+        Http2ResponseDispatchGate = null;
+        Http2BodyData?.Dispose();
+        Http2BodyData = null;
+        Http2IgnoreBodyFrames = false;
+        Http2HeadersQueued = false;
+        Http2OriginAdmitted = null;
+        Http2AdmitAfter = null;
+        Http2HeadersDeferred = false;
+        Http2ReplaceableUntilBodyEnd = false;
+        Priority = null;
+        ReadHttp2BeforeHandlerTaskCompletionSource = null;
+        ReadHttp2BodyTaskCompletionSource = null;
     }
 
     public override string ToString()

@@ -2,17 +2,24 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
+using Titanium.Web.Proxy.Diagnostics;
+using Titanium.Web.Proxy.Logging;
+using Titanium.Web.Proxy.Options;
 using Titanium.Web.Proxy.EventArguments;
 using Titanium.Web.Proxy.Extensions;
 using Titanium.Web.Proxy.Http;
 using Titanium.Web.Proxy.Models;
 using Titanium.Web.Proxy.Network.WinAuth;
 using Titanium.Web.Proxy.Network.WinAuth.Security;
+using WinAuthHandler = Titanium.Web.Proxy.Network.WinAuth.WinAuthHandler;
 
 namespace Titanium.Web.Proxy;
 
 public partial class ProxyServer
 {
+    /// <summary>Key used to store the per-request auth challenge round counter in <see cref="HttpClient.Data" />.</summary>
+    private const string WinAuthRoundCountKey = "WinAuthRoundCount";
+
     /// <summary>
     ///     possible header names.
     /// </summary>
@@ -25,6 +32,11 @@ public partial class ProxyServer
         "NTLMAuthorization",
         "NegotiateAuthorization",
         "KerberosAuthorization"
+    };
+
+    private static readonly HashSet<string> proxyAuthHeaderNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Proxy-Authenticate"
     };
 
     /// <summary>
@@ -45,7 +57,7 @@ public partial class ProxyServer
     ///     User to server to authenticate requests.
     ///     To disable this set ProxyServer.EnableWinAuth to false.
     /// </summary>
-    private async Task Handle401UnAuthorized(SessionEventArgs args)
+    private async Task Handle401UnAuthorized(SessionEventArgs args) // NOSONAR S3776 -- This protocol/state-machine path shares mutable parsing or transport state; splitting it further would create disproportionate regression risk.
     {
         string? headerName = null;
         HttpHeader? authHeader = null;
@@ -55,7 +67,7 @@ public partial class ProxyServer
         // check in non-unique headers first
         var header = response.Headers.NonUniqueHeaders.FirstOrDefault(x => authHeaderNames.Contains(x.Key));
 
-        if (!header.Equals(new KeyValuePair<string, List<HttpHeader>>())) headerName = header.Key;
+        if (!header.Equals(new KeyValuePair<string, IReadOnlyList<HttpHeader>>())) headerName = header.Key;
 
         if (headerName != null)
             authHeader = response.Headers.NonUniqueHeaders[headerName]
@@ -81,6 +93,26 @@ public partial class ProxyServer
 
         if (authHeader != null)
         {
+            // Bound the total number of auth challenge rounds to prevent infinite retry loops when
+            // credentials are persistently rejected or the server continuously re-challenges after the
+            // connection is marked authenticated.  ValidateWinAuthState catches most state-machine
+            // violations, but allowing Authorized→re-challenge cycles (per its own comment) means a
+            // misbehaving server could still loop unboundedly without this additional cap.
+            var currentRound = args.HttpClient.Data.TryGetValueAs(WinAuthRoundCountKey, out int storedRound)
+                ? storedRound
+                : 0;
+            var maxAuthRounds = ResourceLimits.MaxAuthChallengeRounds;
+            var maxTokenBytes = ResourceLimits.MaxWinAuthTokenBytes;
+            if (currentRound >= maxAuthRounds)
+            {
+                ProxyLog.LimitExceeded(logger, LimitId.AuthChallengeRounds, PolicyMode.Enforce,
+                    currentRound, maxAuthRounds, "401");
+                await RewriteUnauthorizedResponse(args);
+                return;
+            }
+
+            args.HttpClient.Data[WinAuthRoundCountKey] = currentRound + 1;
+
             var scheme = authSchemes.Contains(authHeader.Value) ? authHeader.Value : null;
 
             var expectedAuthState =
@@ -93,6 +125,8 @@ public partial class ProxyServer
                 return;
             }
 
+            ProxyMetrics.AuthRoundCompleted(scheme ?? "winauth");
+
             var request = args.HttpClient.Request;
 
             // clear any existing headers to avoid confusing bad servers
@@ -101,7 +135,12 @@ public partial class ProxyServer
             // initial value will match exactly any of the schemes
             if (scheme != null)
             {
-                var clientToken = WinAuthHandler.GetInitialAuthToken(request.Host!, scheme, args.HttpClient.Data);
+                WinAuthCredentials? credentials = null;
+                if (WinAuthCredentialsProvider != null)
+                    credentials = await WinAuthCredentialsProvider(args);
+
+                var clientToken = WinAuthHandler.GetInitialAuthToken(request.Host!, scheme, args.HttpClient.Data,
+                    credentials, maxTokenBytes);
 
                 var auth = string.Concat(scheme, clientToken);
 
@@ -119,7 +158,8 @@ public partial class ProxyServer
                     authHeader.Value.Length > x.Length + 1);
 
                 var serverToken = authHeader.Value.Substring(scheme.Length + 1);
-                var clientToken = WinAuthHandler.GetFinalAuthToken(request.Host!, serverToken, args.HttpClient.Data);
+                var clientToken = WinAuthHandler.GetFinalAuthToken(request.Host!, serverToken, args.HttpClient.Data,
+                    maxTokenBytes);
 
                 var auth = string.Concat(scheme, clientToken);
 
@@ -142,16 +182,104 @@ public partial class ProxyServer
     }
 
     /// <summary>
+    ///     Handles NTLM/Kerberos authentication challenges from an upstream proxy.
+    /// </summary>
+    private async Task Handle407ProxyAuthorization(SessionEventArgs args) // NOSONAR S3776 -- This protocol/state-machine path shares mutable parsing or transport state; splitting it further would create disproportionate regression risk.
+    {
+        if (!args.HttpClient.HasConnection) return;
+
+        var upstreamProxy = args.HttpClient.Connection.UpStreamProxy;
+        if (upstreamProxy?.UseDefaultCredentials != true) return;
+
+        var response = args.HttpClient.Response;
+        var authHeader = response.Headers.GetHeaders(KnownHeaders.ProxyAuthenticate.String)?
+            .FirstOrDefault(x => authSchemes.Any(y =>
+                x.Value.Equals(y, StringComparison.OrdinalIgnoreCase) ||
+                x.Value.StartsWith(y + " ", StringComparison.OrdinalIgnoreCase)));
+        if (authHeader == null) return;
+
+        // Apply the same per-request round cap as Handle401UnAuthorized — see MaxAuthChallengeRounds.
+        var currentRound407 = args.HttpClient.Data.TryGetValueAs(WinAuthRoundCountKey, out int stored407)
+            ? stored407
+            : 0;
+        var maxAuthRounds = ResourceLimits.MaxAuthChallengeRounds;
+        if (currentRound407 >= maxAuthRounds)
+        {
+            ProxyLog.LimitExceeded(logger, LimitId.AuthChallengeRounds, PolicyMode.Enforce,
+                currentRound407, maxAuthRounds, "407");
+            await RewriteUnauthorizedResponse(args);
+            return;
+        }
+
+        args.HttpClient.Data[WinAuthRoundCountKey] = currentRound407 + 1;
+
+        var scheme = authSchemes.Contains(authHeader.Value) ? authHeader.Value : null;
+        var expectedAuthState =
+            scheme == null ? State.WinAuthState.InitialToken : State.WinAuthState.Unauthorized;
+
+        if (UpstreamProxyWinAuthTokenGenerator == null &&
+            !WinAuthEndPoint.ValidateWinAuthState(args.HttpClient.Data, expectedAuthState))
+        {
+            await RewriteUnauthorizedResponse(args);
+            return;
+        }
+
+        ProxyMetrics.AuthRoundCompleted(scheme ?? "winauth");
+
+        var request = args.HttpClient.Request;
+        request.Headers.RemoveHeader(KnownHeaders.ProxyAuthorization);
+
+        if (scheme != null)
+        {
+            var clientToken = GenerateUpstreamProxyWinAuthToken(upstreamProxy, scheme, null, args.HttpClient.Data);
+            if (string.IsNullOrEmpty(clientToken))
+            {
+                await RewriteUnauthorizedResponse(args);
+                return;
+            }
+
+            request.Headers.SetOrAddHeaderValue(KnownHeaders.ProxyAuthorization,
+                string.Concat(scheme, clientToken));
+            if (request.HasBody) request.ContentLength = 0;
+        }
+        else
+        {
+            scheme = authSchemes.First(x =>
+                authHeader.Value.StartsWith(x, StringComparison.OrdinalIgnoreCase) &&
+                authHeader.Value.Length > x.Length &&
+                char.IsWhiteSpace(authHeader.Value[x.Length]));
+
+            var serverToken = authHeader.Value.Substring(scheme.Length).Trim();
+            var clientToken =
+                GenerateUpstreamProxyWinAuthToken(upstreamProxy, scheme, serverToken, args.HttpClient.Data);
+            if (string.IsNullOrEmpty(clientToken))
+            {
+                await RewriteUnauthorizedResponse(args);
+                return;
+            }
+
+            request.Headers.SetOrAddHeaderValue(KnownHeaders.ProxyAuthorization,
+                string.Concat(scheme, clientToken));
+            if (request.OriginalHasBody) request.ContentLength = request.Body.Length;
+
+            args.HttpClient.Connection.IsWinAuthenticated = true;
+        }
+
+        args.ReRequest = true;
+    }
+
+    /// <summary>
     ///     Rewrites the response body for failed authentication
     /// </summary>
     /// <param name="args"></param>
     /// <returns></returns>
-    private async Task RewriteUnauthorizedResponse(SessionEventArgs args)
+    private static async Task RewriteUnauthorizedResponse(SessionEventArgs args)
     {
         var response = args.HttpClient.Response;
 
         // Strip authentication headers to avoid credentials prompt in client web browser
         foreach (var authHeaderName in authHeaderNames) response.Headers.RemoveHeader(authHeaderName);
+        foreach (var proxyAuthHeaderName in proxyAuthHeaderNames) response.Headers.RemoveHeader(proxyAuthHeaderName);
 
         // Add custom div to body to clarify that the proxy (not the client browser) failed authentication
         var authErrorMessage =

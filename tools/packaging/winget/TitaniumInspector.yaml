@@ -1,0 +1,24 @@
+# justcoding121.TitaniumInspector
+# Submit a PR to https://github.com/microsoft/winget-pkgs after a *signed* GitHub Release with MSI.
+# Authenticode publisher: Jehonathan Thomas.
+
+PackageIdentifier: justcoding121.TitaniumInspector
+PackageVersion: 7.0.21
+PackageLocale: en-US
+Publisher: justcoding121
+PublisherUrl: https://github.com/justcoding121/titanium-web-proxy
+PackageName: Titanium Inspector
+License: PolyForm Noncommercial 1.0.0
+LicenseUrl: https://github.com/justcoding121/titanium-web-proxy/blob/develop/licenses/PolyForm-Noncommercial-1.0.0.txt
+ShortDescription: Desktop HTTP(S) traffic debugger for Titanium Web Proxy.
+Installers:
+  - Architecture: x64
+    InstallerType: wix
+    InstallerUrl: https://github.com/justcoding121/titanium-web-proxy/releases/download/v7.0.21/TitaniumInspector-win-x64.msi
+    InstallerSha256: 8050B5AF7EA50193BC694A93B3D56F530C5AAD6411CBB915D619FE221E567E03
+  - Architecture: x64
+    InstallerType: portable
+    InstallerUrl: https://github.com/justcoding121/titanium-web-proxy/releases/download/v7.0.21/TitaniumInspector-win-x64.zip
+    InstallerSha256: FB7540C20770919D819E7A9CDFF9A9A4DD27367D1F255B7D80CF7DA53C025A34
+ManifestType: singleton
+ManifestVersion: 1.6.0

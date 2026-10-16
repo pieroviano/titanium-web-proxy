@@ -1,6 +1,8 @@
-﻿using System;
+using System.Collections.Generic;
+using System;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq;
+using System.Runtime.Versioning;
 using Microsoft.Win32;
 using Titanium.Web.Proxy.Models;
 
@@ -9,11 +11,20 @@ namespace Titanium.Web.Proxy.Helpers;
 
 internal class HttpSystemProxyValue
 {
+    private readonly string protocol;
+
     public HttpSystemProxyValue(string hostName, int port, ProxyProtocolType protocolType)
     {
         HostName = hostName;
         Port = port;
         ProtocolType = protocolType;
+        protocol = protocolType switch
+        {
+            ProxyProtocolType.Http => ProxyServer.UriSchemeHttp,
+            ProxyProtocolType.Https => ProxyServer.UriSchemeHttps,
+            _ => throw new ArgumentOutOfRangeException(nameof(protocolType), protocolType,
+                "Only HTTP and HTTPS proxy values are supported.")
+        };
     }
 
     internal string HostName { get; }
@@ -24,19 +35,6 @@ internal class HttpSystemProxyValue
 
     public override string ToString()
     {
-        string protocol;
-        switch (ProtocolType)
-        {
-            case ProxyProtocolType.Http:
-                protocol = ProxyServer.UriSchemeHttp;
-                break;
-            case ProxyProtocolType.Https:
-                protocol = ProxyServer.UriSchemeHttps;
-                break;
-            default:
-                throw new Exception("Unsupported protocol type");
-        }
-
         return $"{protocol}={HostName}:{Port}";
     }
 }
@@ -46,7 +44,8 @@ internal class HttpSystemProxyValue
 /// </summary>
 [SuppressMessage("StyleCop.CSharp.MaintainabilityRules", "SA1402:FileMayOnlyContainASingleType",
     Justification = "Reviewed.")]
-internal class SystemProxyManager
+[SupportedOSPlatform("windows")]
+internal class SystemProxyManager : ISystemProxyBackend
 {
     private const string RegKeyInternetSettings = "Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
     private const string RegAutoConfigUrl = "AutoConfigURL";
@@ -59,23 +58,66 @@ internal class SystemProxyManager
 
     private ProxyInfo? originalValues;
 
+    private readonly EventHandler processExitHandler;
+    private readonly UnhandledExceptionEventHandler unhandledExceptionHandler;
+    private readonly NativeMethods.ConsoleEventDelegate? consoleEventHandler;
+    private bool disposed;
+
     public SystemProxyManager()
     {
-        AppDomain.CurrentDomain.ProcessExit += (o, args) => RestoreOriginalSettings();
+        // Best-effort restore when the process is going away. Hard kills (e.g. End Task /
+        // taskkill /F) cannot run managed code; Start(changeSystemProxySettings: true) clears
+        // stale local-proxy entries on the next run.
+        processExitHandler = (_, _) => RestoreOriginalSettings();
+        unhandledExceptionHandler = (_, _) => RestoreOriginalSettings();
+        AppDomain.CurrentDomain.ProcessExit += processExitHandler;
+        AppDomain.CurrentDomain.UnhandledException += unhandledExceptionHandler;
+
         if (Environment.UserInteractive && NativeMethods.GetConsoleWindow() != IntPtr.Zero)
         {
-            var handler = new NativeMethods.ConsoleEventDelegate(eventType =>
+            consoleEventHandler = eventType =>
             {
-                if (eventType != 2) return false;
+                // CTRL_C_EVENT=0, CTRL_BREAK_EVENT=1, CTRL_CLOSE_EVENT=2,
+                // CTRL_LOGOFF_EVENT=5, CTRL_SHUTDOWN_EVENT=6
+                if (eventType is 0 or 1 or 2 or 5 or 6)
+                    RestoreOriginalSettings();
 
-                RestoreOriginalSettings();
                 return false;
-            });
-            NativeMethods.Handler = handler;
-
-            // On Console exit make sure we also exit the proxy
-            NativeMethods.SetConsoleCtrlHandler(handler, true);
+            };
+            // On console control events, restore system proxy before the process exits.
+            NativeMethods.SetConsoleCtrlHandler(consoleEventHandler, true);
         }
+    }
+
+    /// <summary>
+    ///     Unsubscribes the AppDomain and console-control handlers registered by the constructor.
+    ///     Without this, every <see cref="ProxyServer" /> created and disposed over an
+    ///     application's lifetime (e.g. in tests, or short-lived proxy instances) leaks a retained
+    ///     reference through <see cref="AppDomain.ProcessExit" />/<see cref="AppDomain.UnhandledException" />,
+    ///     and a disposed instance's console handler could still fire and call into a torn-down object.
+    /// </summary>
+    public void Dispose()
+    {
+        Dispose(true);
+        GC.SuppressFinalize(this);
+    }
+
+    protected virtual void Dispose(bool disposing)
+    {
+        if (disposed) return;
+
+        if (disposing)
+        {
+            AppDomain.CurrentDomain.ProcessExit -= processExitHandler;
+            AppDomain.CurrentDomain.UnhandledException -= unhandledExceptionHandler;
+
+            if (consoleEventHandler != null)
+            {
+                NativeMethods.SetConsoleCtrlHandler(consoleEventHandler, false);
+            }
+        }
+
+        disposed = true;
     }
 
     /// <summary>
@@ -84,11 +126,29 @@ internal class SystemProxyManager
     /// <param name="hostname"></param>
     /// <param name="port"></param>
     /// <param name="protocolType"></param>
-    internal void SetProxy(string hostname, int port, ProxyProtocolType protocolType)
+    public void SetProxy(string hostname, int port, ProxyProtocolType protocolType)
+    {
+        SetProxy(hostname, port, protocolType, null);
+    }
+
+    /// <summary>
+    ///     Set the HTTP and/or HTTPS proxy server for current machine.
+    /// </summary>
+    /// <param name="hostname"></param>
+    /// <param name="port"></param>
+    /// <param name="protocolType"></param>
+    /// <param name="proxyOverride">
+    ///     The proxy bypass list to set, or <see langword="null"/> to preserve the current list.
+    /// </param>
+    public void SetProxy(string hostname, int port, ProxyProtocolType protocolType, string? proxyOverride)
     {
         using (var reg = OpenInternetSettingsKey())
         {
-            if (reg == null) return;
+            if (reg == null)
+            {
+                throw new InvalidOperationException(
+                    "Could not open HKCU Internet Settings; Windows system proxy was not changed");
+            }
 
             SaveOriginalProxyConfiguration(reg);
             PrepareRegistry(reg);
@@ -102,19 +162,31 @@ internal class SystemProxyManager
             if ((protocolType & ProxyProtocolType.Https) != 0)
                 existingSystemProxyValues.Add(new HttpSystemProxyValue(hostname, port, ProxyProtocolType.Https));
 
+            var proxyServerValue = string.Join(";", existingSystemProxyValues.Select(x => x.ToString()).ToArray());
             reg.DeleteValue(RegAutoConfigUrl, false);
             reg.SetValue(RegProxyEnable, 1);
-            reg.SetValue(RegProxyServer,
-                string.Join(";", existingSystemProxyValues.Select(x => x.ToString()).ToArray()));
+            reg.SetValue(RegProxyServer, proxyServerValue);
+            if (proxyOverride != null) reg.SetValue(RegProxyOverride, proxyOverride);
 
             Refresh();
+
+            // Re-read so a silent registry failure cannot look like success to Inspector.
+            var enableObj = reg.GetValue(RegProxyEnable);
+            var enable = enableObj is null ? 0 : Convert.ToInt32(enableObj);
+            var server = reg.GetValue(RegProxyServer) as string ?? string.Empty;
+            if (enable != 1 ||
+                !server.Contains($"{hostname}:{port}", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    "WinINET proxy write did not stick (ProxyEnable/ProxyServer mismatch after set)");
+            }
         }
     }
 
     /// <summary>
     ///     Remove the HTTP and/or HTTPS proxy setting from current machine
     /// </summary>
-    internal void RemoveProxy(ProxyProtocolType protocolType, bool saveOriginalConfig = true)
+    public void RemoveProxy(ProxyProtocolType protocolType, bool saveOriginalConfig = true)
     {
         using (var reg = OpenInternetSettingsKey())
         {
@@ -149,7 +221,7 @@ internal class SystemProxyManager
     /// <summary>
     ///     Removes all types of proxy settings (both http and https)
     /// </summary>
-    internal void DisableAllProxy()
+    public void DisableAllProxy()
     {
         using (var reg = OpenInternetSettingsKey())
         {
@@ -188,15 +260,35 @@ internal class SystemProxyManager
         }
     }
 
-    internal void RestoreOriginalSettings()
-    {
-        if (originalValues == null) return;
 
+    public string? GetCurrentProxyOverride() => GetProxyInfoFromRegistry()?.ProxyOverride;
+
+    public ProxyProtocolType GetStaleLocalProxyProtocols(IReadOnlyCollection<int> ownedPorts)
+    {
+        var stale = ProxyProtocolType.None;
+        var proxyInfo = GetProxyInfoFromRegistry();
+        if (proxyInfo?.Proxies == null) return stale;
+
+        foreach (var proxy in proxyInfo.Proxies.Values)
+        {
+            if (!NetworkHelper.IsLocalIpAddress(proxy.HostName) || !ownedPorts.Contains(proxy.Port))
+                continue;
+            stale |= proxy.ProtocolType;
+        }
+
+        return stale;
+    }
+    public void RestoreOriginalSettings()
+    {
+        var ov = originalValues;
+        if (ov == null) return;
+
+        try
+        {
         using (var reg = Registry.CurrentUser.OpenSubKey(RegKeyInternetSettings, true))
         {
             if (reg == null) return;
 
-            var ov = originalValues;
             if (ov.AutoConfigUrl != null)
                 reg.SetValue(RegAutoConfigUrl, ov.AutoConfigUrl);
             else
@@ -232,9 +324,14 @@ internal class SystemProxyManager
                 // in Windows 7 or earlier at system shutdown.
                 Refresh();
         }
+        }
+        catch
+        {
+            // process-exit restore must not throw
+        }
     }
 
-    internal ProxyInfo? GetProxyInfoFromRegistry()
+    internal static ProxyInfo? GetProxyInfoFromRegistry()
     {
         using (var reg = OpenInternetSettingsKey())
         {
@@ -244,11 +341,12 @@ internal class SystemProxyManager
         }
     }
 
-    private ProxyInfo GetProxyInfoFromRegistry(RegistryKey reg)
+    private static ProxyInfo GetProxyInfoFromRegistry(RegistryKey reg)
     {
+        var proxyEnableValue = reg.GetValue(RegProxyEnable);
         var pi = new ProxyInfo(null,
             reg.GetValue(RegAutoConfigUrl) as string,
-            reg.GetValue(RegProxyEnable) as int?,
+            proxyEnableValue is int proxyEnable ? proxyEnable : null,
             reg.GetValue(RegProxyServer) as string,
             reg.GetValue(RegProxyOverride) as string);
 
@@ -270,7 +368,8 @@ internal class SystemProxyManager
     {
         if (reg.GetValue(RegProxyEnable) == null) reg.SetValue(RegProxyEnable, 0);
 
-        if (reg.GetValue(RegProxyServer) == null || reg.GetValue(RegProxyEnable) as int? == 0)
+        if (reg.GetValue(RegProxyServer) == null ||
+            reg.GetValue(RegProxyEnable) is int proxyEnable && proxyEnable == 0)
             reg.SetValue(RegProxyServer, string.Empty);
     }
 

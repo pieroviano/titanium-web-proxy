@@ -1,0 +1,257 @@
+# RpsLoadProbe
+
+> **For maintainers / contributors** — saturation RPS harness used to refresh wiki [Performance](../../wiki/Performance.md) tables.
+
+Saturation RPS harness for Titanium.Web.Proxy. Measures the **breaking point** (last concurrency that still meets error/latency SLOs) and **peak RPS**.
+
+Published numbers and external control-arm comparisons live only on the wiki [Performance](../../wiki/Performance.md) page (GitHub Actions medians on GitHub-hosted runners; products are compared within an OS, not across OSes: `ubuntu-latest` / `windows-latest` at 4 vCPU / 16 GiB, and `macos-15` Apple Silicon at 3-core / 7 GB). Local cool A/B and laptop tables live on [Performance Local Lab](../../wiki/Performance-Local-Lab.md); the playbook is on [Performance Profiling](../../wiki/Performance-Profiling.md). This README lists how to run the local harness.
+
+Manual CI: [RPS saturation](../../.github/workflows/rps-saturation.yml) (`workflow_dispatch`, matrix `ubuntu-latest` + `windows-latest` + `macos-15`). Use the pinned `macos-15` label (Apple Silicon, 3-core M1 / 7 GiB) rather than `macos-latest` so the image does not change between runs.
+
+**macOS lab deps (workflow):** Homebrew nginx with `http_v3_module` (fail if missing), Homebrew `haproxy` with `USE_QUIC` (fail if missing; 3.2 osx source fallback), Homebrew `envoy` when a bottle exists otherwise pinned darwin-arm64 1.36.7, Homebrew `libmsquic` + `openssl@3` on `DYLD_LIBRARY_PATH` / `DYLD_FALLBACK_LIBRARY_PATH` (assert `QuicListener.IsSupported`), bombardier darwin-arm64, and YARP via the same .NET probe arms as Linux/Windows.
+
+## Tiered cadence
+
+| Tier | Mode | When |
+|------|------|------|
+| Daily / per-PR | `compare-spot` ([`run-spot-matrix.ps1`](run-spot-matrix.ps1)) | minutes; Full÷Reverse + TWP÷YARP @ c=64 |
+| Milestone | `compare-terminate` / `compare-matrix` | ~1–2h investigation |
+| Editions | `compare-editions` | CLI / Plus / Intercept / stress arms vs baselines (~60 min) |
+| Beta/stable publish | `compare-editions` + `compare-spot` (parallel GHA jobs) | ~60 min wall; peer gate catches Core÷YARP regressions editions miss |
+| Release / wiki | `compare-product` | median of 3; the [RPS suite](../../.github/workflows/rps-suite.yml) runs one job per wiki row on Win/Linux/macOS (see [PERF-GATES.md](PERF-GATES.md)); paste unions the row CSVs |
+| Unary gRPC | `compare-grpc` | H2 TLS Echo RPC/s @ c=64 — H2↔H2 and H2→h2c rows, one job each |
+| WebSocket dual-TLS | `compare-ws-h1tls` | H1 TLS→H1 TLS echo (`*-duplex-ws-h1tls`) |
+| WebSocket RFC 8441 | `compare-ws-h2` | H2 TLS extended CONNECT → H1 plain (`*-duplex-ws-h2`) |
+| Heavier tables | `compare-bodies` / `post` / `lossy` / `arch` / `tls-cost` | one suite run each, one job per row |
+
+Harness defaults: warmup **2s** / measure **8s** / concurrency **8,16,32,64** / median of **3** for publishable GHA numbers. `--arm-shard` takes a comparison-group key (`h1c-h1c`, listed by `--print-groups`) to run exactly one wiki row, so TWP÷YARP and Lite÷Reverse stay same-job ratios; `i/n` still partitions rows for the smoke modes. A single-row leg allows 60 minutes of ramp and 75 minutes overall, so a wedged VM loses one row rather than the run. `--stop-on-slo-fail` (default **on**) stops an arm after the first SLO fail plus one peak confirmation step. See [PERF-GATES.md](PERF-GATES.md).
+
+## Full 5×5 reverse matrix
+
+Client × origin wire cartesian: **H1·plain, H1·TLS, H2·plain (h2c), H2·TLS, H3·QUIC** (25 cells). Each cell has a TWP reverse arm and a YARP peer.
+
+```powershell
+pwsh tools/RpsLoadProbe/run-rps.ps1 -Mode compare-matrix
+```
+
+New bridge arms that complete the grid (beyond the historical subset):
+
+| Arm | Topology |
+|---|---|
+| `reverse-http3-to-h2c` | H3 → prior-knowledge h2c |
+| `reverse-http1-to-h2c` | H1 TLS → prior-knowledge h2c |
+| `reverse-http1-plain-to-h2c` | H1 plain → prior-knowledge h2c |
+| `reverse-http1-plain-to-http2` | H1 plain → HTTPS h2 |
+| `reverse-http1-plain-to-http3` | H1 plain → QUIC/h3 |
+| `reverse-h2c-to-https` | h2c → HTTPS HTTP/1 |
+
+YARP dual-crypto peers: `yarp-reverse-http1-tls-to-https`, `yarp-reverse-http2-to-https-http1`, `yarp-reverse-http3-to-https-http1`.
+
+**nginx / HAProxy / Envoy:** all product-possible 5×5 reverse cells have ProbeModes. nginx is H1 origin only (plus h2c inbound on 1.25.1+). HAProxy and Envoy cover H2/H3 origin (Envoy H3 upstream is alpha). Windows: HAProxy/Envoy are OS-impossible; nginx H3 inbound is OS-impossible. See [`product-arm-matrix.py`](product-arm-matrix.py).
+
+**Not supported:** `Upgrade: h2c`. Explicit-proxy inbound h2c is not implemented. Outbound and inbound prior-knowledge h2c on transparent reverse are supported. H3 is always QUIC/TLS for TWP (no cleartext H3 client or origin).
+
+## Same-protocol matrix
+
+```powershell
+pwsh tools/RpsLoadProbe/run-rps.ps1 -Mode compare-same
+```
+
+| Arm | Topology |
+|---|---|
+| `reverse-http1` | H1 cleartext → H1 cleartext |
+| `reverse-http1-tls` | H1 TLS terminate → H1 cleartext |
+| `https-mitm` | Explicit H1 TLS MITM → HTTPS H1 |
+| `reverse-http2` | H2 TLS MITM → HTTPS H2 |
+| `reverse-http3` | H3 QUIC → H3 origin (dual-listen reverse) |
+| `yarp-reverse-http3-to-http3` | Managed reverse peer H3 → H3 |
+
+## Fair terminate compare
+
+```powershell
+pwsh tools/RpsLoadProbe/run-rps.ps1 -Mode compare-terminate
+```
+
+Client TLS → cleartext origin across H1 TLS terminate, H2→H1, h2c→H1, and H3→H1 arms.
+
+Every `--ramp` arm is **three OS processes**: parent load generator, `--serve-origin` child, `--serve-proxy` child (except **origin-direct** arms, which omit the proxy child). The parent seeds a temp test CA (`TWP_RPS_CERT_DIR`) so HTTPS/QUIC origin and proxy share the same root. Combined `--serve` remains for local debugging only; it is not on the ramp path. Absolute RPS from older combined TLS/QUIC-origin cells is not comparable to split runs — prefer TWP÷peer ratios.
+
+## Saturation control (origin ceiling)
+
+Calibration only — not a product ranking matrix. Tiny keep-alive GET; three blocks:
+
+```powershell
+pwsh tools/RpsLoadProbe/run-rps.ps1 -Mode compare-saturation
+```
+
+| Block | Arms |
+|---|---|
+| **A — H1 plain** | `origin-direct`, `origin-direct-bombardier` (if PATH), `bare-reverse-http1`, `nginx-reverse-http1`, `haproxy-reverse-http1` (if haproxy), `envoy-reverse-http1` (if envoy), `yarp-reverse-http1`, `twp-reverse-http1` |
+| **B — H2 TLS→H1** | `nginx-reverse-http2` (if nginx), `haproxy-reverse-http2` (if haproxy), `envoy-reverse-http2` (if envoy), `yarp-reverse-http2`, `twp-reverse-http2-cleartext` |
+| **C — H3→H1** | `nginx-reverse-http3-cleartext` (if nginx + `http_v3_module`), `haproxy-reverse-http3-cleartext` (if `USE_QUIC`), `envoy-reverse-http3-cleartext` (if envoy), `yarp-reverse-http3-cleartext`, `twp-reverse-http3-cleartext` (skipped when `QuicListener` unsupported) |
+
+**CSV resource columns** (every measure step): `proxy_rss_peak_bytes`, `proxy_cpu_avg_pct` (wiki label: **Memory (RSS)**). Names stay `proxy_*` even on origin-direct arms (those sample the **origin** child PID). Otherwise sample the **proxy** child PID plus its **full descendant tree** (so nginx workers under the serve-proxy → master chain are included). Empty when the PID cannot be sampled. Poll ~200ms during the measure window; peak Working Set / VmRSS sum and average CPU% (of all logical processors).
+
+**Summary:**
+- **compare-saturation:** Block A prints median peak RPS as **% of origin-direct** (and bombardier when present) plus median Memory (RSS) / CPU at the peak-RPS step. Blocks B/C print peer÷YARP and peer÷nginx (when present) plus Memory (RSS) / CPU — not % of H1 origin-direct.
+- **Other compare-* matrix modes:** median peak RPS for all arms; **TWP-only** median Memory (RSS) / CPU (`median_memory_rss_bytes` / `median_cpu_avg_pct`). nginx/YARP Memory/CPU remain saturation-only for peer comparison.
+
+HTTP/2 and HTTP/3 open `min(concurrency, max(4×cores, 16))` client connections (one `SocketsHttpHandler` each, `MaxConnectionsPerServer = 1`). On a 4 vCPU runner that is 16 connections at concurrency 64. A single shared handler stays on one connection until the peer stream cap and pins nginx, HAProxy, and Envoy to one worker. `TWP_RPS_SINGLE_HTTP2_CONNECTION=1` / `TWP_RPS_SINGLE_HTTP3_CONNECTION=1` force one connection for a local memory A/B. CSV column `client_connections` records the pool size. See [Performance Profiling — Memory (RSS)](../../wiki/Performance-Profiling.md#memory-rss--h2h1-vs-h1--h3).
+
+Paste CI medians into the wiki [Performance — Saturation control](../../wiki/Performance.md#saturation-control) section. Do not mix bombardier into the publishable TWP÷YARP÷nginx matrices.
+
+## Heavier reverse workloads (bodies / POST / lossy / TLS cost)
+
+Tiny keep-alive GET stresses the per-request path hardest. These modes exercise heavier reverse work:
+
+```powershell
+pwsh tools/RpsLoadProbe/run-rps.ps1 -Mode compare-bodies
+pwsh tools/RpsLoadProbe/run-rps.ps1 -Mode compare-post
+pwsh tools/RpsLoadProbe/run-rps.ps1 -Mode compare-lossy
+pwsh tools/RpsLoadProbe/run-rps.ps1 -Mode compare-tls-cost
+pwsh tools/RpsLoadProbe/run-rps.ps1 -Mode compare-arch
+```
+
+| Mode | Workload |
+|---|---|
+| `compare-bodies` | GET, keep-alive, **64 KiB** and **256 KiB** responses |
+| `compare-post` | POST **64 KiB** request + **64 KiB** response |
+| `compare-lossy` | GET **64 KiB**, userspace **5 ms** delay + **1%** stall/drop on H1/H2 (TCP); H3 gets **1%** UDP datagram drop only (per-datagram delay breaks MsQuic through the shim) |
+| `compare-tls-cost` | H1 TLS only: keep-alive tiny, **new-connection** tiny, keep-alive **256 KiB** |
+| `compare-arch` | Slow consumer (256 KiB GET, throttled read), early response (POST overlap), H2 TLS↔H2 TLS duplex, WebSocket echo |
+
+Lossy link is a userspace shim (not kernel netem): TCP gets per-buffer delay + occasional whole-connection stalls (HOL for multiplexed H2); UDP gets delay + datagram drops (QUIC). PUT with the same body is the same proxy work as POST; DELETE with no body matches GET.
+
+CLI knobs (also usable on single arms): `--method`, `--response-bytes`, `--request-bytes`, `--no-keepalive`, `--delay-ms`, `--loss-percent`.
+
+## MITM matrix (true interception, TWP-only)
+
+```powershell
+pwsh tools/RpsLoadProbe/run-rps.ps1 -Mode compare-mitm
+# Same-job reverse peers + MITM lite + MITM full (for wiki Lite÷Reverse / Full÷Reverse):
+pwsh tools/RpsLoadProbe/run-rps.ps1 -Mode compare-product
+```
+
+Two TWP-only MITM shapes on the same Client×Origin wires (+ CONNECT). nginx/YARP cannot MITM.
+
+| Shape | Arms | Child env | Path |
+|---|---|---|---|
+| **Lite** | `twp-mitm-*` | `TWP_RPS_HTTP_INTERCEPTION=1` | No-op `BeforeRequest`/`BeforeResponse`; after unchanged-lite finish, can reuse reverse compressed-relay / terminate-lite |
+| **Full** | `twp-mitm-full-*` | `…_INTERCEPTION=1` + `TWP_RPS_HTTP_INTERCEPTION_MUTATE=1` | Handlers append `x-twp-rps-probe` on request and response; product uses generic append-only relay via `MitmCompressedRelayHelper` |
+
+`compare-mitm` and `compare-product` both run Lite then Full (Full roughly doubles MITM wall time; GHA `rps-saturation` job timeout is 420m so `compare-product` ×3 can finish). Wiki MITM table columns: Lite sustain, Full sustain, Lite÷Reverse, Full÷Reverse (RSS/CPU footnotes on sustain cells).
+
+**Reverse** (`compare-matrix` / reverse half of `compare-product`) is bare terminate (no handlers). nginx conf matches TWP/YARP streaming: `keepalive 256`, `proxy_buffering off`, `proxy_request_buffering off`.
+
+### Practical reverse charts (README / website)
+
+Two PNG families per OS:
+
+1. **Tiny** (`rps-practical-{os}.png`) — **10 clusters**: eight industry reverse wires (tiny keep-alive GET ~56 B) plus WebSocket / gRPC unary. Chart order puts typical reverse paths first (TLS in → HTTP/1 out), then H2 same-protocol, H3→H1c, **H3→h2c**, then WS / gRPC.
+2. **64 KB** (`rps-practical-heavier-{os}.png`) — six heavier clusters: GET 64 KB H1/H2/H3→H1c, GET 64 KB H2→H2, POST 64 KB H1, GET 256 KB H1. Skipped when that OS has no heavier wiki/CSV data.
+
+After downloading `compare-product` plus heavier roots:
+
+```bash
+pip install -r tools/RpsLoadProbe/requirements-charts.txt
+python3 tools/RpsLoadProbe/render-practical-charts.py \
+  --results-root tools/RpsLoadProbe/results/gha-dl/<productRunId> \
+  --bodies-root tools/RpsLoadProbe/results/gha-dl/<bodiesRunId> \
+  --post-root tools/RpsLoadProbe/results/gha-dl/<postRunId> \
+  --arch-root tools/RpsLoadProbe/results/gha-dl/<archRunId> \
+  --grpc-root tools/RpsLoadProbe/results/gha-dl/<grpcRunId> \
+  --out-dir wiki/images \
+  --title-suffix '@ <sha>'
+```
+
+Wiki fallback (same numbers as published tables; no CSV):
+
+```bash
+python3 tools/RpsLoadProbe/render-practical-charts.py \
+  --from-wiki wiki/Performance.md \
+  --out-dir wiki/images \
+  --title-suffix '@ <sha>'
+```
+
+Writes up to six PNGs: `wiki/images/rps-practical-{linux,windows,macos}.png` and `rps-practical-heavier-{linux,windows,macos}.png` when that OS has heavier data. Linux embeds both in the repo README; the website Performance page shows all OS tiny charts plus Win/Linux 64 KB. Five series: Titanium / YARP / nginx / HAProxy / Envoy. Tiny wires: H1 TLS→H1c · H1 TLS→H1 TLS · H2 TLS→H1c · H2 TLS→H1 TLS · H2 TLS→h2c · H2 TLS→H2 TLS · H3→H1c · H3→h2c. Workloads fold in from `--arch-root` / `--grpc-root`; heavier bodies/POST from `--bodies-root` / `--post-root` (or sibling `gha-dl/` folders when omitted). Wiki Performance tables stay chart-free.
+
+### Native peer smoke (HAProxy / Envoy)
+
+Before a publishable `compare-product` run:
+
+```powershell
+pwsh tools/RpsLoadProbe/run-rps.ps1 -Mode compare-haproxy-smoke -Repeats 1
+pwsh tools/RpsLoadProbe/run-rps.ps1 -Mode compare-envoy-smoke -Repeats 1
+```
+
+On Windows both modes exit **0** with “skip OK” (peers not available). Linux/macOS GHA installs HAProxy and Envoy in [rps-saturation.yml](../../.github/workflows/rps-saturation.yml).
+
+## Editions (`titanium run` daemon)
+
+Library arms (`twp-reverse-*`) embed Core with probe-tuned settings. Edition arms spawn the shipped CLI (`titanium run -c twp.yaml`) as an external process — same shape as nginx — for product-defaults comparison. Full matrix is ~60 min (expanded Plus/CLI stress arms).
+
+`validate-edition-gates.ps1` prefers SLO-passing c=64 medians; if an arm ran but missed p99 SLO at c=64 it still computes the ratio (annotated) so failures are **ratio misses**, not false “missing arm” errors. PR merge checks use `compare-spot`; full saturation / editions on develop is advisory — publish SHA still runs editions via `rps-publish-gate` (see [PERF-GATES.md](PERF-GATES.md)).
+
+```powershell
+pwsh tools/RpsLoadProbe/run-rps.ps1 -Mode compare-editions
+pwsh tools/RpsLoadProbe/validate-edition-gates.ps1 -CsvPath tools/RpsLoadProbe/results/rps-ramp-*.csv
+```
+
+| Arm | What it measures |
+|-----|------------------|
+| `twp-cli-reverse-http1` / `-tls` | CLI daemon, product defaults vs library |
+| `twp-cli-reverse-http1-route` | Single route table ≡ ForwardHost |
+| `twp-cli-plus-base-http1` | Plus ALC + control plane (no options) |
+| `twp-cli-plus-cache-http1` | Plus + `cache.enable` (cold) |
+| `twp-cli-intercept-http1` | Route `RequestHeaderSet` transform → session path |
+| `twp-cli-plus-waf-http1` | WAF denyPaths that do not match `/` |
+| `twp-cli-plus-cidr-http1` | `security.allowCidrs=127.0.0.0/8` |
+| `twp-cli-plus-jwt-http1` | RS256 JWT + JWKS mini-server; Bearer on every request |
+| `twp-cli-plus-ratelimit-http1` | `state.mode=memory` + very high rate limit |
+| `twp-cli-plus-resilience-http1` | Active health vs ForwardHost+cluster destinations |
+| `twp-cli-plus-discovery-file-http1` | File discovery + mid-ramp rewrite |
+| `twp-cli-plus-metrics-scrape-http1` | Background `/v1/snapshot` + dashboard `/metrics` every 10s |
+| `twp-cli-plus-cache-hit-http1` | Cache warm then measure (vs plus-cache cold) |
+| `twp-cli-plus-cors-http1` | CORS response headers on terminate-lite |
+| `twp-cli-plus-circuit-http1` | Circuit breaker (session path; near intercept) |
+| `twp-cli-plus-retry-http1` | Idempotent retry (session path; near intercept) |
+| `twp-cli-static-http1` | `staticFiles.root` tiny file |
+| `twp-cli-logging-http1` | Logging enabled + Info file sink |
+| `twp-cli-lb-leasttime-http1` | LeastTime across two healthy origins |
+| `twp-cli-dialect-twp-http1` | `.twp` `listen`/`forward` site-file |
+
+Plus arms allocate an explicit `controlPlane.dashboardPort` (separate from the control-plane port). Prometheus `/metrics` lives on the **dashboard** listener, not `controlPort + 1`. The metrics-scrape arm polls control `/v1/snapshot` and dashboard `/metrics` every 10s via the CLI host’s `DashboardUrl`.
+
+Gates: see [PERF-GATES.md](PERF-GATES.md). Thresholds lock after a clean Win+Linux pass. Build/publish `Titanium.Cli` (and Plus DLL beside it for Plus arms) before ramping.
+
+## Bridge matrix
+
+```powershell
+pwsh tools/RpsLoadProbe/run-rps.ps1 -Mode compare-bridges
+```
+
+| Arm | Topology |
+|---|---|
+| `reverse-http2-cleartext` | H2 TLS → H2→H1 → cleartext H1 |
+| `reverse-http2-to-h2c` | H2 TLS → prior-knowledge h2c → cleartext H2 |
+| `reverse-h2c-to-h1` | h2c → H2→H1 → cleartext H1 |
+| `reverse-h2c-to-h2c` | h2c → cleartext H2 |
+| `reverse-h2c-to-https` | h2c → H2→H1 → HTTPS H1 |
+| `reverse-h2c-to-h3` | h2c → H2→H3 → QUIC/h3 |
+| `reverse-http11-to-http2` | H1 TLS → H1→H2 → HTTPS h2 |
+| `reverse-http1-to-h2c` | H1 TLS → prior-knowledge h2c |
+| `reverse-http1-plain-to-h2c` | H1 plain → prior-knowledge h2c |
+| `reverse-http1-plain-to-http2` | H1 plain → HTTPS h2 |
+| `reverse-http1-plain-to-http3` | H1 plain → QUIC/h3 |
+| `reverse-http1-to-http3` | H1 TLS → H1→H3 → QUIC/h3 |
+| `reverse-http2-to-http3` | H2 TLS → H2→H3 → QUIC/h3 |
+| `reverse-http3-cleartext` | H3 → cleartext H1 |
+| `nginx-reverse-http3-cleartext` | Native reverse H3 → cleartext H1 (`http_v3_module`) |
+| `reverse-http3-to-h2c` | H3 → prior-knowledge h2c |
+| `reverse-http3-to-http2` | H3 → H3→H2 → HTTPS h2 |
+
+Also: `reverse-h2c` (h2c → HTTPS h2) in `compare-same`. Full TWP+YARP 5×5: `compare-matrix`.
+
+Other modes: `compare`, `compare-tls`, `compare-http2`, `explicit-pool-sweep`. See `--help`.
+
+Status lines use non-blocking `ProbeLog` (not sync `Console.WriteLine` on workers).

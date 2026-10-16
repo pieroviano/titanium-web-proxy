@@ -1,0 +1,1105 @@
+# Manual saturation RPS lab on GitHub-hosted VMs (not a job container).
+# Maintainers run this, then paste median numbers into wiki/Performance.md.
+# Not a per-PR gate; not comparable to dedicated-server blog posts.
+#
+# Prefer --repeats >= 3 for publishable numbers (runner noise). Linux nginx
+# is the authoritative nginx baseline; nginx/Windows is same-OS only.
+#
+# Matrix uses public-repo GitHub-hosted runners: ubuntu-latest / windows-latest
+# (4 vCPU / 16 GiB) and macos-15 (Apple Silicon M1, 3-core / 7 GiB). macOS is Apple
+# Silicon because that is what Mac users run today; we compare products within an OS,
+# not OS against OS. Pin macos-15 (not macos-latest) so the image does not change under us.
+# Do not mix larger or slim runners unless every OS gets the same size class.
+
+name: RPS saturation
+
+on:
+  pull_request:
+    branches: [beta, stable]
+  # Push editions are gated by .NET / rps-publish-gate (Ubuntu only). Do not duplicate
+  # 3-OS compare-editions on every beta/stable merge.
+  # Called by rps-suite.yml: one job per wiki row. Inputs mirror workflow_dispatch but are
+  # plain strings (workflow_call does not support choice inputs).
+  workflow_call:
+    inputs:
+      mode:
+        description: 'Ramp mode'
+        required: true
+        type: string
+      concurrency:
+        description: 'Comma-separated concurrency steps'
+        required: false
+        type: string
+        default: '8,16,32,64'
+      warmup_sec:
+        description: 'Warmup seconds per step'
+        required: false
+        type: string
+        default: '2'
+      duration_sec:
+        description: 'Measure seconds per step'
+        required: false
+        type: string
+        default: '8'
+      repeats:
+        description: 'Full arm sequence repeats (median peaks)'
+        required: false
+        type: string
+        default: '3'
+      runner_os:
+        description: 'Single runner OS for this leg'
+        required: true
+        type: string
+      arm_shard:
+        description: 'all, i/n, or one comparison-group key'
+        required: false
+        type: string
+        default: all
+      arm_contains:
+        description: 'Optional arm-name substring filter'
+        required: false
+        type: string
+        default: ''
+      arm_excludes:
+        description: 'Drop arms whose name matches this substring (same syntax as arm_contains)'
+        required: false
+        type: string
+        default: ''
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Ramp mode'
+        required: true
+        default: compare-terminate
+        type: choice
+        options:
+          - compare-terminate
+          - compare-same
+          - compare-bridges
+          - compare-http3-cleartext
+          - compare-nginx-https
+          - compare-haproxy-smoke
+          - compare-envoy-smoke
+          - compare-mitm
+          - compare-matrix
+          - compare-product
+          - compare-product-smoke
+          - haproxy-reverse-http1
+          - haproxy-reverse-http1-tls
+          - haproxy-reverse-http1-to-https
+          - haproxy-reverse-http1-tls-to-https
+          - haproxy-reverse-http2
+          - haproxy-reverse-http2-to-https-http1
+          - haproxy-reverse-http3-cleartext
+          - haproxy-reverse-http3-to-https-http1
+          - envoy-reverse-http1
+          - envoy-reverse-http1-tls
+          - envoy-reverse-http1-to-https
+          - envoy-reverse-http1-tls-to-https
+          - envoy-reverse-http2
+          - envoy-reverse-http2-to-https-http1
+          - envoy-reverse-http3-cleartext
+          - envoy-reverse-http3-to-https-http1
+          - nginx-reverse-h2c-to-h1
+          - nginx-reverse-h2c-to-https
+          - haproxy-reverse-http1-plain-to-h2c
+          - haproxy-reverse-http1-plain-to-http2
+          - haproxy-reverse-http1-plain-to-http3
+          - haproxy-reverse-http1-to-h2c
+          - haproxy-reverse-http11-to-http2
+          - haproxy-reverse-http1-to-http3
+          - haproxy-reverse-h2c-to-h1
+          - haproxy-reverse-h2c-to-https
+          - haproxy-reverse-h2c-to-h2c
+          - haproxy-reverse-h2c
+          - haproxy-reverse-h2c-to-h3
+          - haproxy-reverse-http2-to-h2c
+          - haproxy-reverse-http2-to-https
+          - haproxy-reverse-http2-to-http3
+          - haproxy-reverse-http3-to-h2c
+          - haproxy-reverse-http3-to-http2
+          - haproxy-reverse-http3-to-http3
+          - envoy-reverse-http1-plain-to-h2c
+          - envoy-reverse-http1-plain-to-http2
+          - envoy-reverse-http1-plain-to-http3
+          - envoy-reverse-http1-to-h2c
+          - envoy-reverse-http11-to-http2
+          - envoy-reverse-http1-to-http3
+          - envoy-reverse-h2c-to-h1
+          - envoy-reverse-h2c-to-https
+          - envoy-reverse-h2c-to-h2c
+          - envoy-reverse-h2c
+          - envoy-reverse-h2c-to-h3
+          - envoy-reverse-http2-to-h2c
+          - envoy-reverse-http2-to-https
+          - envoy-reverse-http2-to-http3
+          - envoy-reverse-http3-to-h2c
+          - envoy-reverse-http3-to-http2
+          - envoy-reverse-http3-to-http3
+          - compare-editions
+          - compare-ceiling
+          - compare-bodies
+          - compare-post
+          - compare-lossy
+          - compare-tls-cost
+          - compare-arch
+          - compare-grpc
+          - compare-ws-h1tls
+          - compare-ws-h2
+          - compare-saturation
+          - compare-spot
+          - origin-direct
+          - compare
+          - compare-tls
+          - reverse-http1
+          - bare-reverse-http1
+          - nginx-reverse-http1
+          - yarp-reverse-http1
+          - reverse-http1-tls
+          - bare-reverse-http1-tls
+          - nginx-reverse-http1-tls
+          - nginx-reverse-http1-to-https
+          - nginx-reverse-http1-tls-to-https
+          - yarp-reverse-http1-tls
+          - https-mitm
+          - mitm-http2-to-http1
+          - mitm-http3-to-http1
+          - reverse-http2
+          - reverse-http2-cleartext
+          - reverse-http2-to-h2c
+          - yarp-reverse-http2-to-h2c
+          - reverse-h2c
+          - yarp-reverse-h2c
+          - reverse-h2c-to-h2c
+          - yarp-reverse-h2c-to-h2c
+          - reverse-h2c-to-h1
+          - yarp-reverse-h2c-to-h1
+          - reverse-h2c-to-https
+          - yarp-reverse-h2c-to-https
+          - reverse-h2c-to-h3
+          - yarp-reverse-h2c-to-h3
+          - reverse-http3
+          - reverse-http3-cleartext
+          - yarp-reverse-http3-cleartext
+          - reverse-http11-to-http2
+          - yarp-reverse-http11-to-http2
+          - reverse-http1-to-h2c
+          - yarp-reverse-http1-to-h2c
+          - reverse-http1-plain-to-h2c
+          - yarp-reverse-http1-plain-to-h2c
+          - reverse-http1-plain-to-http2
+          - yarp-reverse-http1-plain-to-http2
+          - reverse-http1-plain-to-http3
+          - yarp-reverse-http1-plain-to-http3
+          - reverse-http1-to-http3
+          - yarp-reverse-http1-to-http3
+          - reverse-http2-to-http3
+          - yarp-reverse-http2-to-http3
+          - reverse-http3-to-http2
+          - yarp-reverse-http3-to-http2
+          - reverse-http3-to-h2c
+          - yarp-reverse-http3-to-h2c
+          - yarp-reverse-http1-tls-to-https
+          - yarp-reverse-http2-to-https-http1
+          - yarp-reverse-http3-to-https-http1
+          - nginx-reverse-http2
+          - nginx-reverse-http2-to-https-http1
+          - nginx-reverse-http3-cleartext
+          - nginx-reverse-http3-to-https-http1
+          - yarp-reverse-http2
+          - yarp-reverse-http2-to-https
+          - twp-cli-reverse-http1
+          - twp-cli-reverse-http1-tls
+          - twp-cli-reverse-http1-route
+          - twp-cli-plus-base-http1
+          - twp-cli-plus-cache-http1
+          - twp-cli-intercept-http1
+      concurrency:
+        description: 'Comma-separated concurrency steps'
+        required: true
+        default: '8,16,32,64'
+      warmup_sec:
+        description: 'Warmup seconds per step'
+        required: true
+        default: '2'
+      duration_sec:
+        description: 'Measure seconds per step'
+        required: true
+        default: '8'
+      repeats:
+        description: 'Full arm sequence repeats (median peaks)'
+        required: true
+        default: '3'
+      runner_os:
+        description: 'OS matrix filter (all = Win+Linux+Mac Apple Silicon)'
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - ubuntu-latest
+          - windows-latest
+          - macos-15
+      arm_shard:
+        description: 'Comparison-group partition (all = no split; i/n = exclusive 1-based shard of wiki rows; or one group key such as h1c-h1c or h3-h3-body64k = exactly one wiki row, see --print-groups)'
+        required: true
+        default: all
+      arm_contains:
+        description: 'Optional arm-name substring filter (e.g. nc-tiny). Empty = all arms in mode.'
+        required: false
+        default: ''
+      arm_excludes:
+        description: 'Drop arms whose name matches this substring. Empty = keep every arm.'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  rps:
+    # PR → beta/stable: compare-spot; dispatch: inputs.mode
+    permissions:
+      contents: read
+    env:
+      RPS_MODE: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.mode || 'compare-spot' }}
+      RPS_CONCURRENCY: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.concurrency || '8,16,32,64' }}
+      RPS_WARMUP_SEC: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.warmup_sec || 2 }}
+      RPS_DURATION_SEC: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.duration_sec || 8 }}
+      RPS_REPEATS: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.repeats || 1 }}
+      RPS_ARM_SHARD: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.arm_shard || 'all' }}
+      RPS_ARM_CONTAINS: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.arm_contains || '' }}
+      RPS_ARM_EXCLUDES: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.arm_excludes || '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # workflow_dispatch runner_os filters to one OS; otherwise Win+Linux+Mac Apple Silicon.
+        os: ${{ fromJSON(inputs.runner_os == 'macos-15' && '["macos-15"]' || inputs.runner_os == 'ubuntu-latest' && '["ubuntu-latest"]' || inputs.runner_os == 'windows-latest' && '["windows-latest"]' || '["ubuntu-latest","windows-latest","macos-15"]') }}
+    runs-on: ${{ matrix.os }}
+    # Intentionally no jobs.*.container — saturation RPS on a container network measures the wrong thing.
+    # GitHub-hosted runners hard-cap at 360 minutes — do not set timeout above that.
+    # Wiki-grade compare-product / bodies / arch use arm_shard i/n so each job stays under 345m ramp.
+    # compare-product-smoke / haproxy-smoke / envoy-smoke: 120m; compare-editions: 90m.
+    timeout-minutes: ${{ github.event_name == 'pull_request' && 45 || (github.event_name == 'push' && 90 || (inputs.mode == 'compare-editions' && 90 || ((inputs.mode == 'compare-product-smoke' || inputs.mode == 'compare-haproxy-smoke' || inputs.mode == 'compare-envoy-smoke') && 120 || ((inputs.arm_shard != 'all' && !contains(inputs.arm_shard, '/')) && 75 || 360)))) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: |
+            10.0.x
+
+      - name: Log runner shape (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          echo "os=$(uname -s) $(uname -r)"
+          echo "nproc=$(nproc)"
+          free -h
+          lscpu | sed -n '1,20p'
+
+      - name: Log runner shape (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $os = Get-CimInstance Win32_OperatingSystem
+          $cs = Get-CimInstance Win32_ComputerSystem
+          $cpu = Get-CimInstance Win32_Processor
+          Write-Host "OS=$($os.Caption) $($os.Version)"
+          Write-Host "LogicalProcessors=$($cs.NumberOfLogicalProcessors)"
+          Write-Host "RAM_GiB=$([math]::Round($cs.TotalPhysicalMemory / 1GB, 1))"
+          Write-Host "CPU=$($cpu.Name)"
+
+      - name: Log runner shape (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          echo "os=$(uname -s) $(uname -r) $(uname -m)"
+          echo "sw_vers:"
+          sw_vers
+          ncpu=$(sysctl -n hw.ncpu)
+          # hw.memsize is bytes; assert arm64, >= 3 CPUs and >= 6 GiB (macos-15 Apple Silicon is 3 / 7).
+          mem_bytes=$(sysctl -n hw.memsize)
+          mem_gib=$(awk -v b="$mem_bytes" 'BEGIN { printf "%.1f", b / (1024*1024*1024) }')
+          echo "ncpu=$ncpu"
+          echo "RAM_GiB=$mem_gib"
+          sysctl -n machdep.cpu.brand_string || true
+          if [ "$ncpu" -lt 3 ]; then
+            echo "Expected >=3 CPUs on macos-15; got $ncpu." >&2
+            exit 1
+          fi
+          if [ "$(uname -m)" != "arm64" ]; then
+            echo "Expected Apple Silicon (arm64) on macos-15; got $(uname -m)." >&2
+            exit 1
+          fi
+          # 6 GiB floor leaves headroom under the documented 7 GiB Apple Silicon runner.
+          min_bytes=$((6 * 1024 * 1024 * 1024))
+          if [ "$mem_bytes" -lt "$min_bytes" ]; then
+            echo "Expected >=6 GiB RAM on macos-15; got ${mem_gib} GiB." >&2
+            exit 1
+          fi
+
+      # Ubuntu 24.04 distro nginx is 1.24 without HTTP/3. Official nginx.org mainline
+      # packages are built with --with-http_v3_module so the H3 terminate arm can run.
+      - name: Install nginx (HTTP/3-capable)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          . /etc/os-release
+          # Hosted runners sometimes ship a broken Google Chrome apt list (hash mismatch).
+          # Remove any Chrome/Google Chrome apt entries so apt-get update cannot fail the RPS job.
+          sudo find /etc/apt -type f \( -iname '*chrome*' -o -iname '*google*chrome*' \) -print -delete || true
+          if [ -f /etc/apt/sources.list ]; then
+            sudo sed -i '/dl\.google\.com\/linux\/chrome/d' /etc/apt/sources.list || true
+          fi
+          # Tolerate residual third-party mirror failures; nginx.org install below is the real gate.
+          sudo apt-get update || true
+          sudo apt-get install -y ca-certificates curl gnupg
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            https://nginx.org/keys/nginx_signing.key \
+            | gpg --dearmor \
+            | sudo tee /usr/share/keyrings/nginx-archive-keyring.gpg >/dev/null
+          echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] https://nginx.org/packages/mainline/${ID} ${VERSION_CODENAME} nginx" \
+            | sudo tee /etc/apt/sources.list.d/nginx.list
+          printf 'Package: *\nPin: origin nginx.org\nPin-Priority: 900\n' \
+            | sudo tee /etc/apt/preferences.d/99nginx
+          # Re-disable Chrome before the second update (some images re-add it).
+          sudo find /etc/apt -type f \( -iname '*chrome*' -o -iname '*google*chrome*' \) -print -delete || true
+          sudo apt-get update || true
+          sudo apt-get install -y nginx
+          # Stop the distro/package default site so our temp-prefix nginx owns the ports we pick.
+          sudo systemctl stop nginx || true
+          nginx -v
+          if ! nginx -V 2>&1 | grep -q http_v3_module; then
+            echo "nginx was installed but lacks --with-http_v3_module; HTTP/3 native reverse arms will be skipped." >&2
+            nginx -V
+          fi
+
+      # nginx/Windows is same-OS only (no QUIC / http_v3). Pin the zip used by the laptop lab.
+      - name: Install nginx (Windows zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          NGINX_WIN_VERSION: '1.31.3'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ver = $env:NGINX_WIN_VERSION
+          $zip = Join-Path $env:RUNNER_TEMP "nginx-$ver.zip"
+          $dest = Join-Path $env:RUNNER_TEMP 'nginx'
+          curl.exe --fail --silent --show-error --location --proto '=https' --tlsv1.2 `
+            "https://nginx.org/download/nginx-$ver.zip" -o $zip
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          $nginxDir = Join-Path $dest "nginx-$ver"
+          if (-not (Test-Path (Join-Path $nginxDir 'nginx.exe'))) {
+            throw "nginx.exe not found under $nginxDir"
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value $nginxDir
+          & (Join-Path $nginxDir 'nginx.exe') -v
+
+      # Homebrew nginx bottles include --with-http_v3_module (OpenSSL 3). Fail hard if missing.
+      # macos-15 (Apple Silicon): Homebrew bottles arm64; still skip brew update/upgrade of
+      # openssl (the already-installed bottle works and keeps the job fast and reproducible).
+      - name: Install nginx (HTTP/3-capable, macOS)
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_NO_INSTALL_UPGRADE: '1'
+        run: |
+          set -euo pipefail
+          # Use preinstalled openssl@3 / pcre2 when present; do not upgrade.
+          brew list --versions openssl@3 || brew install openssl@3
+          brew list --versions pcre2 || brew install pcre2
+          if ! brew list --versions nginx >/dev/null 2>&1; then
+            if ! brew install nginx; then
+              echo "brew install nginx failed (likely missing bottle); building from source…" >&2
+              brew install --build-from-source nginx
+            fi
+          fi
+          # Prefer brew nginx; if a bottle somehow lacks http_v3, rebuild from source with the flag.
+          if ! nginx -V 2>&1 | grep -q http_v3_module; then
+            echo "brew nginx lacks http_v3_module; rebuilding from source with --with-http_v3_module" >&2
+            brew reinstall --build-from-source nginx
+          fi
+          brew services stop nginx 2>/dev/null || true
+          # Kill any leftover master so our temp-prefix nginx owns the ports we pick.
+          pkill -x nginx 2>/dev/null || true
+          NGINX_BIN="$(brew --prefix nginx)/bin"
+          echo "$NGINX_BIN" >> "$GITHUB_PATH"
+          export PATH="$NGINX_BIN:$PATH"
+          nginx -v
+          if ! nginx -V 2>&1 | grep -q http_v3_module; then
+            echo "nginx was installed but lacks --with-http_v3_module; failing job." >&2
+            nginx -V
+            exit 1
+          fi
+          nginx -V 2>&1 | tr ' ' '\n' | grep http_v3 || true
+
+      # Ubuntu distro HAProxy is not USE_QUIC. GHA Linux builds 3.2 against QuicTLS
+      # (openssl-3.1.7+quic) so MsQuic clients can complete the handshake — OpenSSL
+      # USE_QUIC_OPENSSL_COMPAT + limited-quic starts but fails QUIC_STATUS_TLS_ERROR.
+      # macOS uses Homebrew (typically native USE_QUIC) with a 3.2 osx source fallback.
+      - name: Cache HAProxy QUIC prefix
+        if: runner.os == 'Linux'
+        uses: actions/cache@v6
+        with:
+          path: |
+            ${{ runner.temp }}/haproxy-quic
+            ${{ runner.temp }}/quictls
+          key: haproxy-3.2.23-quictls-3.1.7-linux-x64
+
+      - name: Install HAProxy with QUIC (Linux)
+        if: runner.os == 'Linux'
+        env:
+          HAPROXY_VERSION: '3.2.23'
+          HAPROXY_SHA256: '82d14ef33571e4edeb9197516c0d058a3775fb80541e46afe4377428e461fef0'
+          QUICTLS_REF: 'openssl-3.1.7+quic'
+        run: |
+          set -euo pipefail
+          sudo find /etc/apt -type f \( -iname '*chrome*' -o -iname '*google*chrome*' \) -print -delete || true
+          sudo apt-get update || true
+          sudo apt-get install -y gcc make perl libpcre2-dev zlib1g-dev git
+          # Stop any distro service so our temp-prefix HAProxy owns the ports we pick.
+          sudo apt-get install -y haproxy || true
+          sudo systemctl stop haproxy || true
+          dest="${RUNNER_TEMP}/haproxy-quic"
+          qtls="${RUNNER_TEMP}/quictls"
+          mkdir -p "$dest" "$qtls"
+          # Do not use grep -q under pipefail: early close SIGPIPEs haproxy -vv.
+          have_quic() { case "$("$1" -vv 2>&1 || true)" in *USE_QUIC*) return 0 ;; *) return 1 ;; esac; }
+          have_native_quic() {
+            # OpenSSL-compat builds list USE_QUIC_OPENSSL_COMPAT and need limited-quic;
+            # MsQuic fails TLS against that stack. Prefer a QuicTLS-linked binary.
+            local vv
+            vv="$("$1" -vv 2>&1 || true)"
+            case "$vv" in *USE_QUIC_OPENSSL_COMPAT*) return 1 ;; esac
+            case "$vv" in *USE_QUIC*) return 0 ;; *) return 1 ;; esac
+          }
+          if [ -x "$dest/sbin/haproxy" ] && have_native_quic "$dest/sbin/haproxy"; then
+            echo "Using existing QuicTLS-linked HAProxy at $dest"
+          else
+            if [ ! -x "$qtls/bin/openssl" ]; then
+              echo "Building QuicTLS ${QUICTLS_REF}…"
+              src_qtls="${RUNNER_TEMP}/quictls-src"
+              rm -rf "$src_qtls"
+              git clone --depth 1 --branch "$QUICTLS_REF" https://github.com/quictls/openssl.git "$src_qtls"
+              (
+                cd "$src_qtls"
+                ./config --prefix="$qtls" --libdir=lib
+                make -j "$(nproc)"
+                make install_sw
+              )
+            else
+              echo "Using cached QuicTLS at $qtls"
+            fi
+            ver="$HAPROXY_VERSION"
+            src="${RUNNER_TEMP}/haproxy-src"
+            rm -rf "$src"
+            mkdir -p "$src"
+            tarball="${RUNNER_TEMP}/haproxy-${ver}.tar.gz"
+            curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+              "https://www.haproxy.org/download/3.2/src/haproxy-${ver}.tar.gz" \
+              -o "$tarball"
+            echo "${HAPROXY_SHA256}  ${tarball}" | sha256sum -c -
+            tar -xzf "$tarball" -C "$src" --strip-components=1
+            make -C "$src" -j "$(nproc)" \
+              TARGET=linux-glibc \
+              USE_OPENSSL=1 \
+              USE_QUIC=1 \
+              USE_PCRE2=1 \
+              USE_PCRE2_JIT=1 \
+              USE_ZLIB=1 \
+              SSL_INC="${qtls}/include" \
+              SSL_LIB="${qtls}/lib" \
+              LDFLAGS="-Wl,-rpath,${qtls}/lib"
+            mkdir -p "$dest/sbin"
+            cp -f "$src/haproxy" "$dest/sbin/haproxy"
+            chmod +x "$dest/sbin/haproxy"
+          fi
+          echo "$dest/sbin" >> "$GITHUB_PATH"
+          export PATH="$dest/sbin:$PATH"
+          # QuicTLS libs for runtime if rpath is missing on older caches.
+          echo "LD_LIBRARY_PATH=${qtls}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          export LD_LIBRARY_PATH="${qtls}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          haproxy -v
+          haproxy -vv 2>&1 | head -n 40 || true
+          if ! have_native_quic haproxy; then
+            echo "HAProxy lacks native USE_QUIC (QuicTLS); HTTP/3 HAProxy arms cannot run reliably with MsQuic." >&2
+            exit 1
+          fi
+          echo "HAProxy native USE_QUIC (QuicTLS) present"
+
+      - name: Cache HAProxy QUIC prefix (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/haproxy-quic
+          key: haproxy-3.2.23-quic-osx-arm64
+
+      - name: Install HAProxy with QUIC (macOS)
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_NO_INSTALL_UPGRADE: '1'
+          HAPROXY_VERSION: '3.2.23'
+          HAPROXY_SHA256: '82d14ef33571e4edeb9197516c0d058a3775fb80541e46afe4377428e461fef0'
+        run: |
+          set -euo pipefail
+          if ! brew list --versions haproxy >/dev/null 2>&1; then
+            brew install haproxy || echo "brew install haproxy failed; will build ${HAPROXY_VERSION} from source with USE_QUIC" >&2
+          fi
+          brew services stop haproxy 2>/dev/null || true
+          pkill -x haproxy 2>/dev/null || true
+          if brew list --versions haproxy >/dev/null 2>&1; then
+            HAP_BIN="$(brew --prefix haproxy)/bin"
+            echo "$HAP_BIN" >> "$GITHUB_PATH"
+            export PATH="$HAP_BIN:$PATH"
+          fi
+
+          have_quic() {
+            command -v haproxy >/dev/null 2>&1 || return 1
+            # Do not use grep -q under pipefail: BSD grep -q closes the pipe early (SIGPIPE).
+            case "$(haproxy -vv 2>&1 || true)" in
+              *USE_QUIC*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          if ! have_quic; then
+            echo "Homebrew HAProxy lacks USE_QUIC; building ${HAPROXY_VERSION} with USE_QUIC (TARGET=osx)…" >&2
+            dest="${RUNNER_TEMP}/haproxy-quic"
+            mkdir -p "$dest/sbin"
+            if [ -x "$dest/sbin/haproxy" ] && case "$("$dest/sbin/haproxy" -vv 2>&1 || true)" in *USE_QUIC*) true ;; *) false ;; esac; then
+              echo "Using cached HAProxy QUIC build at $dest"
+            else
+              brew list --versions openssl@3 || brew install openssl@3
+              brew list --versions pcre2 || brew install pcre2
+              ssl="$(brew --prefix openssl@3)"
+              pcre="$(brew --prefix pcre2)"
+              src="${RUNNER_TEMP}/haproxy-src"
+              mkdir -p "$src"
+              tarball="${RUNNER_TEMP}/haproxy-${HAPROXY_VERSION}.tar.gz"
+              curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+                "https://www.haproxy.org/download/3.2/src/haproxy-${HAPROXY_VERSION}.tar.gz" \
+                -o "$tarball"
+              echo "${HAPROXY_SHA256}  ${tarball}" | shasum -a 256 -c -
+              tar -xzf "$tarball" -C "$src" --strip-components=1
+              make -C "$src" -j "$(sysctl -n hw.ncpu)" \
+                TARGET=osx \
+                USE_OPENSSL=1 \
+                USE_QUIC=1 \
+                USE_PCRE2=1 \
+                USE_PCRE2_JIT=1 \
+                USE_ZLIB=1 \
+                SSL_INC="${ssl}/include" \
+                SSL_LIB="${ssl}/lib" \
+                PCRE2_INC="${pcre}/include" \
+                PCRE2_LIB="${pcre}/lib" \
+                LDFLAGS="-Wl,-rpath,${ssl}/lib" \
+              || make -C "$src" -j "$(sysctl -n hw.ncpu)" \
+                TARGET=osx \
+                USE_OPENSSL=1 \
+                USE_QUIC=1 \
+                USE_QUIC_OPENSSL_COMPAT=1 \
+                USE_PCRE2=1 \
+                USE_PCRE2_JIT=1 \
+                USE_ZLIB=1 \
+                SSL_INC="${ssl}/include" \
+                SSL_LIB="${ssl}/lib" \
+                PCRE2_INC="${pcre}/include" \
+                PCRE2_LIB="${pcre}/lib" \
+                LDFLAGS="-Wl,-rpath,${ssl}/lib"
+              cp -f "$src/haproxy" "$dest/sbin/haproxy"
+              chmod +x "$dest/sbin/haproxy"
+            fi
+            echo "$dest/sbin" >> "$GITHUB_PATH"
+            export PATH="$dest/sbin:$PATH"
+          fi
+
+          haproxy -v
+          if ! have_quic; then
+            echo "HAProxy was installed but lacks USE_QUIC; HTTP/3 HAProxy arms cannot run." >&2
+            haproxy -vv 2>&1 | head -n 40 || true
+            exit 1
+          fi
+          echo "HAProxy USE_QUIC present"
+
+      # Envoy Apache 2.0 — Linux static binary from GitHub releases; macOS via Homebrew
+      # (HTTP/3 compiled in). Official GitHub assets are Linux-only; if Homebrew has no
+      # arm64 bottle, fall back to the pinned Kuma/CNCF darwin-arm64 build of the same
+      # 1.36.7 tag (do not bazel-build Envoy on the runner).
+      # Windows support discontinued — skip (cells are Not possible).
+      - name: Install Envoy (Linux)
+        if: runner.os == 'Linux'
+        env:
+          ENVOY_VERSION: '1.36.7'
+        run: |
+          set -euo pipefail
+          ver="$ENVOY_VERSION"
+          dest="${RUNNER_TEMP}/envoy"
+          mkdir -p "$dest"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            "https://github.com/envoyproxy/envoy/releases/download/v${ver}/envoy-${ver}-linux-x86_64" \
+            -o "$dest/envoy"
+          chmod +x "$dest/envoy"
+          echo "$dest" >> "$GITHUB_PATH"
+          export PATH="$dest:$PATH"
+          envoy --version
+          echo "Envoy official binaries include HTTP/3; H3 arms run when QuicListener is supported."
+
+      - name: Install Envoy (macOS)
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_NO_INSTALL_UPGRADE: '1'
+          ENVOY_VERSION: '1.36.7'
+        run: |
+          set -euo pipefail
+          brew services stop envoy 2>/dev/null || true
+          pkill -x envoy 2>/dev/null || true
+
+          # Pour a bottle only; bazel-from-source would burn the job timeout.
+          brew_has_envoy_bottle() {
+            python3 -c '
+          import json, platform, subprocess, sys
+          formula = sys.argv[1]
+          try:
+              raw = subprocess.check_output(["brew", "info", "--json=v2", formula], stderr=subprocess.DEVNULL)
+          except subprocess.CalledProcessError:
+              raise SystemExit(1)
+          formulae = json.loads(raw).get("formulae") or []
+          if not formulae:
+              raise SystemExit(1)
+          files = ((formulae[0].get("bottle") or {}).get("stable") or {}).get("files") or {}
+          intel = platform.machine().lower() in ("x86_64", "amd64", "i386")
+          for tag in files:
+              t = tag.lower()
+              if "linux" in t:
+                  continue
+              if intel and t.startswith("arm64"):
+                  continue
+              if (not intel) and not t.startswith("arm64"):
+                  continue
+              raise SystemExit(0)
+          raise SystemExit(1)
+          ' "$1"
+          }
+
+          if ! brew list --versions envoy >/dev/null 2>&1 && ! brew list --versions envoyproxy/tap/envoy >/dev/null 2>&1; then
+            if brew_has_envoy_bottle envoy; then
+              brew install envoy
+            elif brew_has_envoy_bottle envoyproxy/tap/envoy; then
+              brew install envoyproxy/tap/envoy
+            else
+              echo "No Homebrew Envoy bottle for this Mac; skipping brew install (would compile from source)." >&2
+            fi
+          fi
+
+          if command -v brew >/dev/null 2>&1; then
+            for formula in envoy envoyproxy/tap/envoy; do
+              prefix="$(brew --prefix "$formula" 2>/dev/null || true)"
+              if [ -n "$prefix" ] && [ -x "$prefix/bin/envoy" ]; then
+                echo "$prefix/bin" >> "$GITHUB_PATH"
+                export PATH="$prefix/bin:$PATH"
+                break
+              fi
+            done
+          fi
+
+          if ! command -v envoy >/dev/null 2>&1; then
+            echo "Downloading pinned darwin-arm64 Envoy ${ENVOY_VERSION} (Kuma/CNCF builds; official GitHub assets are Linux-only)…" >&2
+            dest="${RUNNER_TEMP}/envoy"
+            mkdir -p "$dest"
+            tarball="${RUNNER_TEMP}/envoy-darwin-arm64.tar.gz"
+            if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+              "https://github.com/kumahq/envoy-builds/releases/download/v${ENVOY_VERSION}/envoy-darwin-arm64-v${ENVOY_VERSION}.tar.gz" \
+              -o "$tarball"; then
+              echo "darwin-arm64 Envoy download failed — Envoy arms will be skipped." >&2
+              exit 0
+            fi
+            tar -xzf "$tarball" -C "$dest"
+            bin=""
+            if [ -x "$dest/envoy" ]; then
+              bin="$dest/envoy"
+            else
+              bin="$(find "$dest" -type f -name envoy | awk 'NR==1 { print; exit }')"
+            fi
+            if [ -z "${bin}" ] || [ ! -f "$bin" ]; then
+              echo "darwin-arm64 Envoy tarball had no envoy binary — Envoy arms will be skipped." >&2
+              exit 0
+            fi
+            chmod +x "$bin"
+            echo "$(dirname "$bin")" >> "$GITHUB_PATH"
+            export PATH="$(dirname "$bin"):$PATH"
+          fi
+
+          if ! command -v envoy >/dev/null 2>&1; then
+            echo "envoy not on PATH after install attempt — Envoy arms will be skipped." >&2
+            exit 0
+          fi
+          envoy --version
+          echo "Envoy present (Homebrew or pinned darwin-arm64); H3 arms run when QuicListener is supported."
+
+      # .NET System.Net.Quic on Linux requires native libmsquic (shipped in-box on Windows).
+      - name: Install libmsquic (HTTP/3)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          . /etc/os-release
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            "https://packages.microsoft.com/config/${ID}/${VERSION_ID}/packages-microsoft-prod.deb" \
+            -o packages-microsoft-prod.deb
+          sudo dpkg -i packages-microsoft-prod.deb
+          rm -f packages-microsoft-prod.deb
+          sudo find /etc/apt -type f \( -iname '*chrome*' -o -iname '*google*chrome*' \) -print -delete || true
+          sudo apt-get update || true
+          sudo apt-get install -y libmsquic
+          pwsh -NoProfile -Command 'if (-not [System.Net.Quic.QuicListener]::IsSupported) { throw "QuicListener.IsSupported is false after libmsquic install" }; Write-Host "QuicListener.IsSupported=$([System.Net.Quic.QuicListener]::IsSupported)"'
+
+      - name: Assert in-box MsQuic (HTTP/3)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not [System.Net.Quic.QuicListener]::IsSupported) {
+            throw 'QuicListener.IsSupported is false on windows-latest (expected in-box MsQuic)'
+          }
+          Write-Host "QuicListener.IsSupported=$([System.Net.Quic.QuicListener]::IsSupported)"
+
+      # macOS: System.Net.Quic needs Homebrew libmsquic (and OpenSSL) on DYLD_* path.
+      # Prefer brew; fall back to Microsoft osx-arm64 release dylibs if brew is insufficient.
+      - name: Install MsQuic (HTTP/3, macOS)
+        if: runner.os == 'macOS'
+        shell: pwsh
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_NO_INSTALL_UPGRADE: '1'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Do not upgrade openssl@3; the preinstalled bottle is enough.
+          brew install openssl@3 libmsquic
+          $prefix = (& brew --prefix).Trim()
+          $msquicLib = Join-Path $prefix 'opt/libmsquic/lib'
+          $sslLib = Join-Path $prefix 'opt/openssl@3/lib'
+          $libDirs = @($msquicLib, $sslLib, (Join-Path $prefix 'lib')) |
+            Where-Object { Test-Path $_ } |
+            Select-Object -Unique
+          $dyld = ($libDirs -join ':')
+          # Persist for later steps (ramp / QuicListener).
+          Add-Content -Path $env:GITHUB_ENV -Value "DYLD_LIBRARY_PATH=$dyld"
+          Add-Content -Path $env:GITHUB_ENV -Value "DYLD_FALLBACK_LIBRARY_PATH=$dyld"
+          $env:DYLD_LIBRARY_PATH = $dyld
+          $env:DYLD_FALLBACK_LIBRARY_PATH = $dyld
+          Write-Host "DYLD_LIBRARY_PATH=$dyld"
+
+          function Test-QuicSupported {
+            # Child process so dyld sees DYLD_* (in-process env changes are too late for loaded runtime).
+            $out = & pwsh -NoProfile -Command {
+              if (-not [System.Net.Quic.QuicListener]::IsSupported) { '0' } else { '1' }
+            }
+            return ($out.Trim() -eq '1')
+          }
+
+          if (-not (Test-QuicSupported)) {
+            Write-Host 'QuicListener.IsSupported still false after brew; trying Microsoft osx-arm64 libmsquic drop…'
+            $dest = Join-Path $env:RUNNER_TEMP 'msquic-osx'
+            New-Item -ItemType Directory -Path $dest -Force | Out-Null
+            # Pin a known MsQuic release asset layout; adjust tag if the download 404s.
+            $tag = 'v2.4.7'
+            $url = "https://github.com/microsoft/msquic/releases/download/$tag/msquic_osx-arm64_$tag.zip"
+            $zip = Join-Path $env:RUNNER_TEMP 'msquic-osx.zip'
+            try {
+              & curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 $url -o $zip
+              if ($LASTEXITCODE -ne 0) { throw "curl exit $LASTEXITCODE" }
+              Expand-Archive -Path $zip -DestinationPath $dest -Force
+            } catch {
+              Write-Warning "Microsoft release download failed ($url): $_"
+            }
+            $found = Get-ChildItem -Path $dest -Recurse -Filter 'libmsquic*.dylib' -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+            if ($found) {
+              $extra = $found.Directory.FullName
+              # ${extra} — bare $extra: is parsed as a PowerShell drive-qualified variable.
+              $dyld2 = "${extra}:${dyld}"
+              Add-Content -Path $env:GITHUB_ENV -Value "DYLD_LIBRARY_PATH=$dyld2"
+              Add-Content -Path $env:GITHUB_ENV -Value "DYLD_FALLBACK_LIBRARY_PATH=$dyld2"
+              $env:DYLD_LIBRARY_PATH = $dyld2
+              $env:DYLD_FALLBACK_LIBRARY_PATH = $dyld2
+              Write-Host "Added Microsoft dylib dir: $extra"
+            }
+          }
+
+          if (-not (Test-QuicSupported)) {
+            throw 'QuicListener.IsSupported is false after macOS MsQuic install (brew + optional Microsoft drop)'
+          }
+          Write-Host 'QuicListener.IsSupported=True'
+
+      - name: Install bombardier (optional external generator)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          # Force HTTPS-only (including redirects) for Sonar githubactions:S6506.
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            "https://github.com/codesenberg/bombardier/releases/download/v1.2.6/bombardier-linux-amd64" \
+            -o /usr/local/bin/bombardier
+          chmod +x /usr/local/bin/bombardier
+          bombardier --version || true
+
+      - name: Install bombardier (optional external generator)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:RUNNER_TEMP 'bombardier'
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
+          $exe = Join-Path $dir 'bombardier.exe'
+          curl.exe --fail --silent --show-error --location --proto '=https' --tlsv1.2 `
+            'https://github.com/codesenberg/bombardier/releases/download/v1.2.6/bombardier-windows-amd64.exe' `
+            -o $exe
+          Add-Content -Path $env:GITHUB_PATH -Value $dir
+          & $exe --version
+
+      - name: Install bombardier (optional external generator)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          # macos-15 is arm64 - use the darwin arm64 binary.
+          dir="${RUNNER_TEMP}/bombardier"
+          mkdir -p "$dir"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            "https://github.com/codesenberg/bombardier/releases/download/v1.2.6/bombardier-darwin-arm64" \
+            -o "$dir/bombardier"
+          chmod +x "$dir/bombardier"
+          echo "$dir" >> "$GITHUB_PATH"
+          "$dir/bombardier" --version || true
+
+      - name: Raise open-file limit
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        run: |
+          ulimit -n 65535 || true
+          ulimit -n
+
+      # Catch PowerShell/runtime bugs in post-ramp validators before a multi-hour ramp.
+      - name: Smoke-test post-ramp gate scripts
+        shell: pwsh
+        run: pwsh tools/RpsLoadProbe/smoke-validate-gates.ps1
+
+      # Pass workflow_dispatch inputs via env (not ${{ }} in the script) to avoid
+      # githubactions:S7630 script-injection findings on user-controlled values.
+      - name: Run saturation ramp
+        id: ramp
+        # Same cap on every OS (macOS included): the 180m macOS-only cap was hit by the full
+        # saturation ramp (run 37110567901). Leave headroom under the 360m job timeout so a true
+        # hang still uploads a partial CSV.
+        timeout-minutes: ${{ github.event_name == 'pull_request' && 40 || (github.event_name == 'push' && 60 || (inputs.mode == 'compare-editions' && 60 || ((inputs.mode == 'compare-product-smoke' || inputs.mode == 'compare-haproxy-smoke' || inputs.mode == 'compare-envoy-smoke') && 110 || ((inputs.arm_shard != 'all' && !contains(inputs.arm_shard, '/')) && 60 || 345)))) }}
+        shell: pwsh
+        env:
+          RPS_MODE: ${{ env.RPS_MODE }}
+          RPS_CONCURRENCY: ${{ env.RPS_CONCURRENCY }}
+          RPS_WARMUP_SEC: ${{ env.RPS_WARMUP_SEC }}
+          RPS_DURATION_SEC: ${{ env.RPS_DURATION_SEC }}
+          RPS_REPEATS: ${{ env.RPS_REPEATS }}
+          RPS_ARM_SHARD: ${{ env.RPS_ARM_SHARD }}
+          RPS_ARM_CONTAINS: ${{ env.RPS_ARM_CONTAINS }}
+          RPS_ARM_EXCLUDES: ${{ env.RPS_ARM_EXCLUDES }}
+        run: |
+          $hap = Join-Path $env:RUNNER_TEMP 'haproxy-quic/sbin/haproxy'
+          $hapArgs = @()
+          if ((Test-Path -LiteralPath $hap)) {
+            Write-Host "Pinning HAProxy QUIC binary: $hap"
+            $hapArgs = @('-HaproxyPath', $hap)
+          }
+          $containsArgs = @()
+          if ($env:RPS_ARM_CONTAINS) {
+            Write-Host "Arm name filter: $($env:RPS_ARM_CONTAINS)"
+            $containsArgs = @('-ArmContains', $env:RPS_ARM_CONTAINS)
+          }
+          if ($env:RPS_ARM_EXCLUDES) {
+            Write-Host "Arm name exclude: $($env:RPS_ARM_EXCLUDES)"
+            $containsArgs += @('-ArmExcludes', $env:RPS_ARM_EXCLUDES)
+          }
+          pwsh tools/RpsLoadProbe/run-rps.ps1 `
+            -Mode $env:RPS_MODE `
+            -Concurrency $env:RPS_CONCURRENCY `
+            -WarmupSec ([int]$env:RPS_WARMUP_SEC) `
+            -DurationSec ([int]$env:RPS_DURATION_SEC) `
+            -Repeats ([int]$env:RPS_REPEATS) `
+            -ArmShard $env:RPS_ARM_SHARD `
+            -ResultsDir tools/RpsLoadProbe/results `
+            -BombardierCheck `
+            @containsArgs `
+            @hapArgs
+
+      - name: Mark incomplete ramp
+        if: always() && steps.ramp.outcome != 'success'
+        shell: pwsh
+        env:
+          RAMP_OUTCOME: ${{ steps.ramp.outcome }}
+        run: |
+          $dir = 'tools/RpsLoadProbe/results'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          @(
+            "ramp_outcome=$env:RAMP_OUTCOME"
+            "marked_at_utc=$((Get-Date).ToUniversalTime().ToString('o'))"
+            "os=$env:RUNNER_OS"
+            "arm_shard=$env:RPS_ARM_SHARD"
+          ) | Set-Content -LiteralPath (Join-Path $dir 'INCOMPLETE.txt') -Encoding utf8
+          Write-Host "Wrote INCOMPLETE.txt (ramp outcome=$env:RAMP_OUTCOME)"
+
+      - name: Sanitize artifact shard label
+        if: always()
+        shell: bash
+        run: |
+          # macOS runners ship Bash 3.2; ${var//'/'/-} treats quotes as literal and leaves '/'.
+          raw="${RPS_ARM_SHARD:-all}"
+          echo "RPS_ARTIFACT_SHARD=$(printf '%s' "$raw" | tr '/' '-')" >> "$GITHUB_ENV"
+
+      # Every arm this host resolved must have rows in every repeat. Gate scripts skip
+      # pairs whose arms are absent, so a wedged arm would otherwise leave the leg green.
+      - name: Assert ramp completeness
+        if: steps.ramp.outcome == 'success'
+        id: completeness
+        shell: pwsh
+        run: |
+          pwsh tools/RpsLoadProbe/assert-ramp-complete.ps1 `
+            -ResultsDir tools/RpsLoadProbe/results `
+            -Mode $env:RPS_MODE `
+            -ArmShard $env:RPS_ARM_SHARD `
+            -Repeats ([int]$env:RPS_REPEATS) `
+            -ArmExcludes $env:RPS_ARM_EXCLUDES
+
+      # Post-ramp gates: hard-fail on every event (including workflow_dispatch).
+      # fail-fast: false keeps sibling OS jobs running; Upload CSV uses if: always().
+      # Sharded CSVs skip pairs whose arms are not in this artifact (union paste validates completeness).
+      - name: Validate edition gates
+        id: gate-editions
+        if: env.RPS_MODE == 'compare-editions'
+        shell: pwsh
+        run: |
+          $csv = Get-ChildItem tools/RpsLoadProbe/results -Filter 'rps-ramp-*.csv' |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $csv) { throw 'No CSV found for edition gate validation' }
+          pwsh tools/RpsLoadProbe/validate-edition-gates.ps1 -CsvPath $csv.FullName -AllowPartial
+
+      - name: Validate compare-product gates
+        id: gate-product
+        if: env.RPS_MODE == 'compare-product' || env.RPS_MODE == 'compare-product-smoke'
+        shell: pwsh
+        run: |
+          $csv = Get-ChildItem tools/RpsLoadProbe/results -Filter 'rps-ramp-*.csv' |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $csv) { throw 'No CSV found for compare-product gate validation' }
+          # Same floors on all OS: MITM Lite÷Reverse >= 0.25, Full÷Reverse >= 0.25, reverse TWP÷closest peer >= 0.40.
+          pwsh tools/RpsLoadProbe/validate-compare-product-gates.ps1 -CsvPath $csv.FullName
+
+      - name: Validate heavier YARP gates (bodies)
+        id: gate-bodies
+        if: env.RPS_MODE == 'compare-bodies'
+        shell: pwsh
+        run: |
+          $csv = Get-ChildItem tools/RpsLoadProbe/results -Filter 'rps-ramp-*.csv' |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $csv) { throw 'No CSV found for heavier YARP gate validation' }
+          pwsh tools/RpsLoadProbe/validate-heavier-yarp-gates.ps1 -CsvPath $csv.FullName -NameSuffix body64k
+          pwsh tools/RpsLoadProbe/validate-heavier-yarp-gates.ps1 -CsvPath $csv.FullName -NameSuffix body256k
+
+      - name: Validate heavier YARP gates (post)
+        id: gate-post
+        if: env.RPS_MODE == 'compare-post'
+        shell: pwsh
+        run: |
+          $csv = Get-ChildItem tools/RpsLoadProbe/results -Filter 'rps-ramp-*.csv' |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $csv) { throw 'No CSV found for heavier YARP gate validation' }
+          pwsh tools/RpsLoadProbe/validate-heavier-yarp-gates.ps1 -CsvPath $csv.FullName -NameSuffix post64k
+
+      - name: Validate lossy hard-bar gates
+        id: gate-lossy
+        if: env.RPS_MODE == 'compare-lossy'
+        shell: pwsh
+        run: |
+          $csv = Get-ChildItem tools/RpsLoadProbe/results -Filter 'rps-ramp-*.csv' |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $csv) { throw 'No CSV found for lossy hard-bar gate validation' }
+          pwsh tools/RpsLoadProbe/validate-lossy-arch-gates.ps1 -CsvPath $csv.FullName -Suite lossy
+
+      - name: Validate arch hard-bar gates
+        id: gate-arch
+        if: env.RPS_MODE == 'compare-arch'
+        shell: pwsh
+        run: |
+          $csv = Get-ChildItem tools/RpsLoadProbe/results -Filter 'rps-ramp-*.csv' |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $csv) { throw 'No CSV found for arch hard-bar gate validation' }
+          pwsh tools/RpsLoadProbe/validate-lossy-arch-gates.ps1 -CsvPath $csv.FullName -Suite arch
+
+      - name: Validate gRPC YARP gates
+        id: gate-grpc
+        if: env.RPS_MODE == 'compare-grpc'
+        shell: pwsh
+        run: |
+          $csv = Get-ChildItem tools/RpsLoadProbe/results -Filter 'rps-ramp-*.csv' |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $csv) { throw 'No CSV found for gRPC YARP gate validation' }
+          pwsh tools/RpsLoadProbe/validate-grpc-yarp-gates.ps1 -CsvPath $csv.FullName
+
+      # One status file per leg, overwritten on re-run, so the suite aggregator reads the
+      # last attempt rather than a stale incomplete marker from an earlier attempt.
+      - name: Write leg status
+        if: always()
+        shell: pwsh
+        env:
+          RAMP_OUTCOME: ${{ steps.ramp.outcome }}
+          COMPLETENESS_OUTCOME: ${{ steps.completeness.outcome }}
+          GATE_EDITIONS: ${{ steps.gate-editions.outcome }}
+          GATE_PRODUCT: ${{ steps.gate-product.outcome }}
+          GATE_BODIES: ${{ steps.gate-bodies.outcome }}
+          GATE_POST: ${{ steps.gate-post.outcome }}
+          GATE_LOSSY: ${{ steps.gate-lossy.outcome }}
+          GATE_ARCH: ${{ steps.gate-arch.outcome }}
+          GATE_GRPC: ${{ steps.gate-grpc.outcome }}
+        run: |
+          $dir = 'tools/RpsLoadProbe/results'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $gateOutcomes = @($env:GATE_EDITIONS, $env:GATE_PRODUCT, $env:GATE_BODIES, $env:GATE_POST, $env:GATE_LOSSY, $env:GATE_ARCH, $env:GATE_GRPC)
+          $gateOutcome = if ($gateOutcomes -contains 'failure') { 'failure' }
+                         elseif ($env:RAMP_OUTCOME -eq 'success' -and $env:COMPLETENESS_OUTCOME -eq 'success') { 'success' }
+                         else { 'skipped' }
+          [ordered]@{
+            ramp_outcome = $env:RAMP_OUTCOME
+            completeness_outcome = $env:COMPLETENESS_OUTCOME
+            gate_outcome = $gateOutcome
+            attempt = [int]$env:GITHUB_RUN_ATTEMPT
+            arm_shard = $env:RPS_ARM_SHARD
+            os = $env:RUNNER_OS
+          } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $dir 'leg-status.json') -Encoding utf8
+
+      - name: Upload leg status
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rps-status-${{ matrix.os }}-shard-${{ env.RPS_ARTIFACT_SHARD }}
+          path: tools/RpsLoadProbe/results/leg-status.json
+          overwrite: true
+          if-no-files-found: warn
+
+      - name: Upload CSV artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          # Include arm_shard so parallel shard dispatches do not collide (slash → dash via env sanitize).
+          name: rps-csv-${{ matrix.os }}-shard-${{ env.RPS_ARTIFACT_SHARD }}
+          # A re-run attempt of the same run must replace the first attempt's artifact.
+          overwrite: true
+          path: |
+            tools/RpsLoadProbe/results/rps-ramp-*.csv
+            tools/RpsLoadProbe/results/rps-ramp-*.tls.tsv
+          if-no-files-found: error
+
+      - name: Upload incomplete marker
+        if: always() && hashFiles('tools/RpsLoadProbe/results/INCOMPLETE.txt') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: rps-incomplete-${{ matrix.os }}-shard-${{ env.RPS_ARTIFACT_SHARD }}
+          overwrite: true
+          path: tools/RpsLoadProbe/results/INCOMPLETE.txt
+          if-no-files-found: ignore

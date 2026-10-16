@@ -4,6 +4,7 @@ using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
+using System.Threading;
 using System.Threading.Tasks;
 using Titanium.Web.Proxy.Helpers;
 using Titanium.Web.Proxy.Models;
@@ -15,32 +16,83 @@ namespace Titanium.Web.Proxy.Network.Tcp;
 /// </summary>
 internal class TcpClientConnection : IDisposable
 {
-    private readonly Socket tcpClientSocket;
+    private readonly Socket? tcpClientSocket;
 
-    private bool disposed;
+    private int disposed; // 0 = live, 1 = disposed (Interlocked)
 
     private int? processId;
+
+    /// <summary>
+    ///     When false, this adapter does not participate in <see cref="ProxyServer.ClientConnectionCount" />
+    ///     (used by QUIC clients, which are tracked via <see cref="ProxyServer.Http3ClientConnectionCount" />).
+    /// </summary>
+    private readonly bool trackClientConnectionCount;
 
     internal TcpClientConnection(ProxyServer proxyServer, Socket tcpClientSocket)
     {
         this.tcpClientSocket = tcpClientSocket;
         ProxyServer = proxyServer;
+        trackClientConnectionCount = true;
         ProxyServer.UpdateClientConnectionCount(true);
     }
 
-    public object ClientUserData { get; set; }
+    /// <summary>
+    ///     Protected constructor for subclasses (e.g., QUIC connections) that do not use a TCP socket.
+    ///     The caller is responsible for supplying the effective <see cref="LocalEndPoint" /> and
+    ///     <see cref="RemoteEndPoint" /> via the <paramref name="localEndPoint" /> and
+    ///     <paramref name="remoteEndPoint" /> parameters.
+    /// </summary>
+    /// <param name="trackClientConnectionCount">
+    ///     Pass <see langword="false" /> for QUIC adapters so they do not inflate the TCP-only
+    ///     <see cref="ProxyServer.ClientConnectionCount" />.
+    /// </param>
+    protected TcpClientConnection(ProxyServer proxyServer, IPEndPoint localEndPoint, IPEndPoint remoteEndPoint,
+        bool trackClientConnectionCount = true)
+    {
+        tcpClientSocket = null;
+        LocalEndPointOverride = localEndPoint;
+        RemoteEndPointOverride = remoteEndPoint;
+        ProxyServer = proxyServer;
+        this.trackClientConnectionCount = trackClientConnectionCount;
+        if (trackClientConnectionCount)
+            ProxyServer.UpdateClientConnectionCount(true);
+    }
+
+    /// <summary>Stored local endpoint for socket-less subclasses (e.g., QUIC).</summary>
+    private IPEndPoint? LocalEndPointOverride { get; }
+
+    /// <summary>Stored remote endpoint for socket-less subclasses (e.g., QUIC).</summary>
+    private IPEndPoint? RemoteEndPointOverride { get; }
+
+    public object? ClientUserData { get; set; }
 
     private ProxyServer ProxyServer { get; }
 
-    public Guid Id { get; } = Guid.NewGuid();
+    public long Id { get; } = ConnectionId.Next();
 
-    public EndPoint LocalEndPoint => tcpClientSocket.LocalEndPoint;
+    /// <summary>
+    ///     Accept-thread zero-byte <see cref="Socket.ReceiveAsync(System.Memory{byte}, SocketFlags)" /> —
+    ///     must complete before any socket read (<see cref="SslStream.AuthenticateAsServerAsync" /> /
+    ///     ClientHello peek). Cleared after await.
+    /// </summary>
+    internal Task<int>? PendingClientHelloWait { get; set; }
 
-    public EndPoint RemoteEndPoint => tcpClientSocket.RemoteEndPoint;
+    public EndPoint LocalEndPoint => LocalEndPointOverride
+                                     ?? tcpClientSocket?.LocalEndPoint
+                                     ?? throw new InvalidOperationException("Client connection has no local endpoint.");
+
+    public EndPoint RemoteEndPoint => RemoteEndPointOverride
+                                      ?? tcpClientSocket?.RemoteEndPoint
+                                      ?? throw new InvalidOperationException("Client connection has no remote endpoint.");
 
     internal SslProtocols SslProtocol { get; set; }
 
     internal SslApplicationProtocol NegotiatedApplicationProtocol { get; set; }
+
+    /// <summary>
+    ///     True when this client spoke prior-knowledge cleartext HTTP/2 (h2c) rather than TLS ALPN <c>h2</c>.
+    /// </summary>
+    internal bool Http2CleartextClient { get; set; }
 
     public void Dispose()
     {
@@ -48,60 +100,137 @@ internal class TcpClientConnection : IDisposable
         GC.SuppressFinalize(this);
     }
 
+    protected virtual void Dispose(bool disposing) // NOSONAR S3776 -- This protocol/state-machine path shares mutable parsing or transport state; splitting it further would create disproportionate regression risk.
+    {
+        if (Interlocked.Exchange(ref disposed, 1) != 0) return;
+
+        if (disposing)
+        {
+            // Prefer peer-first close (push TIME_WAIT to the client) only when explicitly requested.
+            // Default TcpTimeWaitSeconds==0: close immediately — matches Kestrel SocketConnection
+            // and avoids scheduling ~1 Task.Delay per new-connection handshake onto the worker pool.
+            if (ProxyServer.TcpTimeWaitSeconds == 0)
+            {
+                if (trackClientConnectionCount)
+                    ProxyServer.UpdateClientConnectionCount(false);
+
+                CloseClientSocket(lingerSeconds: 0);
+            }
+            else
+            {
+                var lingerSeconds = ProxyServer.TcpTimeWaitSeconds;
+                Task.Run(async () =>
+                {
+                    await Task.Delay(1000);
+                    if (trackClientConnectionCount)
+                        ProxyServer.UpdateClientConnectionCount(false);
+
+                    CloseClientSocket(lingerSeconds);
+                });
+            }
+        }
+    }
+
+    private void CloseClientSocket(int lingerSeconds)
+    {
+        if (tcpClientSocket == null) return;
+        try
+        {
+            // Abortive RST when lingerSeconds==0 — applied at close so accept→TLS does not
+            // pay setsockopt; omitting linger falls back to graceful FIN / TIME_WAIT.
+            tcpClientSocket.LingerState = new LingerOption(true, lingerSeconds);
+            tcpClientSocket.Close();
+        }
+        catch (ObjectDisposedException)
+        {
+            // GetStream() historically used ownsSocket:true; the NetworkStream may already
+            // have closed the handle before this Dispose runs. Expected under concurrent teardown.
+        }
+        catch (SocketException)
+        {
+            // Socket already half-closed / reset by the peer or by the owning NetworkStream.
+        }
+        catch (Exception ex)
+        {
+            Logging.ProxyDiagnostics.ReportBenign(ProxyServer.Logger,
+                "Failed to close a client socket during disposal.", ex);
+        }
+    }
+
+    /// <summary>
+    ///     Closes with a TCP FIN (not linger-0 RST) so the peer can finish reading the last
+    ///     response — required for seamless decrypt-bypass meta-refresh before a new CONNECT.
+    /// </summary>
+    internal virtual void CloseGracefully()
+    {
+        if (Interlocked.Exchange(ref disposed, 1) != 0) return;
+
+        if (trackClientConnectionCount)
+            ProxyServer.UpdateClientConnectionCount(false);
+
+        if (tcpClientSocket == null) return;
+        try
+        {
+            tcpClientSocket.LingerState = new LingerOption(false, 0);
+            try
+            {
+                tcpClientSocket.Shutdown(SocketShutdown.Both);
+            }
+            catch (SocketException)
+            {
+                // Already half-closed / reset by peer.
+            }
+
+            tcpClientSocket.Close();
+        }
+#pragma warning disable S108 // Empty catches: dispose races / peer reset while closing client socket
+        catch (ObjectDisposedException)
+        {
+            // Socket already disposed by NetworkStream(ownsSocket:true) or concurrent close.
+        }
+        catch (SocketException)
+        {
+            // Peer reset / already half-closed during Close().
+        }
+#pragma warning restore S108
+        catch (Exception ex)
+        {
+            Logging.ProxyDiagnostics.ReportBenign(ProxyServer.Logger,
+                "Failed to gracefully close a client socket after seamless retry.", ex);
+        }
+    }
+
     public Stream GetStream()
     {
-        return new NetworkStream(tcpClientSocket, true);
+        if (tcpClientSocket == null)
+            throw new InvalidOperationException(
+                "GetStream() is not supported on non-TCP connections. Use the QUIC stream API directly.");
+        // ownsSocket:true — HttpClientStream dispose closes the handle. Connection.Dispose then
+        // may race; CloseClientSocket treats ObjectDisposedException as expected (no ReportBenign).
+        return new NetworkStream(tcpClientSocket, ownsSocket: true);
     }
 
     public int GetProcessId(ProxyEndPoint endPoint)
     {
+        if (tcpClientSocket == null) return -1; // Process ID is not available for QUIC/non-TCP connections.
+
         if (processId.HasValue) return processId.Value;
 
-        if (RunTime.IsWindows)
+        if (!Titanium.Web.Proxy.ClientProcessId.IsSupported)
         {
-            var remoteEndPoint = (IPEndPoint)RemoteEndPoint;
-
-            // If client is localhost get the process id
-            if (NetworkHelper.IsLocalIpAddress(remoteEndPoint.Address))
-                processId = TcpHelper.GetProcessIdByLocalPort(endPoint.IpAddress.AddressFamily, remoteEndPoint.Port);
-            else
-                // can't access process Id of remote request from remote machine
-                processId = -1;
-
-            return processId.Value;
+            processId = -1;
+            return -1;
         }
 
-        throw new PlatformNotSupportedException();
-    }
+        var remoteEndPoint = (IPEndPoint)RemoteEndPoint;
 
-    protected virtual void Dispose(bool disposing)
-    {
-        if (disposed) return;
+        // If client is localhost get the process id
+        if (NetworkHelper.IsLocalIpAddress(remoteEndPoint.Address))
+            processId = TcpHelper.GetProcessIdByLocalPort(endPoint.IpAddress.AddressFamily, remoteEndPoint.Port);
+        else
+            // can't access process Id of remote request from remote machine
+            processId = -1;
 
-        Task.Run(async () =>
-        {
-            // delay calling tcp connection close()
-            // so that client have enough time to call close first.
-            // This way we can push tcp Time_Wait to client side when possible.
-            await Task.Delay(1000);
-            ProxyServer.UpdateClientConnectionCount(false);
-
-            if (disposing)
-                try
-                {
-                    tcpClientSocket.Close();
-                }
-                catch
-                {
-                    // ignore
-                }
-        });
-
-        disposed = true;
-    }
-
-    ~TcpClientConnection()
-    {
-        Dispose(false);
+        return processId.Value;
     }
 }

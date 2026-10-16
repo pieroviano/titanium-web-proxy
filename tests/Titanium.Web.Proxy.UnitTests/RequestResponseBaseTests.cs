@@ -1,0 +1,309 @@
+using System.IO;
+using System.IO.Compression;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+using Titanium.Web.Proxy.Http;
+using Titanium.Web.Proxy.Models;
+
+namespace Titanium.Web.Proxy.UnitTests
+{
+    /// <summary>
+    ///     Unit tests for <see cref="RequestResponseBase" /> (via <see cref="Response" />):
+    ///     body assignment, chunked/content-length bookkeeping, and the compression helper used when relaying a
+    ///     buffered, modified body back onto the wire.
+    /// </summary>
+    [TestClass]
+    public class RequestResponseBaseTests
+    {
+        [TestMethod]
+        public void SettingBody_NonChunked_UpdatesContentLengthHeaderToMatchByteLength()
+        {
+            var response = new Response();
+
+            response.Body = Encoding.ASCII.GetBytes("hello world");
+
+            Assert.AreEqual(11, response.ContentLength);
+            Assert.AreEqual("11", response.Headers.GetHeaderValueOrNull(KnownHeaders.ContentLength));
+        }
+
+        [TestMethod]
+        public void IsChunked_True_ClearsContentLengthAndAddsTransferEncodingHeader()
+        {
+            var response = new Response();
+
+            response.IsChunked = true;
+
+            Assert.AreEqual(-1, response.ContentLength);
+            Assert.IsTrue(response.Headers.HeaderExists("Transfer-Encoding"));
+
+            response.IsChunked = false;
+
+            Assert.IsFalse(response.Headers.HeaderExists("Transfer-Encoding"));
+        }
+
+        [TestMethod]
+        public void ContentLength_SetToNegative_RemovesContentLengthHeader()
+        {
+            var response = new Response();
+            response.Body = Encoding.ASCII.GetBytes("hello");
+            Assert.IsTrue(response.Headers.HeaderExists("Content-Length"));
+
+            response.ContentLength = -1;
+
+            Assert.IsFalse(response.Headers.HeaderExists("Content-Length"));
+        }
+
+        [TestMethod]
+        public void BodyString_DecodesBodyUsingContentTypeEncoding()
+        {
+            var response = new Response(Encoding.UTF8.GetBytes("héllo"))
+            {
+                ContentType = "text/plain; charset=utf-8"
+            };
+
+            Assert.AreEqual("héllo", response.BodyString);
+        }
+
+        [TestMethod]
+        public void CompressBodyAndUpdateContentLength_Gzip_ProducesDecodableOutputAndUpdatesContentLength()
+        {
+            var original = Encoding.ASCII.GetBytes(
+                "the quick brown fox jumps over the lazy dog. the quick brown fox jumps over the lazy dog.");
+            var response = new Response(original);
+            response.Headers.AddHeader(KnownHeaders.ContentEncoding, "gzip");
+
+            var compressed = response.CompressBodyAndUpdateContentLength();
+
+            Assert.IsNotNull(compressed);
+            Assert.AreEqual(compressed.Length, response.ContentLength);
+
+            using (var compressedStream = new MemoryStream(compressed))
+            using (var gzip = new GZipStream(compressedStream, CompressionMode.Decompress))
+            using (var decompressed = new MemoryStream())
+            {
+                gzip.CopyTo(decompressed);
+                CollectionAssert.AreEqual(original, decompressed.ToArray());
+            }
+        }
+
+        [TestMethod]
+        public void CompressBodyAndUpdateContentLength_Chunked_SetsContentLengthToUnknown()
+        {
+            var original = Encoding.ASCII.GetBytes("streamed body content");
+            var response = new Response(original) { IsChunked = true };
+            response.Headers.AddHeader(KnownHeaders.ContentEncoding, "gzip");
+
+            response.CompressBodyAndUpdateContentLength();
+
+            Assert.AreEqual(-1, response.ContentLength);
+        }
+
+        [TestMethod]
+        public void CompressBodyAndUpdateContentLength_NoBodyAndNotRead_ReturnsNull()
+        {
+            var response = new Response();
+
+            var result = response.CompressBodyAndUpdateContentLength();
+
+            Assert.IsNull(result);
+        }
+
+        [TestMethod]
+        public void BodySetter_ClearsBodyIsWireEncoded()
+        {
+            var response = new Response(Encoding.ASCII.GetBytes("wire"));
+            response.BodyIsWireEncoded = true;
+
+            response.Body = Encoding.ASCII.GetBytes("plain");
+
+            Assert.IsFalse(response.BodyIsWireEncoded);
+        }
+
+        [TestMethod]
+        public void BodyReassignment_MustRestoreBodyIsWireEncoded_ToAvoidDoubleCompress()
+        {
+            // H2→H1 / synthetic emit paths often do: Body = bytes; BodyIsWireEncoded = true.
+            // The Body setter always clears the flag — callers that forget to restore it double-gzip
+            // and browsers then parse compressed player JSON as text (garbage videoplayback URLs).
+            var plain = Encoding.ASCII.GetBytes(
+                "the quick brown fox jumps over the lazy dog. the quick brown fox jumps over the lazy dog.");
+            byte[] gzipped;
+            using (var ms = new MemoryStream())
+            {
+                using (var gzip = new GZipStream(ms, CompressionLevel.SmallestSize, leaveOpen: true))
+                    gzip.Write(plain);
+                gzipped = ms.ToArray();
+            }
+
+            var response = new Response(gzipped);
+            response.Headers.AddHeader(KnownHeaders.ContentEncoding, "gzip");
+            response.IsBodyRead = true;
+            response.BodyIsWireEncoded = true;
+
+            // Simulate a bridge that reassigns the same wire bytes without restoring the flag.
+            var wasWire = response.BodyIsWireEncoded;
+            response.Body = response.Body;
+            Assert.IsFalse(response.BodyIsWireEncoded, "Body setter must clear the flag.");
+            if (wasWire)
+                response.BodyIsWireEncoded = true;
+
+            var onWire = response.CompressBodyAndUpdateContentLength();
+            Assert.IsNotNull(onWire);
+            CollectionAssert.AreEqual(gzipped, onWire,
+                "After restoring BodyIsWireEncoded, CompressBody must not gzip again.");
+        }
+
+        [TestMethod]
+        public void CompressBodyAndUpdateContentLength_WireEncodedGzip_DoesNotDoubleCompress()
+        {
+            var plain = Encoding.ASCII.GetBytes(
+                "the quick brown fox jumps over the lazy dog. the quick brown fox jumps over the lazy dog.");
+            byte[] gzipped;
+            using (var ms = new MemoryStream())
+            {
+                using (var gzip = new GZipStream(ms, CompressionLevel.SmallestSize, leaveOpen: true))
+                    gzip.Write(plain);
+                gzipped = ms.ToArray();
+            }
+
+            var response = new Response(gzipped);
+            response.Headers.AddHeader(KnownHeaders.ContentEncoding, "gzip");
+            response.IsBodyRead = true;
+            response.BodyIsWireEncoded = true;
+
+            var onWire = response.CompressBodyAndUpdateContentLength();
+
+            Assert.IsNotNull(onWire);
+            CollectionAssert.AreEqual(gzipped, onWire, "Wire-encoded body must not be gzipped again.");
+            Assert.AreEqual(gzipped.Length, response.ContentLength);
+
+            using (var compressedStream = new MemoryStream(onWire))
+            using (var gzip = new GZipStream(compressedStream, CompressionMode.Decompress))
+            using (var decompressed = new MemoryStream())
+            {
+                gzip.CopyTo(decompressed);
+                CollectionAssert.AreEqual(plain, decompressed.ToArray());
+            }
+        }
+
+        [TestMethod]
+        public void CompressBodyAndUpdateContentLength_AfterEnsurePlainBody_RecompressesGzip()
+        {
+            // Mirrors GetRequestBody → EnsurePlainBodyAsync: BodyIsWireEncoded cleared, Body is plain,
+            // Content-Encoding still set. Origin forward must CompressBody (not send plain with CE).
+            var plain = Encoding.ASCII.GetBytes(
+                "the quick brown fox jumps over the lazy dog. the quick brown fox jumps over the lazy dog.");
+            var request = new Request { Method = "POST" };
+            request.Body = plain;
+            request.Headers.AddHeader(KnownHeaders.ContentEncoding, "gzip");
+            request.IsBodyRead = true;
+            request.BodyIsWireEncoded = false;
+
+            var onWire = request.CompressBodyAndUpdateContentLength();
+
+            Assert.IsNotNull(onWire);
+            Assert.AreNotEqual(plain.Length, onWire.Length);
+            using (var compressedStream = new MemoryStream(onWire))
+            using (var gzip = new GZipStream(compressedStream, CompressionMode.Decompress))
+            using (var decompressed = new MemoryStream())
+            {
+                gzip.CopyTo(decompressed);
+                CollectionAssert.AreEqual(plain, decompressed.ToArray());
+            }
+        }
+
+        [TestMethod]
+        public void CompressBodyAndUpdateContentLength_UnsupportedEncoding_PassesWireBytesThrough()
+        {
+            var wire = Encoding.ASCII.GetBytes("not-really-dcb-but-opaque");
+            var response = new Response(wire);
+            response.Headers.AddHeader(KnownHeaders.ContentEncoding, "dcb");
+            response.IsBodyRead = true;
+
+            var onWire = response.CompressBodyAndUpdateContentLength();
+
+            Assert.IsNotNull(onWire);
+            CollectionAssert.AreEqual(wire, onWire);
+        }
+
+        [TestMethod]
+        public void TrailingHeaders_DefaultsToEmptyAndHasTrailingHeadersReflectsContent()
+        {
+            var response = new Response();
+
+            // HasTrailingHeaders must not force the lazy allocation that the public getter performs.
+            Assert.IsFalse(response.HasTrailingHeaders);
+
+            Assert.IsNotNull(response.TrailingHeaders);
+            Assert.IsFalse(response.TrailingHeaders.GetEnumerator().MoveNext());
+            Assert.IsFalse(response.HasTrailingHeaders, "An empty collection was allocated but nothing was added.");
+
+            response.TrailingHeaders.AddHeader("X-Checksum", "abc123");
+
+            Assert.IsTrue(response.HasTrailingHeaders);
+            Assert.AreEqual("abc123", response.TrailingHeaders.GetFirstHeader("X-Checksum")?.Value);
+        }
+
+        [TestMethod]
+        public void TrailingHeaders_SameInstanceReturnedOnRepeatedAccess()
+        {
+            var request = new Request();
+
+            var first = request.TrailingHeaders;
+            var second = request.TrailingHeaders;
+
+            Assert.AreSame(first, second);
+        }
+
+        [TestMethod]
+        public void ResetForKeepAlive_ClearsWireStateAndUnlocksRequest()
+        {
+            var request = new Request
+            {
+                Method = "GET",
+                HttpVersion = HttpHeader.Version11,
+                Locked = true,
+                HeaderNamesAreHttp2Normalized = true
+            };
+            request.Headers.AddHeader("Host", "example.test");
+            request.Headers.AddHeader("Content-Length", "0");
+            request.TrailingHeaders.AddHeader("X-Checksum", "abc");
+
+            request.ResetForKeepAlive();
+
+            Assert.AreEqual(string.Empty, request.Method);
+            Assert.AreEqual(HttpHeader.VersionUnknown, request.HttpVersion);
+            Assert.IsFalse(request.Locked);
+            Assert.IsFalse(request.HeaderNamesAreHttp2Normalized);
+            Assert.AreEqual(0, request.Headers.Count());
+            Assert.IsFalse(request.HasTrailingHeaders);
+        }
+
+        [TestMethod]
+        public void Response_ResetForKeepAlive_ZerosStatusAndClearsWriter()
+        {
+            var response = new Response
+            {
+                StatusCode = 200,
+                StatusDescription = "OK",
+                RequestMethod = "GET",
+                Locked = true,
+                HttpVersion = HttpHeader.Version11
+            };
+            response.Headers.AddHeader("Content-Length", "0");
+            response.StreamBodyWriter = (_, _) => Task.CompletedTask;
+
+            response.ResetForKeepAlive();
+
+            Assert.AreEqual(0, response.StatusCode);
+            Assert.AreEqual(string.Empty, response.StatusDescription);
+            Assert.AreEqual(string.Empty, response.RequestMethod);
+            Assert.IsNull(response.StreamBodyWriter);
+            Assert.IsFalse(response.Locked);
+            Assert.AreEqual(0, response.Headers.Count());
+            Assert.AreEqual(HttpHeader.VersionUnknown, response.HttpVersion);
+        }
+    }
+}

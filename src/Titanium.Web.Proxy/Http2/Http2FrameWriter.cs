@@ -1,0 +1,312 @@
+using System;
+using System.Buffers;
+using System.Threading;
+using System.Threading.Channels;
+using System.Threading.Tasks;
+using Titanium.Web.Proxy.Diagnostics;
+
+namespace Titanium.Web.Proxy.Http2;
+
+/// <summary>
+///     Single dedicated writer for one HTTP/2 socket direction. Producers enqueue already-framed
+///     rented buffers; one background task drains the channel, optionally coalescing contiguous
+///     writes into one <see cref="System.IO.Stream.WriteAsync(System.ReadOnlyMemory{byte}, CancellationToken)" />
+///     to cut syscalls.
+///     <para>
+///         When constructed without a lock the drain is the exclusive socket writer (exclusive drain model):
+///         it never takes a lock around <c>WriteAsync</c>. Pass a <see cref="SemaphoreSlim" /> only
+///         when mixed direct-locked writes still exist on the same stream (client MITM path).
+///     </para>
+/// </summary>
+internal sealed class Http2FrameWriter : IAsyncDisposable
+{
+    // Enough for HEADERS + a full 256 KiB known-CL body (sixteen 16 KiB DATA frames) in one
+    // SslStream write after flatten. Smaller budgets force several coalesce passes mid-body and
+    // left cool 256 KiB H2→H1 at ~0.84× while 64 KiB was already at parity with an 80 KiB budget.
+    private const int CoalesceByteBudget = 288 * 1024;
+    private const int CoalesceMaxFrames = 64;
+
+    // Watermark thresholds for Metrics (sparse samples on crossing only — not every enqueue).
+    private const int WatermarkSoft = 64;
+    private const int WatermarkWarn = 256;
+    private const int WatermarkCritical = 1024;
+
+    private readonly Channel<ArraySegment<byte>> channel;
+    private readonly System.IO.Stream output;
+    private readonly SemaphoreSlim? writeLock;
+    private readonly CancellationTokenSource cts = new();
+    private readonly Task drainTask;
+    // SingleReader drain: reuse coalesce scratch (avoids new ArraySegment[64] under multiplex).
+    private readonly ArraySegment<byte>[] coalesceFrames = new ArraySegment<byte>[CoalesceMaxFrames];
+    private int disposed;
+    private int pendingFrames;
+    private int highWaterMark;
+    private int watermarkTierCrossed; // bit0=soft, bit1=warn, bit2=critical (per writer lifetime)
+
+    public Http2FrameWriter(System.IO.Stream output, SemaphoreSlim? writeLock = null)
+    {
+        this.output = output;
+        this.writeLock = writeLock;
+        channel = Channel.CreateUnbounded<ArraySegment<byte>>(new UnboundedChannelOptions
+        {
+            SingleReader = true,
+            SingleWriter = false,
+            // Keep ASC=false: EnqueueRented runs under origin writeLock; ASC=true MaxOrigin=1
+            // SoftPick long A/B ~0.78× H1 / ~0.88× H3 — sync drain under writeLock regresses.
+            AllowSynchronousContinuations = false
+        });
+        drainTask = Task.Run(() => DrainAsync(cts.Token), cts.Token);
+    }
+
+    /// <summary>Frames currently sitting in the channel (approximate; for tests/metrics).</summary>
+    public int PendingFrameCount => Volatile.Read(ref pendingFrames);
+
+    /// <summary>Peak pending depth observed on this writer.</summary>
+    public int HighWaterMark => Volatile.Read(ref highWaterMark);
+
+    /// <summary>
+    ///     Enqueues a rented buffer for write. Ownership transfers; the buffer is returned to
+    ///     <see cref="ArrayPool{T}.Shared" /> after the write (or on writer fault/dispose).
+    /// </summary>
+    public void EnqueueRented(byte[] rented, int length)
+    {
+        if (disposed != 0)
+        {
+            ArrayPool<byte>.Shared.Return(rented);
+            return;
+        }
+
+        var depth = Interlocked.Increment(ref pendingFrames);
+        // Relaxed high-water: races under count by at most one sample — fine for metrics.
+        var hw = highWaterMark;
+        if (depth > hw)
+            Interlocked.CompareExchange(ref highWaterMark, depth, hw);
+
+        ObserveWatermarkCrossing(depth);
+
+        if (!channel.Writer.TryWrite(new ArraySegment<byte>(rented, 0, length)))
+        {
+            Interlocked.Decrement(ref pendingFrames);
+            ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    private void ObserveWatermarkCrossing(int depth)
+    {
+        // Sparse: only the first crossing of each tier per writer lifetime.
+        if (depth >= WatermarkCritical)
+            RecordTier(0b100, "critical", depth);
+        else if (depth >= WatermarkWarn)
+            RecordTier(0b010, "warn", depth);
+        else if (depth >= WatermarkSoft)
+            RecordTier(0b001, "soft", depth);
+    }
+
+    private void RecordTier(int bit, string name, int depth)
+    {
+        var prev = watermarkTierCrossed;
+        if ((prev & bit) != 0)
+            return;
+        if (Interlocked.CompareExchange(ref watermarkTierCrossed, prev | bit, prev) != prev)
+            return;
+        ProxyMetrics.Http2FrameWriterHighWaterCrossed(name);
+        ProxyMetrics.Http2FrameWriterDepthSample(depth, name);
+    }
+
+    public Task Completion => drainTask;
+
+    private async Task DrainAsync(CancellationToken cancellationToken) // NOSONAR S3776 -- This protocol/state-machine path shares mutable parsing or transport state; splitting it further would create disproportionate regression risk.
+    {
+        var reader = channel.Reader;
+        try
+        {
+            while (await reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                // MaxOrigin=1 SoftPick: writeLock serializes EnqueueRented then Release; the drain
+                // often wakes after a single HEADERS. Brief spin lets the next producer enqueue so
+                // coalesce can batch SecureTransport writes (YARP/SHH contiguous outgoing buffer).
+                var spinner = new SpinWait();
+                while (!spinner.NextSpinWillYield)
+                {
+                    if (reader.TryPeek(out _))
+                        break;
+                    spinner.SpinOnce();
+                }
+
+                while (reader.TryRead(out var first))
+                {
+                    Interlocked.Decrement(ref pendingFrames);
+                    try
+                    {
+                        // Second grace after taking first frame — next writeLock holder may enqueue.
+                        if (!reader.TryPeek(out _))
+                        {
+                            spinner = new SpinWait();
+                            while (!spinner.NextSpinWillYield)
+                            {
+                                if (reader.TryPeek(out _))
+                                    break;
+                                spinner.SpinOnce();
+                            }
+                        }
+
+                        if (!reader.TryPeek(out _))
+                        {
+                            await WriteLockedAsync(first.AsMemory(), cancellationToken).ConfigureAwait(false);
+                            ArrayPool<byte>.Shared.Return(first.Array!);
+                            continue;
+                        }
+
+                        var total = first.Count;
+                        var frames = coalesceFrames;
+                        frames[0] = first;
+                        var count = 1;
+                        while (count < CoalesceMaxFrames
+                               && total < CoalesceByteBudget
+                               && reader.TryRead(out var next))
+                        {
+                            Interlocked.Decrement(ref pendingFrames);
+                            frames[count++] = next;
+                            total += next.Count;
+                        }
+
+                        if (count == 1)
+                        {
+                            await WriteLockedAsync(first.AsMemory(), cancellationToken).ConfigureAwait(false);
+                            ArrayPool<byte>.Shared.Return(first.Array!);
+                        }
+                        else
+                        {
+                            var coalesced = ArrayPool<byte>.Shared.Rent(total);
+                            try
+                            {
+                                var pos = 0;
+                                for (var i = 0; i < count; i++)
+                                {
+                                    frames[i].AsSpan().CopyTo(coalesced.AsSpan(pos));
+                                    pos += frames[i].Count;
+                                    ArrayPool<byte>.Shared.Return(frames[i].Array!);
+                                    frames[i] = default;
+                                }
+
+                                await WriteLockedAsync(coalesced.AsMemory(0, total), cancellationToken).ConfigureAwait(false);
+                            }
+                            finally
+                            {
+                                ArrayPool<byte>.Shared.Return(coalesced);
+                                for (var i = 0; i < count; i++)
+                                {
+                                    if (frames[i].Array != null)
+                                        ArrayPool<byte>.Shared.Return(frames[i].Array!);
+                                }
+                            }
+                        }
+                    }
+                    catch
+                    {
+                        if (first.Array != null)
+                            ArrayPool<byte>.Shared.Return(first.Array);
+                        throw;
+                    }
+                }
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // normal shutdown
+        }
+        finally
+        {
+            while (reader.TryRead(out var leftover))
+            {
+                Interlocked.Decrement(ref pendingFrames);
+                if (leftover.Array != null)
+                    ArrayPool<byte>.Shared.Return(leftover.Array);
+            }
+        }
+    }
+
+    private ValueTask WriteLockedAsync(ReadOnlyMemory<byte> memory, CancellationToken cancellationToken)
+    {
+        if (writeLock == null)
+            return output.WriteAsync(memory, cancellationToken);
+
+        var waitTask = writeLock.WaitAsync(cancellationToken);
+        if (!waitTask.IsCompletedSuccessfully)
+            return WriteLockedSlowAsync(waitTask, memory, cancellationToken);
+
+        try
+        {
+            var writeVt = output.WriteAsync(memory, cancellationToken);
+            if (writeVt.IsCompletedSuccessfully)
+            {
+                writeLock.Release();
+                return default;
+            }
+
+            return WriteLockedAwaitWriteAsync(writeVt);
+        }
+        catch
+        {
+            writeLock.Release();
+            throw;
+        }
+    }
+
+    private async ValueTask WriteLockedSlowAsync(Task waitTask, ReadOnlyMemory<byte> memory,
+        CancellationToken cancellationToken)
+    {
+        await waitTask.ConfigureAwait(false);
+        try
+        {
+            await output.WriteAsync(memory, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            writeLock!.Release();
+        }
+    }
+
+    private async ValueTask WriteLockedAwaitWriteAsync(ValueTask writeVt)
+    {
+        try
+        {
+            await writeVt.ConfigureAwait(false);
+        }
+        finally
+        {
+            writeLock!.Release();
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (Interlocked.Exchange(ref disposed, 1) != 0)
+            return;
+
+        // Complete first so the drain writes already-queued frames. Cancelling immediately
+        // races WaitToReadAsync and drops leftovers (bytes never hit the socket).
+        channel.Writer.TryComplete();
+        try
+        {
+            await drainTask.WaitAsync(TimeSpan.FromSeconds(2), CancellationToken.None).ConfigureAwait(false); // NOSONAR S8949 -- drain queued frames; cts.Token would abort if already cancelled
+        }
+        catch (TimeoutException)
+        {
+            try { await cts.CancelAsync(); }
+            catch { /* ignore */ }
+
+            try { await drainTask.WaitAsync(TimeSpan.FromSeconds(1), CancellationToken.None).ConfigureAwait(false); } // NOSONAR S8949 -- drain after Cancel; cts is already cancelled
+            catch { /* drain may fault if socket already closed */ }
+        }
+        catch
+        {
+            /* drain may fault if socket already closed */
+        }
+
+        try { await cts.CancelAsync(); }
+        catch { /* ignore */ }
+
+        cts.Dispose();
+    }
+}

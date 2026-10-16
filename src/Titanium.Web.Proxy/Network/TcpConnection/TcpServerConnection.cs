@@ -2,7 +2,9 @@
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
+using System.Threading;
 using System.Threading.Tasks;
+using Titanium.Web.Proxy.Diagnostics;
 using Titanium.Web.Proxy.Helpers;
 using Titanium.Web.Proxy.Models;
 
@@ -15,7 +17,17 @@ internal class TcpServerConnection : IDisposable
 {
     private bool disposed;
 
-    internal TcpServerConnection(ProxyServer proxyServer, Socket tcpSocket, HttpServerStream stream,
+    private int disposalScheduled;
+
+    private int firstUseClaimed;
+
+    /// <summary>
+    /// Exclusive lease flag for the connection pool. 0 = free / pooled, 1 = leased to a session.
+    /// Detects use-after-release and double-lease races that corrupt keep-alive framing.
+    /// </summary>
+    private int leaseState;
+
+    internal TcpServerConnection(ProxyServer proxyServer, Socket tcpSocket, HttpServerStream stream, // NOSONAR S107 -- Constructor captures the established connection state without changing internal wiring.
         string hostName, int port, bool isHttps, SslApplicationProtocol negotiatedApplicationProtocol,
         Version version, IExternalProxy? upStreamProxy, IPEndPoint? upStreamEndPoint, string cacheKey)
     {
@@ -33,9 +45,27 @@ internal class TcpServerConnection : IDisposable
         UpStreamEndPoint = upStreamEndPoint;
 
         CacheKey = cacheKey;
+        // Fresh connections start leased to the creating session.
+        leaseState = 1;
     }
 
-    public Guid Id { get; } = Guid.NewGuid();
+    /// <summary>
+    /// Optional per-endpoint pool depth captured at create time from
+    /// <see cref="Models.ProxyEndPoint.MaxCachedConnections"/>. Null = use server default.
+    /// </summary>
+    internal int? PoolSizeLimit { get; set; }
+
+    public long Id { get; } = ConnectionId.Next();
+
+    /// <summary>
+    ///     Structured establishment timing for this connection (DNS/TCP/upstream-proxy/TLS), populated only
+    ///     when <see cref="ProxyServer.EnableRequestTimingCapture" /> was enabled at the moment this
+    ///     connection was created. Set once by <see cref="Tcp.TcpConnectionFactory" /> right after
+    ///     construction and never mutated afterwards; shared by every session that later reuses this
+    ///     connection from the pool. Exposed publicly via
+    ///     <see cref="EventArguments.SessionEventArgsBase.UpstreamConnectionTiming" />.
+    /// </summary>
+    internal UpstreamConnectionTiming? Timing { get; set; }
 
     private ProxyServer ProxyServer { get; }
 
@@ -59,12 +89,18 @@ internal class TcpServerConnection : IDisposable
     /// <summary>
     ///     Http version
     /// </summary>
-    internal Version Version { get; set; } = HttpHeader.VersionUnknown;
+    internal Version Version { get; set; }
 
     /// <summary>
     ///     The TcpClient.
     /// </summary>
     internal Socket TcpSocket { get; }
+
+    /// <summary>
+    ///     Physical peer of the established upstream TCP socket.
+    ///     When an upstream proxy is used this is the proxy hop, not the origin.
+    /// </summary>
+    internal IPEndPoint? RemoteEndPoint => TcpSocket.RemoteEndPoint as IPEndPoint;
 
     /// <summary>
     ///     Used to write lines to server
@@ -77,6 +113,23 @@ internal class TcpServerConnection : IDisposable
     internal DateTime LastAccess { get; set; }
 
     /// <summary>
+    ///     True once the HTTP/2 connection preface has been written on this connection, i.e. it carries a
+    ///     real h2 session rather than being an ALPN-negotiated-but-never-started socket. An h2 connection
+    ///     opened only for capability probing/prefetching never starts its session, and origins terminate
+    ///     such a connection (typically with GOAWAY/INTERNAL_ERROR) once their preface timeout elapses -
+    ///     so it must never be pooled and resurrected later. See <see cref="Tcp.TcpConnectionFactory.Release" />.
+    /// </summary>
+    internal bool Http2SessionStarted { get; set; }
+
+    /// <summary>
+    ///     True when this connection is intended for cleartext HTTP/2 (h2c prior-knowledge): no TLS/ALPN,
+    ///     <see cref="IsHttps"/> is false, and the session starts with the connection preface. Distinct from
+    ///     TLS ALPN <c>h2</c> so pool keys and <see cref="Tcp.TcpConnectionFactory.Release"/> unstarted
+    ///     guards treat both flavors correctly.
+    /// </summary>
+    internal bool Http2Cleartext { get; set; }
+
+    /// <summary>
     ///     The cache key used to uniquely identify this connection properties
     /// </summary>
     internal string CacheKey { get; set; }
@@ -85,6 +138,53 @@ internal class TcpServerConnection : IDisposable
     ///     Is this connection authenticated via WinAuth
     /// </summary>
     internal bool IsWinAuthenticated { get; set; }
+
+    /// <summary>
+    ///     True when a per-session client certificate was presented on this TLS connection.
+    ///     Such connections are identity-specific and must not be reused from the shared pool.
+    /// </summary>
+    internal bool UsedClientCertificate { get; set; }
+
+    /// <summary>
+    ///     True once this connection has been scheduled for disposal.
+    ///     A scheduled connection must never be returned to the pool.
+    /// </summary>
+    internal bool IsDisposalScheduled => Volatile.Read(ref disposalScheduled) != 0;
+
+    /// <summary>
+    ///     Atomically marks this connection as scheduled for disposal.
+    ///     Returns true only for the first caller, so the connection is added to the
+    ///     disposal bag exactly once (avoids duplicate disposal and an O(n) membership scan).
+    /// </summary>
+    internal bool TryScheduleDisposal()
+    {
+        return Interlocked.CompareExchange(ref disposalScheduled, 1, 0) == 0;
+    }
+
+    /// <summary>
+    /// Marks this connection leased by a session. Returns <see langword="false" /> if it was already leased
+    /// (double-lease / use-after-free from the pool).
+    /// </summary>
+    internal bool TryEnterLease() => Interlocked.CompareExchange(ref leaseState, 1, 0) == 0;
+
+    /// <summary>
+    /// Releases the exclusive lease before the connection is returned to the pool or disposed.
+    /// </summary>
+    internal void ExitLease() => Interlocked.Exchange(ref leaseState, 0);
+
+    /// <summary>
+    /// Claims this connection for use by a session, for <see cref="ProxyServer.EnableRequestTimingCapture" />'s
+    ///     "was the upstream connection reused" bookkeeping. Returns <see langword="true" /> only the very
+    ///     first time it is called for this connection's entire lifetime (i.e. the caller is establishing it
+    ///     fresh); every subsequent call returns <see langword="false" /> (i.e. the caller is reusing an
+    ///     already-claimed connection - whether pooled-and-reacquired, retried, or a multiplexed HTTP/2
+    ///     stream sharing a connection another stream already claimed). Cheap and side-effect-free to call
+    ///     even when timing capture is disabled.
+    /// </summary>
+    internal bool ClaimFirstUse()
+    {
+        return Interlocked.CompareExchange(ref firstUseClaimed, 1, 0) == 0;
+    }
 
     public void Dispose()
     {
@@ -96,35 +196,33 @@ internal class TcpServerConnection : IDisposable
     {
         if (disposed) return;
 
-        Task.Run(async () =>
+        if (disposing)
         {
-            // delay calling tcp connection close()
-            // so that server have enough time to call close first.
-            // This way we can push tcp Time_Wait to server side when possible.
-            await Task.Delay(1000);
-
-            ProxyServer.UpdateServerConnectionCount(false);
-
-            if (disposing)
+            // No finalizer: sockets/streams already have their own finalization, and scheduling
+            // Task.Run / logging from a finalizer thread is unsafe.
+            Task.Run(async () =>
             {
+                // delay calling tcp connection close()
+                // so that server have enough time to call close first.
+                // This way we can push tcp Time_Wait to server side when possible.
+                await Task.Delay(1000);
+
+                ProxyServer.UpdateServerConnectionCount(false);
+
                 Stream.Dispose();
 
                 try
                 {
                     TcpSocket.Close();
                 }
-                catch
+                catch (Exception ex)
                 {
-                    // ignore
+                    Logging.ProxyDiagnostics.ReportBenign(ProxyServer.Logger,
+                        "Failed to close a server socket during disposal.", ex);
                 }
-            }
-        });
+            });
+        }
 
         disposed = true;
-    }
-
-    ~TcpServerConnection()
-    {
-        Dispose(false);
     }
 }

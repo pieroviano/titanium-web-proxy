@@ -1,0 +1,653 @@
+#pragma warning disable CA1416
+#pragma warning disable TWP001
+
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Net;
+using System.Net.Quic;
+using System.Net.Security;
+using System.Net.Sockets;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
+using Titanium.Web.Proxy.Http3;
+using Titanium.Web.Proxy.Http3.Qpack;
+using Titanium.Web.Proxy.RpsLoadProbe.Support;
+
+namespace Titanium.Web.Proxy.RpsLoadProbe;
+
+/// <summary>
+/// Minimal HTTP/3 origin (QUIC) for reverse-h3 saturation. Uses the same QuicListener
+/// pattern as integration tests.
+/// </summary>
+internal sealed class QuicHttp3OriginHost : IAsyncDisposable
+{
+    private readonly X509Certificate2 certificate;
+    private readonly QuicListener listener;
+    private readonly QuicListener? loopbackV4Listener;
+    private readonly CancellationTokenSource cts = new();
+    private readonly byte[] responseBody;
+
+    public QuicHttp3OriginHost(int responseBytes = 0)
+    {
+        responseBody = OriginServer.BuildResponseBody(
+            responseBytes > 0 ? responseBytes : WorkloadOptions.TinyJsonBytes);
+        certificate = LoopbackCertificateAuthority.ServerCertificate;
+
+        // HttpClient "localhost" prefers ::1; other clients use 127.0.0.1. Both families,
+        // same port. A wildcard bind (:: / 0.0.0.0) prompts Windows Defender Firewall.
+        const int maxAttempts = 20;
+        var ipv6 = Socket.OSSupportsIPv6;
+        QuicListener? boundPrimary = null;
+        QuicListener? boundV4 = null;
+        for (var attempt = 1; ; attempt++)
+        {
+            QuicListener? primary = null;
+            try
+            {
+                if (ipv6)
+                {
+                    primary = Listen(new IPEndPoint(IPAddress.IPv6Loopback, 0));
+                    boundV4 = Listen(new IPEndPoint(IPAddress.Loopback, primary.LocalEndPoint.Port));
+                }
+                else
+                {
+                    primary = Listen(new IPEndPoint(IPAddress.Loopback, 0));
+                }
+
+                boundPrimary = primary;
+                break;
+            }
+            catch (Exception ex) when (attempt < maxAttempts && IsUdpAddressInUse(ex))
+            {
+                DisposeListener(primary);
+                DisposeListener(boundV4);
+                boundV4 = null;
+            }
+            catch
+            {
+                DisposeListener(primary);
+                DisposeListener(boundV4);
+                throw;
+            }
+        }
+
+        listener = boundPrimary ?? throw new InvalidOperationException("QUIC origin failed to bind loopback.");
+        loopbackV4Listener = ipv6 ? boundV4 : null;
+        _ = AcceptLoopAsync(listener);
+        if (loopbackV4Listener != null)
+            _ = AcceptLoopAsync(loopbackV4Listener);
+    }
+
+    public int Port => listener.LocalEndPoint.Port;
+
+    private QuicListener Listen(IPEndPoint endPoint)
+    {
+        var options = new QuicListenerOptions
+        {
+            ListenEndPoint = endPoint,
+            ApplicationProtocols = [SslApplicationProtocol.Http3],
+            ConnectionOptionsCallback = (_, _, _) => ValueTask.FromResult(new QuicServerConnectionOptions
+            {
+                DefaultStreamErrorCode = (long)Http3ErrorCode.RequestCancelled,
+                DefaultCloseErrorCode = (long)Http3ErrorCode.NoError,
+                IdleTimeout = TimeSpan.FromSeconds(60),
+                MaxInboundBidirectionalStreams = 256,
+                MaxInboundUnidirectionalStreams = 3,
+                ServerAuthenticationOptions = new SslServerAuthenticationOptions
+                {
+                    ServerCertificate = certificate,
+                    ApplicationProtocols = [SslApplicationProtocol.Http3]
+                }
+            })
+        };
+
+        return QuicListener.ListenAsync(options).AsTask().GetAwaiter().GetResult();
+    }
+
+    private static bool IsUdpAddressInUse(Exception ex)
+    {
+        for (Exception? cur = ex; cur != null; cur = cur.InnerException)
+        {
+            if (cur is SocketException se &&
+                (se.SocketErrorCode == SocketError.AddressAlreadyInUse
+                 || se.NativeErrorCode is 10048 or 98))
+                return true;
+        }
+
+        return false;
+    }
+
+    private static void DisposeListener(QuicListener? quicListener) =>
+        quicListener?.DisposeAsync().AsTask().GetAwaiter().GetResult();
+
+    private async Task AcceptLoopAsync(QuicListener quicListener)
+    {
+        while (!cts.IsCancellationRequested)
+        {
+            QuicConnection connection;
+            try
+            {
+                connection = await quicListener.AcceptConnectionAsync(cts.Token);
+            }
+            catch
+            {
+                return;
+            }
+
+            _ = Task.Run(() => HandleConnectionAsync(connection));
+        }
+    }
+
+    private async Task HandleConnectionAsync(QuicConnection connection)
+    {
+        await using (connection)
+        {
+            try
+            {
+                await using var control = await connection.OpenOutboundStreamAsync(
+                    QuicStreamType.Unidirectional, cts.Token);
+                await control.WriteAsync(new byte[] { (byte)Http3StreamType.Control }, cts.Token);
+                var settings = new Http3Settings();
+                settings.SetQpackMaxTableCapacity(0);
+                settings.SetQpackBlockedStreams(0);
+                await Http3Frame.WriteAsync(control, Http3FrameType.Settings, settings.Serialize(), cts.Token);
+
+                while (!cts.IsCancellationRequested)
+                {
+                    var stream = await connection.AcceptInboundStreamAsync(cts.Token);
+                    if (stream.Type == QuicStreamType.Unidirectional)
+                    {
+                        _ = Task.Run(async () =>
+                        {
+                            await using (stream)
+                            {
+                                var buf = new byte[4096];
+                                while (await stream.ReadAsync(buf, cts.Token) > 0) { }
+                            }
+                        });
+                        continue;
+                    }
+
+                    _ = Task.Run(() => HandleRequestStreamAsync(stream));
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (QuicException) { }
+        }
+    }
+
+    private async Task HandleRequestStreamAsync(QuicStream stream)
+    {
+        await using (stream)
+        {
+            try
+            {
+                var headersFrame = await Http3Frame.ReadAsync(stream, maxPayloadBytes: 64 * 1024, cts.Token);
+                if (headersFrame is null || headersFrame.Type != Http3FrameType.Headers)
+                    return;
+
+                while (true)
+                {
+                    var frame = await Http3Frame.ReadAsync(stream, maxPayloadBytes: 0, cts.Token);
+                    if (frame is null) break;
+                    if (frame.Type == Http3FrameType.Headers)
+                        break;
+                }
+
+                var responseHeaders = QpackEncoder.Encode(
+                [
+                    (":status", "200"),
+                    ("content-type", "application/octet-stream"),
+                    ("content-length", responseBody.Length.ToString())
+                ]);
+                await Http3Frame.WriteAsync(stream, Http3FrameType.Headers, responseHeaders, cts.Token);
+                await Http3Frame.WriteAsync(stream, Http3FrameType.Data, responseBody, cts.Token);
+                stream.CompleteWrites();
+            }
+            catch (OperationCanceledException) { }
+            catch (QuicException) { }
+            catch (Http3ConnectionException) { }
+            catch (Http3StreamException) { }
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        cts.Cancel();
+        try
+        {
+            await listener.DisposeAsync();
+        }
+        finally
+        {
+            if (loopbackV4Listener != null)
+                await loopbackV4Listener.DisposeAsync();
+        }
+
+        cts.Dispose();
+        certificate.Dispose();
+    }
+}
+
+/// <summary>
+/// HTTP/3 load generator over <see cref="QuicConnection"/>. Used for UDP-only
+/// <c>TransparentQuicProxyEndPoint</c> arms (e.g. MITM H3) where HttpClient has no TCP/Alt-Svc
+/// discovery path. Dual-listen reverse H3 uses <c>dotnet-httpclient</c> instead.
+/// </summary>
+internal static class QuicHttp3LoadGenerator
+{
+    public static async Task WarmupAsync(IPEndPoint proxyEndPoint, string sniHost, string authority,
+        int concurrency, TimeSpan duration, CancellationToken cancellationToken,
+        WorkloadOptions? workload = null)
+    {
+        await RunAsync(proxyEndPoint, sniHost, authority, concurrency, duration, collectLatency: false,
+            cancellationToken, workload);
+    }
+
+    public static Task<LoadResult> RunAsync(IPEndPoint proxyEndPoint, string sniHost, string authority,
+        int concurrency, TimeSpan duration, CancellationToken cancellationToken = default,
+        WorkloadOptions? workload = null) =>
+        RunAsync(proxyEndPoint, sniHost, authority, concurrency, duration, collectLatency: true, cancellationToken,
+            workload);
+
+    private static async Task<LoadResult> RunAsync(IPEndPoint proxyEndPoint, string sniHost, string authority,
+        int concurrency, TimeSpan duration, bool collectLatency, CancellationToken cancellationToken,
+        WorkloadOptions? workload = null)
+    {
+        workload ??= WorkloadOptions.TinyGet;
+        var requestBody = workload.RequestBytes > 0 ? new byte[workload.RequestBytes] : null;
+        if (requestBody != null)
+            Array.Fill(requestBody, (byte)'p');
+        var method = workload.Method.ToUpperInvariant();
+        var keepAlive = workload.KeepAlive;
+        var ok = 0L;
+        var errors = 0L;
+        var latencies = collectLatency ? new ConcurrentBag<double>() : null;
+        string? firstError = null;
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+
+        // New-connection mode: one QUIC connection per request. Keep-alive: multiplex across a few.
+        // Lossy UDP: open more connections so 1% DATA drops do not serialize all workers on one path
+        // (keeps TWP÷YARP stable above the 0.50 harder floor under compare-lossy).
+        var connectionCount = !keepAlive
+            ? concurrency
+            : workload.IsLossy
+                ? Math.Clamp(concurrency / 4, 2, 16)
+                : Math.Clamp(concurrency / 8, 1, 8);
+        var connections = new QuicConnection?[connectionCount];
+        var connectionLocks = new object[connectionCount];
+        // Critical H3 unidirectional streams must stay open for the connection lifetime
+        // (closing them is H3_CLOSED_CRITICAL_STREAM = 0x104 / 260 — many server stacks abort).
+        var retainedUnidirectional = new ConcurrentBag<QuicStream>();
+        for (var i = 0; i < connectionCount; i++)
+            connectionLocks[i] = new object();
+
+        try
+        {
+            // Establish keep-alive sockets before starting the measure CancelAfter budget.
+            // Lossy UDP shims can need > measure-duration to finish the first MsQuic handshake;
+            // tying connect to CancelAfter(duration) produced false 100% TaskCanceled failures.
+            if (keepAlive)
+            {
+                for (var c = 0; c < connectionCount; c++)
+                {
+                    try
+                    {
+                        connections[c] = await ConnectAsync(proxyEndPoint, sniHost, cancellationToken,
+                            workload.IsLossy);
+                        await OpenControlAsync(connections[c]!, retainedUnidirectional, cancellationToken);
+                        DrainInbound(connections[c]!, cts.Token);
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException
+                                              || !cancellationToken.IsCancellationRequested)
+                    {
+                        // Lossy UDP / MsQuic can fail the first connect; workers reconnect or count errors.
+                        if (firstError == null)
+                        {
+                            firstError = ex.GetType().Name + ": " + ex.Message;
+                            ProbeLog.Error($"  [quic-h3] keep-alive connect: {firstError}");
+                        }
+
+                        connections[c] = null;
+                    }
+                }
+            }
+
+            cts.CancelAfter(duration);
+            var sw = Stopwatch.StartNew();
+            var workers = new Task[concurrency];
+            for (var i = 0; i < concurrency; i++)
+            {
+                var workerId = i;
+                workers[i] = Task.Run(async () =>
+                {
+                    var slot = workerId % connectionCount;
+                    while (!cts.IsCancellationRequested)
+                    {
+                        QuicConnection? connection = null;
+                        var owned = false;
+                        if (keepAlive)
+                        {
+                            lock (connectionLocks[slot])
+                                connection = connections[slot];
+                        }
+
+                        if (connection == null)
+                        {
+                            try
+                            {
+                                connection = await ConnectAsync(proxyEndPoint, sniHost, cts.Token, workload.IsLossy);
+                                await OpenControlAsync(connection, retainedUnidirectional, cts.Token);
+                                DrainInbound(connection, cts.Token);
+                                if (keepAlive)
+                                {
+                                    lock (connectionLocks[slot])
+                                        connections[slot] = connection;
+                                }
+                                else
+                                {
+                                    owned = true;
+                                }
+                            }
+                            catch (OperationCanceledException) when (cts.IsCancellationRequested)
+                            {
+                                break;
+                            }
+                            catch (Exception ex)
+                            {
+                                if (firstError == null)
+                                {
+                                    firstError = ex.GetType().Name + ": " + ex.Message;
+                                    ProbeLog.Error($"  [quic-h3] {firstError}");
+                                }
+
+                                Interlocked.Increment(ref errors);
+                                break;
+                            }
+                        }
+
+                        var requestSw = collectLatency ? Stopwatch.StartNew() : null;
+                        try
+                        {
+                            var status = await SendRequestAsync(connection, authority, "/", method, requestBody,
+                                workload, cts.Token);
+                            if (status is >= 200 and < 300)
+                                Interlocked.Increment(ref ok);
+                            else
+                            {
+                                Interlocked.Increment(ref errors);
+                                if (firstError == null)
+                                {
+                                    firstError = "non-2xx status=" + status;
+                                    ProbeLog.Error($"  [quic-h3] {firstError}");
+                                }
+                            }
+
+                            if (requestSw != null)
+                            {
+                                requestSw.Stop();
+                                latencies!.Add(requestSw.Elapsed.TotalMilliseconds);
+                            }
+                        }
+                        catch (OperationCanceledException) when (cts.IsCancellationRequested)
+                        {
+                            break;
+                        }
+                        catch (Exception ex)
+                        {
+                            var msg = ex.GetType().Name + ": " + ex.Message;
+                            if (firstError == null)
+                            {
+                                firstError = msg;
+                                ProbeLog.Error($"  [quic-h3] {firstError}");
+                            }
+
+                            Interlocked.Increment(ref errors);
+                            if (requestSw != null)
+                            {
+                                requestSw.Stop();
+                                latencies!.Add(requestSw.Elapsed.TotalMilliseconds);
+                            }
+
+                            if (keepAlive)
+                            {
+                                QuicConnection? dead;
+                                lock (connectionLocks[slot])
+                                {
+                                    dead = connections[slot];
+                                    connections[slot] = null;
+                                }
+
+                                if (dead != null)
+                                {
+                                    try
+                                    {
+                                        await dead.DisposeAsync();
+                                    }
+                                    catch
+                                    {
+                                        // ignore
+                                    }
+                                }
+                            }
+                        }
+                        finally
+                        {
+                            if (owned && connection != null)
+                            {
+                                try
+                                {
+                                    await connection.DisposeAsync();
+                                }
+                                catch
+                                {
+                                    // ignore
+                                }
+                            }
+                        }
+                    }
+                }, CancellationToken.None);
+            }
+
+            await Task.WhenAll(workers);
+            sw.Stop();
+
+            var elapsed = Math.Max(sw.Elapsed.TotalSeconds, 0.001);
+            var total = ok + errors;
+            var samples = latencies?.ToArray() ?? Array.Empty<double>();
+            Array.Sort(samples);
+
+            return new LoadResult(
+                Generator: "quic-http3",
+                Concurrency: concurrency,
+                DurationSeconds: elapsed,
+                Ok: ok,
+                Errors: errors,
+                Rps: ok / elapsed,
+                ErrorRatePercent: total == 0 ? 100 : 100.0 * errors / total,
+                P50Ms: Percentile(samples, 0.50),
+                P99Ms: Percentile(samples, 0.99),
+                MaxMs: samples.Length == 0 ? 0 : samples[^1],
+                NegotiatedVersionHint: "3.0");
+        }
+        finally
+        {
+            while (retainedUnidirectional.TryTake(out var uni))
+            {
+                try
+                {
+                    await uni.DisposeAsync();
+                }
+                catch
+                {
+                    // ignore
+                }
+            }
+
+            for (var c = 0; c < connectionCount; c++)
+            {
+                if (connections[c] != null)
+                {
+                    try
+                    {
+                        await connections[c]!.DisposeAsync();
+                    }
+                    catch
+                    {
+                        // ignore
+                    }
+                }
+            }
+        }
+    }
+
+    private static async Task<QuicConnection> ConnectAsync(IPEndPoint endpoint, string sniHost,
+        CancellationToken cancellationToken, bool lossy = false)
+    {
+        var options = new QuicClientConnectionOptions
+        {
+            RemoteEndPoint = endpoint,
+            DefaultStreamErrorCode = (long)Http3ErrorCode.RequestCancelled,
+            DefaultCloseErrorCode = (long)Http3ErrorCode.NoError,
+            MaxInboundBidirectionalStreams = 0,
+            MaxInboundUnidirectionalStreams = 3,
+            ClientAuthenticationOptions = new SslClientAuthenticationOptions
+            {
+                ApplicationProtocols = [SslApplicationProtocol.Http3],
+                TargetHost = sniHost,
+                RemoteCertificateValidationCallback = static (_, _, _, _) => true
+            }
+        };
+        // Lossy UDP / stalled networks can hang MsQuic connect; bound it so the ramp progresses.
+        // Userspace delay shim adds RTT on every datagram — allow a longer handshake budget.
+        var connectSeconds = lossy ? 20 : 5;
+        using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        connectCts.CancelAfter(TimeSpan.FromSeconds(connectSeconds));
+        return await QuicConnection.ConnectAsync(options, connectCts.Token).AsTask()
+            .WaitAsync(TimeSpan.FromSeconds(connectSeconds + 1), cancellationToken);
+    }
+
+    private static async Task OpenControlAsync(QuicConnection connection,
+        ConcurrentBag<QuicStream> retainedUnidirectional, CancellationToken cancellationToken)
+    {
+        // Bound like ConnectAsync — MsQuic OpenOutboundStream can stall without honoring CT.
+        using var openCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        openCts.CancelAfter(TimeSpan.FromSeconds(5));
+        var ct = openCts.Token;
+
+        var control = await connection.OpenOutboundStreamAsync(QuicStreamType.Unidirectional, ct)
+            .AsTask().WaitAsync(TimeSpan.FromSeconds(6), cancellationToken);
+        retainedUnidirectional.Add(control);
+        await control.WriteAsync(new byte[] { (byte)Http3StreamType.Control }, ct);
+        var settings = new Http3Settings();
+        settings.SetQpackMaxTableCapacity(0);
+        settings.SetQpackBlockedStreams(0);
+        await Http3Frame.WriteAsync(control, Http3FrameType.Settings, settings.Serialize(), ct);
+
+        // RFC 9114: QPACK encoder/decoder streams are critical; open them even with table capacity 0.
+        var qpackEncoder = await connection.OpenOutboundStreamAsync(QuicStreamType.Unidirectional, ct)
+            .AsTask().WaitAsync(TimeSpan.FromSeconds(6), cancellationToken);
+        retainedUnidirectional.Add(qpackEncoder);
+        await qpackEncoder.WriteAsync(new byte[] { (byte)Http3StreamType.QpackEncoder }, ct);
+
+        var qpackDecoder = await connection.OpenOutboundStreamAsync(QuicStreamType.Unidirectional, ct)
+            .AsTask().WaitAsync(TimeSpan.FromSeconds(6), cancellationToken);
+        retainedUnidirectional.Add(qpackDecoder);
+        await qpackDecoder.WriteAsync(new byte[] { (byte)Http3StreamType.QpackDecoder }, ct);
+    }
+
+    private static void DrainInbound(QuicConnection connection, CancellationToken cancellationToken)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                while (!cancellationToken.IsCancellationRequested)
+                {
+                    var stream = await connection.AcceptInboundStreamAsync(cancellationToken);
+                    _ = Task.Run(async () =>
+                    {
+                        await using (stream)
+                        {
+                            var buf = new byte[4096];
+                            while (await stream.ReadAsync(buf, cancellationToken) > 0) { }
+                        }
+                    });
+                }
+            }
+            catch
+            {
+                // connection closed
+            }
+        });
+    }
+
+    private static async Task<int> SendRequestAsync(QuicConnection connection, string authority, string path,
+        string method, byte[]? requestBody, WorkloadOptions workload, CancellationToken cancellationToken)
+    {
+        // Measure CancelAfter alone is not enough — MsQuic ReadAsync can ignore CT on a stalled stream.
+        using var reqCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        reqCts.CancelAfter(TimeSpan.FromSeconds(30));
+        return await SendRequestCoreAsync(connection, authority, path, method, requestBody, workload, reqCts.Token)
+            .WaitAsync(TimeSpan.FromSeconds(35), cancellationToken);
+    }
+
+    private static async Task<int> SendRequestCoreAsync(QuicConnection connection, string authority, string path,
+        string method, byte[]? requestBody, WorkloadOptions workload, CancellationToken cancellationToken)
+    {
+        await using var stream = await connection.OpenOutboundStreamAsync(
+            QuicStreamType.Bidirectional, cancellationToken);
+
+        var headerList = new List<(string, string)>
+        {
+            (":method", method),
+            (":scheme", "https"),
+            (":authority", authority),
+            (":path", path)
+        };
+        if (requestBody != null)
+            headerList.Add(("content-length", requestBody.Length.ToString()));
+
+        var headers = QpackEncoder.Encode(headerList);
+        await Http3Frame.WriteAsync(stream, Http3FrameType.Headers, headers, cancellationToken);
+        if (requestBody != null)
+            await Http3Frame.WriteAsync(stream, Http3FrameType.Data, requestBody, cancellationToken);
+        stream.CompleteWrites();
+
+        var headersFrame = await Http3Frame.ReadAsync(stream, maxPayloadBytes: 64 * 1024, cancellationToken);
+        if (headersFrame is null || headersFrame.Type != Http3FrameType.Headers)
+            throw new InvalidOperationException("Expected response HEADERS frame.");
+
+        var decoded = QpackDecoder.Decode(headersFrame.Payload.Span);
+        var status = 0;
+        foreach (var (name, value) in decoded)
+        {
+            if (name == ":status" && int.TryParse(value, out var code))
+                status = code;
+        }
+
+        var sleep = workload.IsSlowConsumer ? Math.Max(0, workload.ClientReadSleepMs) : 0;
+        while (true)
+        {
+            // Drain DATA (large bodies) — 1 MiB cap per frame is enough for our probe sizes.
+            var frame = await Http3Frame.ReadAsync(stream, maxPayloadBytes: 1024 * 1024, cancellationToken);
+            if (frame is null) break;
+            if (frame.Type == Http3FrameType.Headers)
+                break;
+            if (sleep > 0 && frame.Type == Http3FrameType.Data && frame.Payload.Length > 0)
+                await Task.Delay(sleep, cancellationToken);
+        }
+
+        return status;
+    }
+
+    private static double Percentile(double[] sorted, double p)
+    {
+        if (sorted.Length == 0) return 0;
+        var index = (int)Math.Clamp(Math.Ceiling(p * sorted.Length) - 1, 0, sorted.Length - 1);
+        return sorted[index];
+    }
+}
+
+#pragma warning restore TWP001
+#pragma warning restore CA1416

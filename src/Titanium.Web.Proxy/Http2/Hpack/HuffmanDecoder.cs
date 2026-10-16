@@ -20,7 +20,7 @@ using System.IO;
 
 namespace Titanium.Web.Proxy.Http2.Hpack;
 
-public class HuffmanDecoder
+internal class HuffmanDecoder
 {
     /// <summary>
     ///     Huffman Decoder
@@ -66,29 +66,45 @@ public class HuffmanDecoder
             int b = buf[i];
             current = (current << 8) | b;
             bits += 8;
-            while (bits >= 8)
-            {
-                var c = (current >> (bits - 8)) & 0xFF;
-                node = node.Children![c];
-                bits -= node.Bits;
-                if (node.IsTerminal)
-                {
-                    if (node.Symbol == HpackUtil.HuffmanEos) throw new IOException("EOS Decoded");
-
-                    resultBuf[resultSize++] = (byte)node.Symbol;
-                    node = root;
-                }
-            }
+            DecodeCompleteBytes(current, ref bits, ref node, resultBuf, ref resultSize);
         }
 
+        DecodeTrailingBits(current, ref bits, ref node, resultBuf, ref resultSize);
+
+        var mask = (1 << bits) - 1;
+        if ((current & mask) != mask) throw new IOException("Invalid Padding");
+
+        return resultBuf.AsMemory(0, resultSize);
+    }
+
+    private void DecodeCompleteBytes(int current, ref int bits, ref Node node, byte[] result,
+        ref int resultSize)
+    {
+        while (bits >= 8)
+        {
+            var c = (current >> (bits - 8)) & 0xFF;
+            node = GetChild(node, c);
+            bits -= node.Bits;
+            if (!node.IsTerminal) continue;
+
+            if (node.Symbol == HpackUtil.HuffmanEos) throw new IOException("EOS Decoded");
+
+            result[resultSize++] = (byte)node.Symbol;
+            node = root;
+        }
+    }
+
+    private void DecodeTrailingBits(int current, ref int bits, ref Node node, byte[] result,
+        ref int resultSize)
+    {
         while (bits > 0)
         {
             var c = (current << (8 - bits)) & 0xFF;
-            node = node.Children![c];
+            node = GetChild(node, c);
             if (node.IsTerminal && node.Bits <= bits)
             {
                 bits -= node.Bits;
-                resultBuf[resultSize++] = (byte)node.Symbol;
+                result[resultSize++] = (byte)node.Symbol;
                 node = root;
             }
             else
@@ -96,14 +112,13 @@ public class HuffmanDecoder
                 break;
             }
         }
+    }
 
-        // Section 5.2. String Literal Representation
-        // Padding not corresponding to the most significant bits of the code
-        // for the EOS symbol (0xFF) MUST be treated as a decoding error.
-        var mask = (1 << bits) - 1;
-        if ((current & mask) != mask) throw new IOException("Invalid Padding");
-
-        return resultBuf.AsMemory(0, resultSize);
+    private static Node GetChild(Node node, int index)
+    {
+        var children = node.Children ??
+                       throw new IOException("Invalid Huffman code: terminal node has trailing bits.");
+        return children[index] ?? throw new IOException("Invalid Huffman code.");
     }
 
     private static Node BuildTree(int[] codes, byte[] lengths)
@@ -124,19 +139,23 @@ public class HuffmanDecoder
 
             length -= 8;
             var i = (code >> length) & 0xFF;
-            if (current.Children![i] == null) current.Children[i] = new Node();
+            var children = current.Children ??
+                           throw new InvalidDataException("invalid Huffman code: terminal node has trailing bits");
+            children[i] ??= new Node();
 
-            current = current.Children[i];
+            current = children[i]!;
         }
 
         var terminal = new Node(symbol, length);
         var shift = 8 - length;
         var start = (code << shift) & 0xFF;
         var end = 1 << shift;
-        for (var i = start; i < start + end; i++) current.Children![i] = terminal;
+        var currentChildren = current.Children ??
+                              throw new InvalidDataException("invalid Huffman code: prefix not unique");
+        for (var i = start; i < start + end; i++) currentChildren[i] = terminal;
     }
 
-    private class Node
+    private sealed class Node
     {
         /// <summary>
         ///     Initializes a new instance of the <see cref="HuffmanDecoder" /> class.
@@ -145,7 +164,7 @@ public class HuffmanDecoder
         {
             Symbol = 0;
             Bits = 8;
-            Children = new Node[256];
+            Children = new Node?[256];
         }
 
         /// <summary>
@@ -155,7 +174,6 @@ public class HuffmanDecoder
         /// <param name="bits">the number of bits matched by this node</param>
         public Node(int symbol, int bits)
         {
-            //assert(bits > 0 && bits <= 8);
             Symbol = symbol;
             Bits = bits;
             Children = null;
@@ -168,7 +186,7 @@ public class HuffmanDecoder
         public int Bits { get; }
 
         // internal nodes have children
-        public Node[]? Children { get; }
+        public Node?[]? Children { get; }
 
         public bool IsTerminal => Children == null;
     }

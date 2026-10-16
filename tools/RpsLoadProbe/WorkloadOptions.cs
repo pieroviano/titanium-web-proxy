@@ -1,0 +1,262 @@
+using System.Net.Http;
+using System.Text;
+
+namespace Titanium.Web.Proxy.RpsLoadProbe;
+
+/// <summary>
+/// Workload knobs for saturation arms. Defaults preserve the historical tiny-GET loopback matrix.
+/// </summary>
+internal sealed class WorkloadOptions
+{
+    public static readonly int TinyJsonBytes =
+        Encoding.UTF8.GetByteCount(OriginServer.ResponseBody);
+
+    public string Method { get; init; } = "GET";
+    public int ResponseBytes { get; init; } = TinyJsonBytes;
+    public int RequestBytes { get; init; }
+    public bool KeepAlive { get; init; } = true;
+    public int DelayMs { get; init; }
+    public double LossPercent { get; init; }
+    public bool CaptureTlsTiming { get; init; }
+    public int ClientReadChunkBytes { get; init; }
+    public int ClientReadSleepMs { get; init; }
+    public int EarlyResponseAfterBytes { get; init; }
+    public bool IsDuplexHttp { get; init; }
+    public bool IsWebSocket { get; init; }
+    /// <summary>
+    /// RFC 8441 extended CONNECT WebSocket over HTTP/2 (compare-ws-h2). Implies <see cref="IsWebSocket"/>.
+    /// </summary>
+    public bool IsHttp2WebSocket { get; init; }
+    /// <summary>Unary gRPC Echo over H2 TLS (compare-grpc arms).</summary>
+    public bool IsGrpc { get; init; }
+    /// <summary>Optional extra request headers (e.g. Authorization Bearer for JWT edition arm).</summary>
+    public IReadOnlyDictionary<string, string>? ExtraHeaders { get; init; }
+
+    public bool IsLossy => DelayMs > 0 || LossPercent > 0;
+    public bool IsHeavyBody => ResponseBytes > TinyJsonBytes || RequestBytes > 0;
+    public bool IsHandshake => !KeepAlive;
+    public bool IsSlowConsumer => ClientReadChunkBytes > 0 && ClientReadSleepMs > 0;
+    public bool IsEarlyResponse => EarlyResponseAfterBytes > 0;
+    public bool IsArchitectureSensitive =>
+        IsSlowConsumer || IsEarlyResponse || IsDuplexHttp || IsWebSocket || IsHttp2WebSocket;
+
+    public HttpMethod HttpMethod =>
+        string.Equals(Method, "POST", StringComparison.OrdinalIgnoreCase)
+            ? HttpMethod.Post
+            : HttpMethod.Get;
+
+    public static WorkloadOptions TinyGet { get; } = new();
+
+    public static WorkloadOptions ForBodyGet(int responseBytes) => new()
+    {
+        Method = "GET",
+        ResponseBytes = responseBytes,
+        KeepAlive = true
+    };
+
+    public static WorkloadOptions ForPost(int requestBytes, int responseBytes) => new()
+    {
+        Method = "POST",
+        RequestBytes = requestBytes,
+        ResponseBytes = responseBytes,
+        KeepAlive = true
+    };
+
+    public static WorkloadOptions ForLossy(int responseBytes, int delayMs, double lossPercent) => new()
+    {
+        Method = "GET",
+        ResponseBytes = responseBytes,
+        KeepAlive = true,
+        DelayMs = delayMs,
+        LossPercent = lossPercent
+    };
+
+    public static WorkloadOptions ForTlsKeepAlive(int responseBytes) => new()
+    {
+        Method = "GET",
+        ResponseBytes = responseBytes,
+        KeepAlive = true,
+        CaptureTlsTiming = false
+    };
+
+    public static WorkloadOptions ForTlsNewConnection() => new()
+    {
+        Method = "GET",
+        ResponseBytes = TinyJsonBytes,
+        KeepAlive = false,
+        // RPS fairness: do not enable TWP-only timing capture on the NC arm (YARP has no equivalent).
+        // Set TWP_RPS_CAPTURE_TLS=1 manually when collecting ClientTlsTiming.
+        CaptureTlsTiming = false
+    };
+
+    public static WorkloadOptions ForSlowConsumer() => new()
+    {
+        Method = "GET",
+        ResponseBytes = 256 * 1024,
+        KeepAlive = true,
+        ClientReadChunkBytes = 16 * 1024,
+        ClientReadSleepMs = 8
+    };
+
+    public static WorkloadOptions ForEarlyResponse() => new()
+    {
+        Method = "POST",
+        RequestBytes = 64 * 1024,
+        ResponseBytes = 64 * 1024,
+        KeepAlive = true,
+        EarlyResponseAfterBytes = 8 * 1024
+    };
+
+    public static WorkloadOptions ForDuplexH2() => new()
+    {
+        Method = "POST",
+        RequestBytes = 64 * 1024,
+        ResponseBytes = 64 * 1024,
+        KeepAlive = true,
+        EarlyResponseAfterBytes = 8 * 1024,
+        IsDuplexHttp = true
+    };
+
+    public static WorkloadOptions ForWebSocket() => new()
+    {
+        Method = "GET",
+        KeepAlive = true,
+        IsWebSocket = true
+    };
+
+    /// <summary>RFC 8441 extended CONNECT WebSocket over H2 TLS → H1 plain origin.</summary>
+    public static WorkloadOptions ForHttp2WebSocket() => new()
+    {
+        Method = "GET",
+        KeepAlive = true,
+        IsWebSocket = true,
+        IsHttp2WebSocket = true
+    };
+
+    public static WorkloadOptions ForGrpc() => new()
+    {
+        Method = "GET",
+        KeepAlive = true,
+        IsGrpc = true
+    };
+
+    public WorkloadOptions WithCaptureTlsTiming(bool capture) => Copy(captureTlsTiming: capture);
+
+    public WorkloadOptions WithExtraHeaders(IReadOnlyDictionary<string, string>? headers) =>
+        Copy(extraHeaders: headers);
+
+    public WorkloadOptions Copy(
+        string? method = null,
+        int? responseBytes = null,
+        int? requestBytes = null,
+        bool? keepAlive = null,
+        int? delayMs = null,
+        double? lossPercent = null,
+        bool? captureTlsTiming = null,
+        int? clientReadChunkBytes = null,
+        int? clientReadSleepMs = null,
+        int? earlyResponseAfterBytes = null,
+        bool? isDuplexHttp = null,
+        bool? isWebSocket = null,
+        bool? isHttp2WebSocket = null,
+        bool? isGrpc = null,
+        IReadOnlyDictionary<string, string>? extraHeaders = null,
+        bool replaceExtraHeaders = false) => new()
+    {
+        Method = method ?? Method,
+        ResponseBytes = responseBytes ?? ResponseBytes,
+        RequestBytes = requestBytes ?? RequestBytes,
+        KeepAlive = keepAlive ?? KeepAlive,
+        DelayMs = delayMs ?? DelayMs,
+        LossPercent = lossPercent ?? LossPercent,
+        CaptureTlsTiming = captureTlsTiming ?? CaptureTlsTiming,
+        ClientReadChunkBytes = clientReadChunkBytes ?? ClientReadChunkBytes,
+        ClientReadSleepMs = clientReadSleepMs ?? ClientReadSleepMs,
+        EarlyResponseAfterBytes = earlyResponseAfterBytes ?? EarlyResponseAfterBytes,
+        IsDuplexHttp = isDuplexHttp ?? IsDuplexHttp,
+        IsWebSocket = isWebSocket ?? IsWebSocket,
+        IsHttp2WebSocket = isHttp2WebSocket ?? IsHttp2WebSocket,
+        IsGrpc = isGrpc ?? IsGrpc,
+        ExtraHeaders = replaceExtraHeaders ? extraHeaders : (extraHeaders ?? ExtraHeaders)
+    };
+
+    public double ResolveP99SloMs(double http1, double http2, double http3, double httpsMitm,
+        ProbeMode mode)
+    {
+        if (IsArchitectureSensitive)
+            return 5000;
+        if (IsLossy)
+            return 2000;
+        if (IsHandshake)
+        {
+            // Win/Linux .NET clears 200 ms at c=64 (p99 ~90–110). macOS-15-intel SslStream
+            // new-connection TLS sits ~70 RPS with c=8 p99 often 200–400 ms for both TWP and
+            // YARP (nginx/HAProxy still pass 200). Same peer SLO on Mac — do not loosen Win/Linux.
+            if (OperatingSystem.IsMacOS())
+                return 500;
+            return 200;
+        }
+        if (IsHeavyBody)
+            return 500;
+
+        return mode switch
+        {
+            ProbeMode.HttpsMitm or ProbeMode.ReverseHttp1Mitm
+                or ProbeMode.ExplicitHttp1Multi or ProbeMode.ExplicitHttp2Multi =>
+                httpsMitm,
+            _ when PeerWire.TryGet(mode, out var wire) &&
+                   wire.Inbound is PeerInboundProto.H2c or PeerInboundProto.H2Tls =>
+                http2,
+            _ when PeerWire.TryGet(mode, out var h3Wire) && h3Wire.Inbound == PeerInboundProto.H3 =>
+                http3,
+            ProbeMode.ReverseHttp2 or ProbeMode.ReverseHttp2Cleartext or ProbeMode.ReverseHttp2ToH2c
+                or ProbeMode.YarpReverseHttp2 or ProbeMode.YarpReverseHttp2ToH2c
+                or ProbeMode.YarpReverseHttp2ToHttps or ProbeMode.YarpReverseHttp2ToHttpsHttp1
+                or ProbeMode.ReverseH2c or ProbeMode.ReverseH2cToH2c or ProbeMode.ReverseH2cToH1
+                or ProbeMode.ReverseH2cToHttps or ProbeMode.YarpReverseH2cToHttps
+                or ProbeMode.YarpReverseH2c or ProbeMode.YarpReverseH2cToH2c or ProbeMode.YarpReverseH2cToH1
+                or ProbeMode.NginxReverseHttp2 or ProbeMode.NginxReverseHttp2ToHttpsHttp1
+                or ProbeMode.HaproxyReverseHttp2 or ProbeMode.HaproxyReverseHttp2ToHttpsHttp1
+                or ProbeMode.EnvoyReverseHttp2 or ProbeMode.EnvoyReverseHttp2ToHttpsHttp1
+                or ProbeMode.ReverseHttp2ToHttp3 or ProbeMode.YarpReverseHttp2ToHttp3
+                or ProbeMode.ReverseH2cToH3 or ProbeMode.YarpReverseH2cToH3
+                or ProbeMode.MitmHttp2ToHttp1 =>
+                http2,
+            ProbeMode.ReverseHttp3 or ProbeMode.ReverseHttp3Cleartext or ProbeMode.YarpReverseHttp3Cleartext
+                or ProbeMode.NginxReverseHttp3Cleartext or ProbeMode.NginxReverseHttp3ToHttpsHttp1
+                or ProbeMode.HaproxyReverseHttp3Cleartext or ProbeMode.HaproxyReverseHttp3ToHttpsHttp1
+                or ProbeMode.EnvoyReverseHttp3Cleartext or ProbeMode.EnvoyReverseHttp3ToHttpsHttp1
+                or ProbeMode.ReverseHttp3ToHttp2 or ProbeMode.YarpReverseHttp3ToHttp2
+                or ProbeMode.ReverseHttp3ToH2c or ProbeMode.YarpReverseHttp3ToH2c
+                or ProbeMode.YarpReverseHttp3ToHttp3 or ProbeMode.YarpReverseHttp3ToHttpsHttp1
+                or ProbeMode.ReverseHttp1ToHttp3 or ProbeMode.YarpReverseHttp1ToHttp3
+                or ProbeMode.ReverseHttp1PlainToHttp3 or ProbeMode.YarpReverseHttp1PlainToHttp3
+                or ProbeMode.MitmHttp3ToHttp1 => http3,
+            _ => http1
+        };
+    }
+
+    public string Suffix
+    {
+        get
+        {
+            var suffix =
+                $"{Method.ToLowerInvariant()}-r{ResponseBytes}-q{RequestBytes}-{(KeepAlive ? "ka" : "nc")}";
+            if (IsLossy)
+                suffix += $"-d{DelayMs}-l{LossPercent.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture)}";
+            if (IsSlowConsumer)
+                suffix += $"-slow{ClientReadChunkBytes}-{ClientReadSleepMs}";
+            if (IsEarlyResponse)
+                suffix += $"-early{EarlyResponseAfterBytes}";
+            if (IsDuplexHttp)
+                suffix += "-duplex";
+            if (IsHttp2WebSocket)
+                suffix += "-ws-h2";
+            else if (IsWebSocket)
+                suffix += "-ws";
+            if (IsGrpc)
+                suffix += "-grpc";
+            return suffix;
+        }
+    }
+}

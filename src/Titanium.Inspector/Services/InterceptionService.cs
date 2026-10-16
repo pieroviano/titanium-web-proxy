@@ -1,0 +1,3408 @@
+using System.Collections.Concurrent;
+using System.Net;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
+using System.Threading.Channels;
+using Microsoft.Extensions.Logging;
+using Titanium.Inspector.ViewModels;
+using Titanium.Web.Proxy;
+using Titanium.Web.Proxy.Abstractions.Plugins;
+using Titanium.Web.Proxy.Diagnostics;
+using Titanium.Web.Proxy.EventArguments;
+using Titanium.Web.Proxy.Http;
+using Titanium.Web.Proxy.Models;
+using Titanium.Web.Proxy.Network;
+
+namespace Titanium.Inspector.Services;
+
+/// <summary>
+/// Explicit MITM capture: full request/response bodies, system proxy, CA trust/export,
+/// capture pause, AutoResponder, breakpoints, and light script hooks.
+/// </summary>
+public sealed class InterceptionService : IDisposable
+{
+    public const int MaxBodyBytes = InspectorBodyLimits.MaxBodyBytes;
+    public const int MaxBodyTextChars = InspectorBodyLimits.MaxBodyTextChars;
+
+    private long _nextId;
+    private readonly ConcurrentDictionary<object, SessionSnapshot> _live = new();
+    private readonly ConcurrentDictionary<object, SessionEventBuffer> _eventNotes = new();
+    private readonly RunLogRing _runLog = new(2000);
+    private InspectorFileLogProvider? _fileLog;
+
+    /// <summary>In-memory run log. The same instance is reused across logging rebuilds.</summary>
+    public RunLogRing RunLog => _runLog;
+
+    /// <summary>Active dated log file path when file logging is on; null otherwise.</summary>
+    public string? CurrentLogFilePath => _fileLog?.CurrentFilePath;
+    private readonly ISystemProxyController _systemProxy;
+    private ProxyServer? _proxy;
+    private ExplicitProxyEndPoint? _endPoint;
+    private bool _systemProxyEnabled;
+    private int _shutdownStarted;
+    private readonly ManualResetEventSlim _shutdownCompleted = new(false);
+    private string? _rootPfxPath;
+    private InspectorSettings? _loggingSettings;
+    private Channel<ProcessResolveWork>? _processResolveChannel;
+    private CancellationTokenSource? _processResolveCts;
+    private NetworkThrottleProfile? _throttleProfile;
+    private LinkShaper? _linkShaper;
+    private readonly ConcurrentDictionary<object, ExchangeThrottleState> _exchange = new();
+
+    /// <summary>
+    ///     Serializes fire-and-forget trust cleanup: Firefox prefs/HKCU/policies and Personal-store
+    ///     prune. Rapid Clear+Install / Install / Untrust must not interleave ClearRootTrust,
+    ///     EnableEnterpriseRoots, and My-store prune (prefs locks + Crypt32 contention).
+    /// </summary>
+    private readonly object _firefoxTrustBgGate = new();
+    private readonly Queue<FirefoxTrustBgQueued> _firefoxTrustBgQueue = new();
+    private bool _firefoxTrustBgRunning;
+    private TaskCompletionSource _firefoxTrustBgIdle = CreateCompletedFirefoxTrustIdle();
+
+    private enum FirefoxTrustBgKind
+    {
+        Clear,
+        Enable,
+        Prune,
+    }
+
+    private readonly record struct FirefoxTrustBgQueued(FirefoxTrustBgKind Kind, Action Work);
+
+    private static TaskCompletionSource CreateCompletedFirefoxTrustIdle()
+    {
+        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        tcs.SetResult();
+        return tcs;
+    }
+
+    private readonly record struct ProcessResolveWork(SessionSnapshot Snap, Lazy<int> ProcessId);
+
+    public InterceptionService(ISystemProxyController? systemProxy = null)
+    {
+        _systemProxy = systemProxy ?? new ProxyServerSystemProxyController();
+    }
+
+    public bool IsRunning => _proxy?.ProxyRunning == true;
+
+    /// <summary>OS-assigned listen port after <see cref="StartAsync"/> (supports <c>port == 0</c>).</summary>
+    public int BoundPort { get; private set; }
+
+    /// <summary>When false, the listener stays up but sessions are not published to the grid.</summary>
+    public bool Capturing { get; set; } = true;
+
+    /// <summary>
+    /// When false, HTTPS CONNECT tunnels stay opaque (no MITM). Endpoint still has decrypt capability;
+    /// <see cref="OnBeforeTunnelConnect"/> gates per-request <c>DecryptSsl</c>.
+    /// </summary>
+    public bool DecryptHttps { get; set; }
+
+    /// <summary>
+    /// When true, origin TLS handshake failures under MITM train an in-memory host bypass.
+    /// Default on for Inspector; wired to <see cref="ProxyServer.EnableDecryptFailureBypass"/>.
+    /// </summary>
+    public bool EnableDecryptFailureBypass { get; set; } = true;
+
+    /// <summary>Extra host patterns that skip HTTPS decryption (in addition to built-in bypasses).</summary>
+    public List<string> DecryptSkipHosts { get; set; } = [];
+
+    /// <summary>When non-empty, only these hosts are decrypted (built-in bypasses still never decrypt).</summary>
+    public List<string> DecryptOnlyHosts { get; set; } = [];
+
+    /// <summary>User WinINET bypass patterns when System proxy is on.</summary>
+    public List<string> SystemProxyBypassHosts { get; set; } = [];
+
+    /// <summary>Proxy localhost through the system proxy when enabled.</summary>
+    public bool ProxyLoopback { get; set; } = true;
+
+    public InspectorSettings? SystemProxySettings { get; set; }
+
+    /// <summary>True when the OS can host QUIC (MsQuic / <c>QuicListener.IsSupported</c>).</summary>
+    public static bool IsHttp3Supported => System.Net.Quic.QuicListener.IsSupported;
+
+    /// <summary>
+    /// When set (tests), skip the Windows certificate store and track trust in-memory.
+    /// Avoids modal "Root Certificate Store" UI that hangs headless / CI runs.
+    /// Also suppresses CertificateManager Root-store CryptUI when the proxy is started.
+    /// </summary>
+    public bool UseInMemoryTrustState
+    {
+        get => _useInMemoryTrustState;
+        set
+        {
+            _useInMemoryTrustState = value;
+            if (value)
+                CertificateManager.SuppressInteractiveRootStoreMutations = true;
+        }
+    }
+
+    private bool _useInMemoryTrustState;
+
+    /// <summary>Test seam: next <see cref="InstallRootCertificate"/> returns false once (forces elevate path).</summary>
+    public bool FailNextUserTrustInstall { get; set; }
+
+    private bool _inMemoryTrusted;
+
+    public bool SystemProxyEnabled => _systemProxyEnabled;
+    public X509Certificate2? RootCertificate => _proxy?.CertificateManager.RootCertificate;
+    public bool IsRootTrusted { get; private set; }
+
+    /// <summary>Last OS trust outcome from Install root CA (Keychain / NSS / package hints).</summary>
+    public CertificateOsTrustResult? LastOsTrustResult { get; private set; }
+
+    /// <summary>Last system-proxy enable/disable failure message (null after success).</summary>
+    public string? LastSystemProxyError { get; private set; }
+
+    /// <summary>Root certificate display name used as NSS nickname.</summary>
+    public string RootCertificateName =>
+        _proxy?.CertificateManager.RootCertificateName ?? "Titanium Inspector Root Certificate";
+
+    /// <summary>True when a Firefox profiles.ini is present on this machine.</summary>
+    public static bool IsFirefoxProfilePresent => FirefoxCertificateTrust.IsFirefoxProfilePresent();
+
+    /// <summary>HTTP/2 for new connections. Applied by <see cref="ApplyHttpProtocols"/>.</summary>
+    public bool PreferHttp2 { get; set; } = true;
+
+    /// <summary>HTTP/3 toward servers for new connections. Applied by <see cref="ApplyHttpProtocols"/>.</summary>
+    public bool PreferHttp3 { get; set; } = true;
+
+    /// <summary>Outbound TLS mask. <see cref="System.Security.Authentication.SslProtocols.None"/> keeps the engine default.</summary>
+    public System.Security.Authentication.SslProtocols OutboundTlsProtocols { get; set; }
+
+    /// <summary>When false, server connections are not reused.</summary>
+    public bool ReuseServerConnections { get; set; } = true;
+
+    /// <summary>
+    /// When true, strip conditional cache headers and send <c>Cache-Control: no-cache</c>.
+    /// Session only; not stored in settings. Skips CONNECT, WebSocket, and range requests.
+    /// </summary>
+    public bool DisableCaching { get; set; }
+
+    /// <summary>
+    /// When true, send <c>Accept-Encoding: identity</c> and leave <c>grpc-accept-encoding</c> alone.
+    /// Session only; not stored in settings. Skips CONNECT, WebSocket, and range requests.
+    /// </summary>
+    public bool ForceUncompressed { get; set; }
+
+    private string _winAuthHosts = string.Empty;
+    private WinAuthHostMatcher? _winAuthMatcher;
+
+    /// <summary>
+    /// Hosts that receive per-session Windows authentication. Empty leaves every request unchanged.
+    /// The server-wide <c>EnableWinAuth</c> flag stays false.
+    /// </summary>
+    public string WinAuthHosts
+    {
+        get => _winAuthHosts;
+        set
+        {
+            _winAuthHosts = value ?? string.Empty;
+            WinAuthHostList.TryCompile(_winAuthHosts, out var matcher, out _);
+            Volatile.Write(ref _winAuthMatcher, matcher);
+        }
+    }
+
+    /// <summary>True when the running proxy currently allows HTTP/2.</summary>
+    public bool Http2Enabled { get; private set; } = true;
+
+    /// <summary>True when this capture session has HTTP/3 enabled (MsQuic available).</summary>
+    public bool Http3Enabled { get; private set; }
+    public string? UpstreamProxyAddress { get; set; }
+    public string? PacUrl { get; set; }
+
+    public bool IgnoreServerCertificateErrors { get; set; }
+
+    private bool _addViaHeader = true;
+
+    /// <summary>
+    /// When true, inject <see cref="ProxyServer.DefaultViaHeaderPseudonym"/> on intercepted traffic.
+    /// Applied on start and when toggled while the proxy is running.
+    /// </summary>
+    public bool AddViaHeader
+    {
+        get => _addViaHeader;
+        set
+        {
+            _addViaHeader = value;
+            ApplyViaHeaderOption();
+        }
+    }
+
+    /// <summary>When true, call <see cref="InstallRootCertificate"/> after start (explicit trust).</summary>
+    public bool AutoTrustRootOnStart { get; set; }
+
+    public AutoResponderViewModel? AutoResponder { get; set; }
+    public MapRemoteViewModel? MapRemote { get; set; }
+    public BreakpointViewModel? Breakpoints { get; set; }
+
+    /// <summary>When true, breakpoints also fire on BeforeResponse.</summary>
+    public bool BreakpointOnResponse { get; set; }
+
+    /// <summary>Optional light request script (set-header / set-status / abort).</summary>
+    public string? ScriptOnRequest { get; set; }
+
+    /// <summary>Optional light response script (set-header / set-status / abort).</summary>
+    public string? ScriptOnResponse { get; set; }
+
+    /// <summary>Active network throttle profile (null / None = off).</summary>
+    public NetworkThrottleProfile? ThrottleProfile
+    {
+        get => _throttleProfile;
+        set
+        {
+            _throttleProfile = value is { IsEnabled: true } ? value : null;
+            RefreshShaper();
+        }
+    }
+
+    /// <summary>Optional FileDescriptorSet path for protobuf decode hints.</summary>
+    public string? ProtobufDescriptorSetPath { get; set; }
+
+    public event EventHandler<SessionSnapshot>? SessionCaptured;
+    public event EventHandler<SessionSnapshot>? SessionUpdated;
+    public event EventHandler<DecryptFailureBypassEntry>? DecryptFailureBypassLearned;
+
+    /// <summary>Applies the learning toggle to a running proxy (no-op when not started).</summary>
+    public void ApplyDecryptFailureBypassSetting()
+    {
+        if (_proxy is null)
+            return;
+        _proxy.EnableDecryptFailureBypass = EnableDecryptFailureBypass;
+    }
+
+    public IReadOnlyList<DecryptFailureBypassEntry> GetDecryptFailureBypassEntries() =>
+        _proxy?.GetDecryptFailureBypassEntries() ?? Array.Empty<DecryptFailureBypassEntry>();
+
+    public bool RemoveDecryptFailureBypass(string host) =>
+        _proxy?.RemoveDecryptFailureBypass(host) ?? false;
+
+    public void ClearDecryptFailureBypass() => _proxy?.ClearDecryptFailureBypass();
+
+    /// <summary>Test / tooling hook: mark <paramref name="host"/> as actively bypassed and raise learned.</summary>
+    internal bool ForceLearnDecryptBypass(string host) =>
+        _proxy?.ForceDecryptFailureBypass(host) ?? false;
+
+    private bool IsLearnedDecryptBypass(string? host)
+    {
+        if (!EnableDecryptFailureBypass || _proxy is null || string.IsNullOrWhiteSpace(host))
+            return false;
+        // O(1) cache consult - do not Snapshot the full list on every CONNECT.
+        return _proxy.ShouldBypassDecryptForLearnedHost(host);
+    }
+
+    private void OnDecryptFailureBypassChanged(object? sender, DecryptFailureBypassEntry e) =>
+        DecryptFailureBypassLearned?.Invoke(this, e);
+
+    public async Task StartAsync(IPAddress address, int port, CancellationToken cancellationToken = default)
+    {
+        using var scope = InspectorUxTrace.Scope("Interception.StartAsync", $"{address}:{port}");
+        cancellationToken.ThrowIfCancellationRequested();
+        if (_proxy is not null)
+        {
+            return;
+        }
+
+        Interlocked.Exchange(ref _nextId, 0);
+
+        // Explicit trust flags: do not silently install into the user store on start.
+        // Callers must InstallRootCertificate (or set AutoTrustRootOnStart) so UI can report success/failure.
+        _proxy = new ProxyServer(userTrustRootCertificate: false, machineTrustRootCertificate: false);
+        ApplyLoggingOptions(_loggingSettings);
+        _proxy.EnableHttpInterception = true;
+        _proxy.EnableRequestTimingCapture = true;
+        _proxy.EnableDecryptFailureBypass = EnableDecryptFailureBypass;
+        _proxy.DecryptFailureBypassChanged += OnDecryptFailureBypassChanged;
+        ApplyViaHeaderOption();
+        // Inspector eagerly buffers bodies for the session grid; 4 MiB trips too often on
+        // normal browsing (images, JS bundles) and RST'd the H2 stream. 32 MiB still bounds
+        // memory while covering typical inspected payloads.
+        _proxy.MaxBufferedBodyBytes = 32 * 1024 * 1024;
+        // Observing must not close an application that sends one large WebSocket frame.
+        _proxy.PolicyModes = _proxy.PolicyModes.With(
+            Titanium.Web.Proxy.Options.PolicyFamily.WebSocketFrameBudget,
+            Titanium.Web.Proxy.Options.PolicyMode.Observe);
+        ApplyHttpProtocols();
+        _proxy.BeforeRequest += OnBeforeRequest;
+        _proxy.BeforeResponse += OnBeforeResponse;
+        _proxy.AfterResponse += OnAfterResponse;
+        _proxy.OnRequestBodyWrite += OnRequestBodyWriteThrottle;
+        _proxy.OnResponseBodyWrite += OnResponseBodyWriteThrottle;
+        _proxy.ServerCertificateValidationCallback += OnServerCertValidation;
+
+        if (!string.IsNullOrWhiteSpace(UpstreamProxyAddress) &&
+            Uri.TryCreate(UpstreamProxyAddress, UriKind.Absolute, out var upstream))
+        {
+            _proxy.UpStreamHttpProxy = new ExternalProxy(upstream.Host, upstream.Port)
+            {
+                ProxyType = ExternalProxyType.Http,
+            };
+        }
+
+        EnsureRootPfxPath();
+        _proxy.CertificateManager.PfxFilePath = _rootPfxPath!;
+        // Browser MITM: ECDSA leaves + disk cache (RSA first-visit stampede is the cold google.com tax).
+        _proxy.CertificateManager.ApplyFastColdStartLeafSettings();
+
+        _endPoint = new ExplicitProxyEndPoint(address, port, decryptSsl: true);
+        _endPoint.BeforeTunnelConnectRequest += OnBeforeTunnelConnect;
+        _endPoint.BeforeTunnelConnectResponse += OnBeforeTunnelConnectResponse;
+        _proxy.AddEndPoint(_endPoint);
+        using (InspectorUxTrace.Scope("Interception.ProxyServer.Start"))
+            _proxy.Start();
+        BoundPort = _endPoint.Port;
+        StartProcessResolveWorker();
+
+        // Do not treat Unix store/Keychain presence as SSL trust (see RefreshTrustState).
+        using (InspectorUxTrace.Scope("Interception.RefreshTrustState.OnStart"))
+        {
+            IsRootTrusted = UseInMemoryTrustState
+                ? _inMemoryTrusted
+                : RefreshTrustState(machineStore: false);
+        }
+
+        TryPruneLegacySharedCrtsOnce();
+
+        if (AutoTrustRootOnStart)
+        {
+            InstallRootCertificate(machineStore: false);
+        }
+
+        Capturing = true;
+        Interlocked.Exchange(ref _shutdownStarted, 0);
+        _shutdownCompleted.Reset();
+        await Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Apply HTTP/2, HTTP/3, outbound TLS, and connection reuse. Safe while capturing: new
+    /// connections pick up the change; in-flight sessions keep the protocol they already negotiated.
+    /// Inspector is an explicit TCP proxy, so HTTP/3 here is origin-side only. HTTP/2 off does not
+    /// disable HTTP/3.
+    /// </summary>
+    public void ApplyHttpProtocols()
+    {
+        if (_proxy is null)
+        {
+            Http2Enabled = PreferHttp2;
+            Http3Enabled = PreferHttp3 && IsHttp3Supported;
+            return;
+        }
+
+        _proxy.EnableHttp2 = PreferHttp2;
+        Http2Enabled = _proxy.EnableHttp2;
+        Http3Enabled = _proxy.SetHttp3Enabled(PreferHttp3);
+        _proxy.EnableConnectionPool = ReuseServerConnections;
+        _proxy.SupportedServerSslProtocols = OutboundTlsProtocols;
+    }
+
+    /// <summary>Apply or refresh logging from Inspector settings (safe while running).</summary>
+    public void ConfigureLogging(InspectorSettings settings)
+    {
+        _loggingSettings = settings;
+        if (_proxy is null)
+        {
+            return;
+        }
+
+        ApplyLoggingOptions(settings);
+        _proxy.ApplyLoggingConfiguration();
+    }
+
+    private void ApplyViaHeaderOption()
+    {
+        if (_proxy is null)
+        {
+            return;
+        }
+
+        _proxy.ViaHeaderPseudonym = AddViaHeader
+            ? ProxyServer.DefaultViaHeaderPseudonym
+            : string.Empty;
+    }
+
+    /// <summary>
+    /// Idempotent shutdown: restore system proxy (even if already stopped) and dispose the proxy.
+    /// Matches WPF example <c>EnsureProxyShutdown</c> semantics.
+    /// Must not run on the Avalonia UI thread - WinINET <c>InternetSetOption</c> broadcasts
+    /// back to the closing window and deadlocks (title-bar Close hangs; taskbar Close often
+    /// terminates the process instead).
+    /// </summary>
+    public void EnsureShutdown()
+    {
+        if (Interlocked.Exchange(ref _shutdownStarted, 1) != 0)
+        {
+            _shutdownCompleted.Wait(TimeSpan.FromSeconds(3), CancellationToken.None);
+            return;
+        }
+
+        try
+        {
+            if (_proxy is not null && _proxy.ProxyRunning)
+            {
+                Stop();
+            }
+            else if (_proxy is not null)
+            {
+                try
+                {
+                    _systemProxy.RestoreOriginalProxySettings(_proxy);
+                }
+                catch
+                {
+                    // best-effort
+                }
+
+                try
+                {
+                    _proxy.Dispose();
+                }
+                catch
+                {
+                    // best-effort
+                }
+
+                _proxy = null;
+                _endPoint = null;
+                _systemProxyEnabled = false;
+                Http3Enabled = false;
+            }
+        }
+        catch
+        {
+            // never throw from teardown
+        }
+        finally
+        {
+            try
+            {
+                _fileLog?.Dispose();
+            }
+            catch
+            {
+                // best-effort
+            }
+
+            _fileLog = null;
+            DisposeShaper();
+            _shutdownCompleted.Set();
+        }
+    }
+
+    /// <summary>
+    /// Persist-safe close path: queue <see cref="EnsureShutdown"/> on the thread pool so the
+    /// window can disappear immediately.
+    /// </summary>
+    public void BeginBackgroundShutdown()
+    {
+        if (Volatile.Read(ref _shutdownStarted) != 0)
+        {
+            return;
+        }
+
+        ThreadPool.UnsafeQueueUserWorkItem(_ =>
+        {
+            try
+            {
+                EnsureShutdown();
+            }
+            catch
+            {
+                // never throw from teardown
+            }
+        }, null);
+    }
+
+    private void ApplyLoggingOptions(InspectorSettings? settings)
+    {
+        if (_proxy is null)
+        {
+            return;
+        }
+
+        var s = settings ?? new InspectorSettings();
+        // Inspector always leaves the logger factory on so Recent logs keeps receiving lines.
+        // File output is gated separately via LoggingEnableFile / InspectorFileLogProvider.
+        _proxy.Logging.Enabled = true;
+        if (Enum.TryParse<LogLevel>(s.LoggingMinimumLevel, ignoreCase: true, out var level))
+        {
+            _proxy.Logging.MinimumLevel = level;
+        }
+
+        _proxy.Logging.EnableConsole = false;
+        // Core numbered rolling is unused; Inspector attaches its own dated-file sink.
+        _proxy.Logging.EnableFile = false;
+        RunLog.SetCapacity(s.LoggingMemoryLines);
+        if (!_proxy.Logging.AdditionalLoggerProviders.Contains(RunLog))
+        {
+            _proxy.Logging.AdditionalLoggerProviders.Add(RunLog);
+        }
+
+        var folder = InspectorLogFiles.ResolveFolder(s.LoggingFilePath);
+        var maxBytes = Math.Max(1, s.LoggingMaxFileSizeMb) * 1024L * 1024L;
+        var keep = Math.Clamp(Math.Max(1, s.LoggingMaxRolledFiles), 1, 100);
+
+        if (s.LoggingEnableFile)
+        {
+            if (_fileLog is null)
+            {
+                _fileLog = new InspectorFileLogProvider(folder, maxBytes, keep);
+                _proxy.Logging.AdditionalLoggerProviders.Add(_fileLog);
+            }
+            else
+            {
+                _fileLog.Reconfigure(folder, maxBytes, keep);
+                if (!_proxy.Logging.AdditionalLoggerProviders.Contains(_fileLog))
+                {
+                    _proxy.Logging.AdditionalLoggerProviders.Add(_fileLog);
+                }
+            }
+
+            InspectorLogFiles.Prune(folder, keep, _fileLog.CurrentFilePath);
+        }
+        else if (_fileLog is not null)
+        {
+            _proxy.Logging.AdditionalLoggerProviders.Remove(_fileLog);
+            _fileLog.Dispose();
+            _fileLog = null;
+        }
+
+        _proxy.ApplyLoggingConfiguration();
+    }
+
+    public void Stop()
+    {
+        // Release a paused breakpoint so Stop does not wait out the 120s hit timeout
+        // and the client is not left hanging after the listener is gone.
+        Breakpoints?.ContinueIfPaused("Proxy stopped — paused request continued");
+        RefreshShaper();
+
+        if (_proxy is null)
+        {
+            return;
+        }
+
+        if (_systemProxyEnabled)
+        {
+            SetSystemProxy(false);
+        }
+
+        _proxy.BeforeRequest -= OnBeforeRequest;
+        _proxy.BeforeResponse -= OnBeforeResponse;
+        _proxy.AfterResponse -= OnAfterResponse;
+        FinalizeInFlightSessions();
+        _proxy.OnRequestBodyWrite -= OnRequestBodyWriteThrottle;
+        _proxy.OnResponseBodyWrite -= OnResponseBodyWriteThrottle;
+        _proxy.ServerCertificateValidationCallback -= OnServerCertValidation;
+        _proxy.DecryptFailureBypassChanged -= OnDecryptFailureBypassChanged;
+        if (_endPoint is not null)
+        {
+            _endPoint.BeforeTunnelConnectRequest -= OnBeforeTunnelConnect;
+            _endPoint.BeforeTunnelConnectResponse -= OnBeforeTunnelConnectResponse;
+        }
+
+        _proxy.Stop();
+        _proxy.Dispose();
+        _proxy = null;
+        _endPoint = null;
+        BoundPort = 0;
+        _live.Clear();
+        StopProcessResolveWorker();
+        IsRootTrusted = false;
+        _systemProxyEnabled = false;
+        Http3Enabled = false;
+    }
+
+    private readonly object _systemProxyGate = new();
+
+    /// <summary>
+    /// Enable or disable system proxy. Returns false if the proxy is not running or the underlying call failed.
+    /// </summary>
+    /// <param name="stillWanted">
+    /// Optional gate evaluated under the system-proxy lock before mutating OS settings.
+    /// Used to cancel a superseded optimistic enable/disable (e.g. Stop while enable is in flight).
+    /// </param>
+    public bool SetSystemProxy(bool enable, InspectorSettings? settings = null, Func<bool>? stillWanted = null)
+    {
+        LastSystemProxyError = null;
+        lock (_systemProxyGate)
+        {
+            if (stillWanted is not null && !stillWanted())
+            {
+                return false;
+            }
+
+            if (enable)
+            {
+                if (_proxy is null || _endPoint is null || !_proxy.ProxyRunning)
+                {
+                    LastSystemProxyError = "Proxy is not running";
+                    return false;
+                }
+            }
+            else if (!_systemProxyEnabled)
+            {
+                // Already restored - common when Stop raced an optimistic enable that never landed.
+                return true;
+            }
+
+            if (_proxy is null)
+            {
+                LastSystemProxyError = "Proxy is not running";
+                return false;
+            }
+
+            try
+            {
+                return enable
+                    ? TryEnableSystemProxyLocked(settings)
+                    : TryDisableSystemProxyLocked();
+            }
+            catch (Exception ex)
+            {
+                LastSystemProxyError = ex.Message;
+                try
+                {
+                    _proxy.Logger.LogWarning(ex, "System proxy {Action} failed", enable ? "enable" : "disable");
+                }
+                catch
+                {
+                    // logging must not hide the original failure
+                }
+
+                return false;
+            }
+        }
+    }
+
+    private bool TryEnableSystemProxyLocked(InspectorSettings? settings)
+    {
+        var effective = settings ?? SystemProxySettings ?? new InspectorSettings();
+        SystemProxySettings = effective;
+        var result = _systemProxy.SetAsSystemProxy(_proxy!, _endPoint!, effective);
+        if (!result.Succeeded)
+        {
+            LastSystemProxyError = result.Message;
+            _proxy!.Logger.LogWarning("System proxy enable failed: {Message}", result.Message);
+            return false;
+        }
+
+        _systemProxyEnabled = true;
+        return true;
+    }
+
+    private bool TryDisableSystemProxyLocked()
+    {
+        var result = _systemProxy.RestoreOriginalProxySettings(_proxy!);
+        if (!result.Succeeded)
+        {
+            LastSystemProxyError = result.Message;
+            _proxy!.Logger.LogWarning("System proxy disable failed: {Message}", result.Message);
+            return false;
+        }
+
+        _systemProxyEnabled = false;
+        return true;
+    }
+
+    /// <summary>Re-applies system proxy bypass rules when already enabled (after settings change).</summary>
+    public bool ReapplySystemProxyIfEnabled()
+    {
+        if (!_systemProxyEnabled || SystemProxySettings is null)
+        {
+            return true;
+        }
+
+        return SetSystemProxy(true, SystemProxySettings);
+    }
+
+    /// <summary>
+    /// Turns the system proxy off, then back on, so clients drop a cached connection and open a new one.
+    /// Rewriting the same <c>ProxyEnable=1</c> value does not do that: packaged apps that already
+    /// failed to reach localhost keep their direct connection until <c>ProxyEnable</c> actually changes.
+    /// Must not run on the UI thread: the WinINET settings broadcast can deadlock Avalonia.
+    /// </summary>
+    /// <param name="stillWanted">
+    /// When this returns false after the proxy is turned off, it stays off (the user turned System proxy off).
+    /// </param>
+    /// <returns>True only when the system proxy is enabled again.</returns>
+    public bool NudgeSystemProxy(Func<bool>? stillWanted = null)
+    {
+        lock (_systemProxyGate)
+        {
+            LastSystemProxyError = null;
+            if (!_systemProxyEnabled)
+            {
+                return false;
+            }
+
+            if (stillWanted is not null && !stillWanted())
+            {
+                return false;
+            }
+
+            if (_proxy is null || _endPoint is null || !_proxy.ProxyRunning)
+            {
+                LastSystemProxyError = "Proxy is not running";
+                return false;
+            }
+
+            try
+            {
+                if (!TryDisableSystemProxyLocked())
+                {
+                    return false;
+                }
+
+                if (stillWanted is not null && !stillWanted())
+                {
+                    return false;
+                }
+
+                return TryEnableSystemProxyLocked(SystemProxySettings);
+            }
+            catch (Exception ex)
+            {
+                LastSystemProxyError = ex.Message;
+                return false;
+            }
+        }
+    }
+
+    /// <summary>Install root CA and refresh <see cref="IsRootTrusted"/> from the store.</summary>
+    /// <returns>True when the cert is present in the target Root store after install (or Unix SSL trust succeeded / needs Keychain confirm).</returns>
+    /// <remarks>
+    ///     Combined API for tests/E2E. Inspector UI uses <see cref="InstallRootStoresOnly"/> +
+    ///     <see cref="FinalizeTrustAfterStoreMutation"/> so CryptUI Yes is not followed by store
+    ///     sweeps on the Avalonia dispatcher.
+    /// </remarks>
+    public bool InstallRootCertificate(bool machineStore)
+    {
+        if (_proxy is null)
+        {
+            return false;
+        }
+
+        if (FailNextUserTrustInstall)
+        {
+            FailNextUserTrustInstall = false;
+            LastOsTrustResult = CertificateOsTrustResult.Fail(
+                CertificateOsTrustKind.Failed, "Forced user-trust failure (test)");
+            return false;
+        }
+
+        if (UseInMemoryTrustState)
+        {
+            _inMemoryTrusted = true;
+            IsRootTrusted = true;
+            LastOsTrustResult = CertificateOsTrustResult.Ok("Root CA trusted (in-memory)");
+            return true;
+        }
+
+        if (IsRootPresentInStore(machineStore))
+        {
+            if (OperatingSystem.IsWindows())
+            {
+                IsRootTrusted = true;
+                LastOsTrustResult = CertificateOsTrustResult.Ok("Root CA already trusted");
+                return CompleteRootTrustInstall(true);
+            }
+
+            if (_proxy.CertificateManager.VerifyOsUserSslTrust())
+            {
+                IsRootTrusted = true;
+                LastOsTrustResult = CertificateOsTrustResult.Ok("Root CA already trusted for SSL");
+                return CompleteRootTrustInstall(true);
+            }
+
+            _proxy.CertificateManager.TrustRootCertificate(machineStore);
+            LastOsTrustResult = _proxy.CertificateManager.LastOsTrustResult;
+            IsRootTrusted = EvaluateUnixTrustSuccess(LastOsTrustResult) ||
+                            _proxy.CertificateManager.VerifyOsUserSslTrust();
+            return CompleteRootTrustInstall(
+                IsRootTrusted ||
+                LastOsTrustResult?.Kind == CertificateOsTrustKind.MacNeedsManualTrustConfirm);
+        }
+
+        // Full trust (stores + orphan prune + Unix) - non-UI callers only.
+        _proxy.CertificateManager.TrustRootCertificate(machineStore);
+        LastOsTrustResult = _proxy.CertificateManager.LastOsTrustResult;
+
+        if (OperatingSystem.IsWindows())
+        {
+            IsRootTrusted = IsRootPresentInStore(machineStore);
+            return CompleteRootTrustInstall(IsRootTrusted);
+        }
+
+        IsRootTrusted = EvaluateUnixTrustSuccess(LastOsTrustResult) ||
+                        _proxy.CertificateManager.VerifyOsUserSslTrust();
+        return CompleteRootTrustInstall(
+            IsRootTrusted ||
+            LastOsTrustResult?.Kind == CertificateOsTrustKind.MacNeedsManualTrustConfirm);
+    }
+
+    /// <summary>CryptUI Root Add only - must run on a pumping UI thread.</summary>
+    /// <returns>True when the Root entry was newly added.</returns>
+    public bool InstallRootStoresOnly(bool machineStore)
+    {
+        if (_proxy is null)
+            return false;
+
+        if (FailNextUserTrustInstall)
+        {
+            FailNextUserTrustInstall = false;
+            LastOsTrustResult = CertificateOsTrustResult.Fail(
+                CertificateOsTrustKind.Failed, "Forced user-trust failure (test)");
+            return false;
+        }
+
+        if (UseInMemoryTrustState)
+        {
+            _inMemoryTrusted = true;
+            IsRootTrusted = true;
+            LastOsTrustResult = CertificateOsTrustResult.Ok("Root CA trusted (in-memory)");
+            return true;
+        }
+
+        var added = _proxy.CertificateManager.InstallRootIntoCertificateStores(machineStore);
+        LastOsTrustResult = _proxy.CertificateManager.LastOsTrustResult;
+        return added;
+    }
+
+    /// <summary>macOS/Linux Keychain/NSS trust - may show auth UI; pumping thread required.</summary>
+    public void ApplyUnixSslTrustOnUi(bool machineStore)
+    {
+        using var scope = InspectorUxTrace.Scope("ApplyUnixSslTrustOnUi", $"machine={machineStore}");
+        if (_proxy is null || UseInMemoryTrustState || OperatingSystem.IsWindows())
+            return;
+
+        _proxy.CertificateManager.ApplyUnixSslTrustAfterStoreInstall(machineStore);
+        LastOsTrustResult = _proxy.CertificateManager.LastOsTrustResult;
+        InspectorUxTrace.Event(
+            "ApplyUnixSslTrustOnUi.Result",
+            $"kind={LastOsTrustResult?.Kind} trusted={IsRootTrusted}");
+    }
+
+    /// <summary>
+    ///     After CryptUI Add / Unix trust: verify trust + My-store prune. Safe off the UI thread.
+    ///     Skips Root orphan CryptUI sweeps (those freeze Avalonia after Yes).
+    /// </summary>
+    /// <param name="machineStore">CurrentUser vs LocalMachine.</param>
+    /// <param name="rootStoreAdded">
+    ///     When <see langword="true"/>, CryptUI just added the Root entry - skip an immediate
+    ///     Root-store Find (Crypt32 is hot after Yes and routinely stalls ~10–15s, especially on a
+    ///     second Clear+Install). Trust is assumed; My prune runs best-effort afterward.
+    /// </param>
+    public bool FinalizeTrustAfterStoreMutation(bool machineStore, bool? rootStoreAdded = null)
+    {
+        using var scope = InspectorUxTrace.Scope(
+            "FinalizeTrustAfterStoreMutation",
+            $"machine={machineStore} added={rootStoreAdded}");
+        if (_proxy is null)
+            return false;
+
+        if (UseInMemoryTrustState)
+        {
+            IsRootTrusted = _inMemoryTrusted;
+            return IsRootTrusted;
+        }
+
+        if (rootStoreAdded == true && OperatingSystem.IsWindows())
+        {
+            IsRootTrusted = true;
+            if (LastOsTrustResult is null)
+                LastOsTrustResult = CertificateOsTrustResult.Ok("Root CA trusted in current-user store");
+
+            InspectorUxTrace.Event("FinalizeTrust.SkipRootFind", "assumeInstalled=true");
+            // Prune on the serial trust background lane - never Task.Run beside Firefox prefs work.
+            SchedulePruneOrphanedPersonalCertificates(machineStore);
+            return CompleteRootTrustInstall(true);
+        }
+
+        try
+        {
+            using (InspectorUxTrace.Scope("FinalizeTrust.PrunePersonal"))
+            {
+                _proxy.CertificateManager.PruneOrphanedPersonalCertificates(
+                    machineStore ? StoreLocation.LocalMachine : StoreLocation.CurrentUser,
+                    keepCurrentThumbprint: true);
+            }
+        }
+        catch
+        {
+            // best-effort
+        }
+
+        if (OperatingSystem.IsWindows())
+        {
+            using (InspectorUxTrace.Scope("FinalizeTrust.IsRootPresentInStore"))
+                IsRootTrusted = IsRootPresentInStore(machineStore);
+            if (IsRootTrusted && LastOsTrustResult is null)
+                LastOsTrustResult = CertificateOsTrustResult.Ok("Root CA trusted in current-user store");
+            return CompleteRootTrustInstall(IsRootTrusted);
+        }
+
+        using (InspectorUxTrace.Scope("FinalizeTrust.VerifyOsUserSslTrust"))
+        {
+            IsRootTrusted = EvaluateUnixTrustSuccess(LastOsTrustResult) ||
+                            _proxy.CertificateManager.VerifyOsUserSslTrust();
+        }
+        return CompleteRootTrustInstall(
+            IsRootTrusted ||
+            LastOsTrustResult?.Kind == CertificateOsTrustKind.MacNeedsManualTrustConfirm);
+    }
+
+    private static bool CompleteRootTrustInstall(bool installed)
+    {
+        // Do not write Firefox prefs/policies here - schedule via RunOffUiAsync after success.
+        return installed;
+    }
+
+    /// <summary>
+    /// Installs the root CA with an OS admin prompt when required (UAC / macOS auth / polkit).
+    /// </summary>
+    public bool InstallRootCertificateAsAdmin(bool machineStore)
+    {
+        if (_proxy is null)
+        {
+            return false;
+        }
+
+        if (UseInMemoryTrustState)
+        {
+            _inMemoryTrusted = true;
+            IsRootTrusted = true;
+            LastOsTrustResult = CertificateOsTrustResult.Ok("Root CA trusted (in-memory)");
+            return true;
+        }
+
+        var ok = _proxy.CertificateManager.TrustRootCertificateAsAdmin(machineStore);
+        LastOsTrustResult = _proxy.CertificateManager.LastOsTrustResult;
+        if (OperatingSystem.IsWindows())
+        {
+            IsRootTrusted = ok && IsRootPresentInStore(machineStore);
+            return CompleteRootTrustInstall(IsRootTrusted);
+        }
+
+        IsRootTrusted = ok && (EvaluateUnixTrustSuccess(LastOsTrustResult) ||
+                               _proxy.CertificateManager.VerifyOsUserSslTrust());
+        return CompleteRootTrustInstall(
+            IsRootTrusted ||
+            LastOsTrustResult?.Kind == CertificateOsTrustKind.MacNeedsManualTrustConfirm);
+    }
+
+    /// <summary>
+    ///     After UAC/admin install: re-verify off the UI thread (store Find can stall Crypt32).
+    /// </summary>
+    public bool FinalizeTrustAfterAdminInstall(bool machineStore)
+    {
+        if (_proxy is null)
+            return false;
+        if (UseInMemoryTrustState)
+            return IsRootTrusted;
+
+        try
+        {
+            _proxy.CertificateManager.PruneOrphanedPersonalCertificates(
+                machineStore ? StoreLocation.LocalMachine : StoreLocation.CurrentUser,
+                keepCurrentThumbprint: true);
+        }
+        catch
+        {
+            // best-effort
+        }
+
+        if (OperatingSystem.IsWindows())
+        {
+            IsRootTrusted = IsRootPresentInStore(machineStore);
+            return CompleteRootTrustInstall(IsRootTrusted);
+        }
+
+        IsRootTrusted = EvaluateUnixTrustSuccess(LastOsTrustResult) ||
+                        _proxy.CertificateManager.VerifyOsUserSslTrust();
+        return CompleteRootTrustInstall(
+            IsRootTrusted ||
+            LastOsTrustResult?.Kind == CertificateOsTrustKind.MacNeedsManualTrustConfirm);
+    }
+
+    /// <summary>Installs certutil (package/brew) then retries user SSL trust.</summary>
+    public CertificateOsTrustResult InstallNssToolsAndRetryTrust()
+    {
+        if (_proxy is null)
+        {
+            return CertificateOsTrustResult.Fail(
+                CertificateOsTrustKind.Failed, "Start the proxy first");
+        }
+
+        var result = _proxy.CertificateManager.InstallNssCertutilAndRetryUserTrust();
+        LastOsTrustResult = result;
+        if (EvaluateUnixTrustSuccess(result))
+        {
+            IsRootTrusted = true;
+        }
+        else if (result.Kind == CertificateOsTrustKind.MacNeedsManualTrustConfirm)
+        {
+            // Cert may be present; SSL trust still requires Always Trust confirmation.
+            IsRootTrusted = _proxy.CertificateManager.VerifyOsUserSslTrust();
+        }
+
+        return result;
+    }
+
+    /// <summary>Opens Keychain Access for Always Trust guidance.</summary>
+    public string? OpenMacKeychainGuidance() => _proxy?.CertificateManager.OpenMacKeychainGuidance();
+
+    /// <summary>Best-effort: root is present in the macOS login keychain (not necessarily SSL-trusted).</summary>
+    public bool IsRootInLoginKeychain() =>
+        _proxy?.CertificateManager.IsRootInLoginKeychain() == true;
+
+    /// <summary>Re-verifies macOS/Linux user SSL trust and updates <see cref="IsRootTrusted"/>.</summary>
+    /// <remarks>
+    /// Does not write Firefox prefs - that is Install / Trust Firefox only (verify-only must stay cheap).
+    /// </remarks>
+    public bool VerifyOsUserSslTrust()
+    {
+        using var scope = InspectorUxTrace.Scope("VerifyOsUserSslTrust");
+        if (_proxy is null) return false;
+        if (UseInMemoryTrustState) return IsRootTrusted;
+        // Windows: Root store presence is trust. Unix: require real SSL trust verification -
+        // Keychain/NSS can hold the CA without trusting it for SSL (Chrome MITM fails).
+        var ok = OperatingSystem.IsWindows()
+            ? IsRootPresentInStore(false)
+            : _proxy.CertificateManager.VerifyOsUserSslTrust();
+        IsRootTrusted = ok;
+        return ok;
+    }
+
+    /// <summary>
+    ///     Trust CA for Firefox: enable OS-root import (Windows policy / macOS Keychain via
+    ///     <c>user.js</c>) first; otherwise import into the default Firefox profile via certutil.
+    /// </summary>
+    public CertificateOsTrustResult TrustFirefox()
+    {
+        if (UseInMemoryTrustState)
+        {
+            return CertificateOsTrustResult.Ok("Firefox trust recorded (in-memory)");
+        }
+
+        if (_proxy is null)
+        {
+            return CertificateOsTrustResult.Fail(
+                CertificateOsTrustKind.Failed, "Start the proxy first");
+        }
+
+        var cert = _proxy.CertificateManager.RootCertificate;
+        if (cert is null)
+        {
+            return CertificateOsTrustResult.Fail(
+                CertificateOsTrustKind.Failed, "Root certificate is not loaded");
+        }
+
+        if (OperatingSystem.IsWindows())
+        {
+            var policy = FirefoxCertificateTrust.TryEnableWindowsEnterpriseRoots();
+            InspectorUxTrace.Event(
+                "TrustFirefox.WindowsEnterpriseRoots",
+                $"ok={policy.Succeeded} kind={policy.Kind} step={FirefoxCertificateTrust.LastEnterpriseRootsStep} msg={TruncateTrustMsg(policy.Message)}");
+            LogTrustFirefoxOutcome(policy);
+            if (policy.Succeeded)
+                return policy;
+
+            // Windows does not ship NSS certutil on PATH (Microsoft certutil.exe is ignored).
+            // Never fall through to TrustDefaultProfile - that surfaces CertutilMissing / apt-style copy.
+            var failed = CertificateOsTrustResult.Fail(
+                policy.Kind == CertificateOsTrustKind.Cancelled
+                    ? CertificateOsTrustKind.Cancelled
+                    : CertificateOsTrustKind.Failed,
+                string.IsNullOrWhiteSpace(policy.Message)
+                    ? "Could not enable Firefox OS-root trust. Quit Firefox and retry, or Export CA and import it under Firefox Authorities."
+                    : policy.Message + " - or Export CA and import it under Firefox Authorities.");
+            LogTrustFirefoxOutcome(failed);
+            return failed;
+        }
+
+        var pref = FirefoxCertificateTrust.TryEnableEnterpriseRootsUserPref();
+        InspectorUxTrace.Event(
+            "TrustFirefox.EnterpriseRootsUserPref",
+            $"ok={pref.Succeeded} kind={pref.Kind} step={FirefoxCertificateTrust.LastEnterpriseRootsStep}");
+        if (pref.Succeeded)
+        {
+            LogTrustFirefoxOutcome(pref);
+            return pref;
+        }
+
+        var nss = FirefoxCertificateTrust.TrustDefaultProfile(cert, RootCertificateName);
+        LogTrustFirefoxOutcome(nss);
+        return nss;
+    }
+
+    private void LogTrustFirefoxOutcome(CertificateOsTrustResult result)
+    {
+        try
+        {
+            if (_proxy?.Logger is null)
+                return;
+            if (result.Succeeded)
+            {
+                if (_proxy.Logger.IsEnabled(LogLevel.Information))
+                    _proxy.Logger.LogInformation("TrustFirefox: {Message}", result.Message);
+            }
+            else
+                _proxy.Logger.LogWarning("TrustFirefox failed ({Kind}): {Message}", result.Kind, result.Message);
+        }
+        catch
+        {
+            // never break trust UX for logging
+        }
+    }
+
+    private static string TruncateTrustMsg(string? message)
+    {
+        if (string.IsNullOrEmpty(message))
+            return "";
+        return message.Length <= 120 ? message : message[..120] + "...";
+    }
+
+    /// <summary>
+    ///     Best-effort: if a Firefox profile exists, enable OS-root trust so Install root CA
+    ///     is enough after a Firefox restart (no extra menu, no certutil).
+    /// </summary>
+    public static void TryEnableFirefoxEnterpriseRootsBestEffort()
+    {
+        try
+        {
+            // Unit tests set TITANIUM_SKIP_ROOT_STORE_UI=1 - never touch live Firefox profiles
+            // (prefs.js locks hang / balloon memory when Firefox is open).
+            if (string.Equals(Environment.GetEnvironmentVariable("TITANIUM_SKIP_ROOT_STORE_UI"), "1",
+                    StringComparison.Ordinal))
+                return;
+
+            if (!FirefoxCertificateTrust.IsFirefoxProfilePresent())
+                return;
+
+            // Windows: HKCU ImportEnterpriseRoots first (cheap). user.js/prefs.js only as fallback
+            // inside TryEnableWindowsEnterpriseRoots - never prefs-first on the install path.
+            if (OperatingSystem.IsWindows())
+                FirefoxCertificateTrust.TryEnableWindowsEnterpriseRoots();
+            else
+                FirefoxCertificateTrust.TryEnableEnterpriseRootsUserPref();
+        }
+        catch
+        {
+            // install path must not fail because Firefox prefs were locked
+        }
+    }
+
+    /// <summary>
+    ///     Queue Firefox enable work on the serial background lane (coalesces consecutive enables).
+    /// </summary>
+    public void ScheduleFirefoxEnterpriseRootsBestEffort() =>
+        EnqueueFirefoxTrustBackground(FirefoxTrustBgKind.Enable, TryEnableFirefoxEnterpriseRootsBestEffort);
+
+    /// <summary>
+    ///     Queue Firefox clear work on the serial background lane (coalesces consecutive clears).
+    /// </summary>
+    public void ScheduleClearPendingFirefoxRootTrust() =>
+        EnqueueFirefoxTrustBackground(FirefoxTrustBgKind.Clear, ClearPendingFirefoxRootTrust);
+
+    /// <summary>
+    ///     Queue Personal (My) store same-CN prune on the serial trust background lane.
+    ///     Used after CryptUI Root Add so install returns immediately while Crypt32 settles.
+    /// </summary>
+    public void SchedulePruneOrphanedPersonalCertificates(bool machineStore)
+    {
+        if (_proxy is null || UseInMemoryTrustState)
+            return;
+
+        var location = machineStore ? StoreLocation.LocalMachine : StoreLocation.CurrentUser;
+        var mgr = _proxy.CertificateManager;
+        EnqueueFirefoxTrustBackground(FirefoxTrustBgKind.Prune, () =>
+        {
+            try
+            {
+                mgr.PruneOrphanedPersonalCertificates(location, keepCurrentThumbprint: true);
+            }
+            catch
+            {
+                // best-effort
+            }
+        });
+    }
+
+    /// <summary>
+    ///     Await idle trust background lane (Firefox prefs + My prune) so the next trust mutation
+    ///     does not collide with prior fire-and-forget work.
+    /// </summary>
+    public Task WaitForFirefoxTrustBackgroundIdleAsync(CancellationToken cancellationToken = default)
+    {
+        Task idle;
+        lock (_firefoxTrustBgGate)
+            idle = _firefoxTrustBgIdle.Task;
+
+        if (idle.IsCompleted)
+            return Task.CompletedTask;
+
+        return idle.WaitAsync(cancellationToken);
+    }
+
+    /// <summary>
+    ///     Drop queued (not yet started) Clear/Enable/Prune work. A job already running finishes;
+    ///     callers still use a short WaitForFirefoxTrustBackgroundIdleAsync.
+    /// </summary>
+    public void DropPendingFirefoxTrustBackgroundWork()
+    {
+        lock (_firefoxTrustBgGate)
+        {
+            var dropped = _firefoxTrustBgQueue.Count;
+            if (dropped == 0)
+                return;
+
+            _firefoxTrustBgQueue.Clear();
+            InspectorUxTrace.Event(
+                "TrustBg.DropPending",
+                $"dropped={dropped} running={_firefoxTrustBgRunning}");
+
+            if (!_firefoxTrustBgRunning)
+                _firefoxTrustBgIdle.TrySetResult();
+        }
+    }
+
+    private void EnqueueFirefoxTrustBackground(FirefoxTrustBgKind kind, Action work)
+    {
+        lock (_firefoxTrustBgGate)
+        {
+            // Coalesce consecutive same-kind ops (double Enable from Ensure+SetOsTrustSuccess,
+            // double Clear, double Prune after rapid Install).
+            if (_firefoxTrustBgQueue.Count > 0)
+            {
+                var items = _firefoxTrustBgQueue.ToArray();
+                if (items[^1].Kind == kind)
+                {
+                    _firefoxTrustBgQueue.Clear();
+                    for (var i = 0; i < items.Length - 1; i++)
+                        _firefoxTrustBgQueue.Enqueue(items[i]);
+                }
+            }
+
+            _firefoxTrustBgQueue.Enqueue(new FirefoxTrustBgQueued(kind, work));
+            InspectorUxTrace.Event(
+                "TrustBg.Enqueue",
+                $"kind={kind} depth={_firefoxTrustBgQueue.Count} running={_firefoxTrustBgRunning}");
+
+            if (_firefoxTrustBgRunning)
+                return;
+
+            _firefoxTrustBgRunning = true;
+            _firefoxTrustBgIdle = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            // Background drain is independent of process-resolve CTS; opt out explicitly (S8949).
+            _ = Task.Run(DrainFirefoxTrustBackground, CancellationToken.None);
+        }
+    }
+
+    private void DrainFirefoxTrustBackground()
+    {
+        InspectorUxTrace.Event("TrustBg.Drain.Start");
+        try
+        {
+            while (true)
+            {
+                FirefoxTrustBgQueued next;
+                lock (_firefoxTrustBgGate)
+                {
+                    if (_firefoxTrustBgQueue.Count == 0)
+                    {
+                        _firefoxTrustBgRunning = false;
+                        _firefoxTrustBgIdle.TrySetResult();
+                        InspectorUxTrace.Event("TrustBg.Drain.Idle");
+                        return;
+                    }
+
+                    next = _firefoxTrustBgQueue.Dequeue();
+                }
+
+                using (InspectorUxTrace.Scope("TrustBg.Job", $"kind={next.Kind}"))
+                {
+                    try
+                    {
+                        // Clear/Enable historically stalled 30–40s on locked Firefox prefs.
+                        // Cap the lane so Remove / Clear+Install never wait on a wedged job.
+                        if (next.Kind is FirefoxTrustBgKind.Clear or FirefoxTrustBgKind.Enable)
+                        {
+                            // Prefs I/O is best-effort and time-capped; do not tie to process-resolve CTS.
+                            var work = Task.Run(next.Work, CancellationToken.None);
+                            if (!work.Wait(TimeSpan.FromSeconds(3), CancellationToken.None))
+                                InspectorUxTrace.Event("TrustBg.Job.Timeout", $"kind={next.Kind}");
+                        }
+                        else
+                        {
+                            next.Work();
+                        }
+                    }
+                    catch
+                    {
+                        // best-effort lane - never fail the proxy / UI on prefs I/O
+                    }
+                }
+            }
+        }
+        catch
+        {
+            lock (_firefoxTrustBgGate)
+            {
+                _firefoxTrustBgRunning = false;
+                _firefoxTrustBgIdle.TrySetResult();
+            }
+            InspectorUxTrace.Event("TrustBg.Drain.Fault");
+        }
+    }
+
+    private static bool EvaluateUnixTrustSuccess(CertificateOsTrustResult? result) =>
+        result is { Succeeded: true };
+
+    /// <summary>Marks the last trust attempt as user-cancelled (recovery dialog dismissed).</summary>
+    public void SetLastOsTrustCancelled()
+    {
+        LastOsTrustResult = CertificateOsTrustResult.Fail(
+            CertificateOsTrustKind.Cancelled,
+            "Root CA install cancelled");
+    }
+
+    public void UntrustRootCertificate(bool machineStore)
+    {
+        // Combined API for E2E / non-UI callers. Inspector ViewModel uses RemoveOsRootStoreOnly
+        // + ClearPendingFirefoxRootTrust off-UI so CryptUI does not freeze on Firefox prefs.
+        RemoveOsRootStoreOnly(machineStore);
+        ClearPendingFirefoxRootTrust();
+    }
+
+    /// <summary>Nickname to clear from Firefox after OS untrust; consumed by <see cref="ClearPendingFirefoxRootTrust"/>.</summary>
+    internal string? PendingFirefoxRootClearName { get; private set; }
+
+    /// <summary>Best-effort Firefox cleanup after OS Root remove (call off the UI thread).</summary>
+    public void ClearPendingFirefoxRootTrust()
+    {
+        var name = PendingFirefoxRootClearName;
+        PendingFirefoxRootClearName = null;
+        FirefoxCertificateTrust.ClearRootTrustBestEffort(name);
+    }
+
+    /// <summary>
+    ///     Mint a new root CA: untrust same-CN store entries, delete Inspector PFX + local leaf cache,
+    ///     recreate root. Always best-effort prunes the legacy shared <c>Titanium.Web.Proxy/crts</c> folder.
+    ///     Does not install trust - caller should prompt Install CA.
+    /// </summary>
+    /// <remarks>
+    ///     CryptUI Remove must run on a pumping UI thread; Firefox clear + PFX recreate should run
+    ///     off-UI via <see cref="RemoveOsRootStoreOnly"/> + <see cref="MintNewRootCertificateCore"/>.
+    ///     This combined method remains for tests / non-UI callers.
+    /// </remarks>
+    public bool RotateRootCertificate(bool machineStore)
+    {
+        RemoveOsRootStoreOnly(machineStore);
+        return MintNewRootCertificateCore();
+    }
+
+    /// <summary>
+    ///     CryptUI Root Removes for every same-CN thumbprint, then My/Unix finalize off-UI via
+    ///     <see cref="FinalizeAfterRootRemove"/>. Inspector ViewModel lists thumbs off-UI first.
+    /// </summary>
+    public void RemoveOsRootStoreOnly(bool machineStore)
+    {
+        if (_proxy is null)
+            return;
+
+        if (UseInMemoryTrustState)
+        {
+            _inMemoryTrusted = false;
+            IsRootTrusted = false;
+            PendingFirefoxRootClearName = null;
+            return;
+        }
+
+        PendingFirefoxRootClearName = RootCertificateName;
+        // Combined path for tests: full CN sweep (may CryptUI). UI callers use List + RemoveByThumb.
+        _proxy.CertificateManager.PruneOrphanedSameCommonNameCertificates(
+            machineStore, keepCurrentThumbprint: false);
+        RefreshTrustAfterRootRemove(machineStore);
+    }
+
+    /// <summary>Read-only list of same-CN Root thumbprints to delete. Safe off the UI thread.</summary>
+    public IReadOnlyList<string> ListRootThumbprintsToRemove(bool machineStore)
+    {
+        if (_proxy is null || UseInMemoryTrustState)
+            return Array.Empty<string>();
+
+        PendingFirefoxRootClearName = RootCertificateName;
+        var location = machineStore ? StoreLocation.LocalMachine : StoreLocation.CurrentUser;
+        return _proxy.CertificateManager.ListSameCommonNameRootThumbprints(location, keepThumbprint: null);
+    }
+
+    /// <summary>
+    ///     Read-only list of same-CN Root thumbprints that are NOT the current root: leftovers from earlier
+    ///     CA regenerations that only confuse chain building. Safe off the UI thread.
+    /// </summary>
+    public IReadOnlyList<string> ListStaleRootThumbprints(bool machineStore)
+    {
+        var current = RootCertificate?.Thumbprint;
+        if (ListStaleRootsOverride is { } listOverride)
+            return listOverride(machineStore).Where(t => !IsCurrentRootThumbprint(t, current)).ToList();
+        if (_proxy is null || UseInMemoryTrustState || string.IsNullOrEmpty(current))
+            return Array.Empty<string>();
+
+        var location = machineStore ? StoreLocation.LocalMachine : StoreLocation.CurrentUser;
+        return _proxy.CertificateManager.ListSameCommonNameRootThumbprints(location, keepThumbprint: current);
+    }
+
+    /// <summary>Test seam: replaces the Root-store listing of stale thumbprints (never touches the OS store).</summary>
+    internal Func<bool, IReadOnlyList<string>>? ListStaleRootsOverride { get; set; }
+
+    /// <summary>Test seam: replaces the CryptUI Root removal of one thumbprint.</summary>
+    internal Action<bool, string>? RemoveRootOverride { get; set; }
+
+    private static bool IsCurrentRootThumbprint(string? candidate, string? current) =>
+        !string.IsNullOrEmpty(current) && string.Equals(candidate, current, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>One Root Remove by thumbprint (CryptUI). Must run on a pumping UI thread.</summary>
+    public void RemoveRootThumbprintOnUi(bool machineStore, string thumbprint)
+    {
+        if (RemoveRootOverride is { } removeOverride)
+        {
+            removeOverride(machineStore, thumbprint);
+            return;
+        }
+
+        if (_proxy is null || UseInMemoryTrustState)
+            return;
+
+        var location = machineStore ? StoreLocation.LocalMachine : StoreLocation.CurrentUser;
+        _proxy.CertificateManager.RemoveCertificateByThumbprint(StoreName.Root, location, thumbprint);
+    }
+
+    /// <summary>
+    ///     After CryptUI Root Removes: drop matching Personal-store entries + refresh IsRootTrusted.
+    ///     Safe off the UI thread (no Root CryptUI). Does not touch Firefox.
+    /// </summary>
+    public void FinalizeAfterRootRemove(bool machineStore)
+    {
+        if (_proxy is null)
+            return;
+
+        if (UseInMemoryTrustState)
+        {
+            _inMemoryTrusted = false;
+            IsRootTrusted = false;
+            return;
+        }
+
+        var location = machineStore ? StoreLocation.LocalMachine : StoreLocation.CurrentUser;
+        try
+        {
+            // Thumbprint remove only - avoid another subject scan of a large Personal store.
+            var thumb = RootCertificate?.Thumbprint;
+            if (!string.IsNullOrEmpty(thumb))
+                _proxy.CertificateManager.RemoveCertificateByThumbprint(StoreName.My, location, thumb);
+            else
+                _proxy.CertificateManager.PruneOrphanedPersonalCertificates(
+                    location, keepCurrentThumbprint: false);
+        }
+        catch
+        {
+            // best-effort
+        }
+
+        RefreshTrustAfterRootRemove(machineStore);
+    }
+
+    /// <summary>macOS/Linux Keychain/NSS untrust - may prompt; pumping UI thread.</summary>
+    public void ApplyUnixUntrustOnUi()
+    {
+        using var scope = InspectorUxTrace.Scope("ApplyUnixUntrustOnUi");
+        if (_proxy is null || UseInMemoryTrustState || OperatingSystem.IsWindows())
+            return;
+        if (CertificateManager.AreInteractiveRootStoreMutationsSuppressed)
+            return;
+        if (RootCertificate is null)
+            return;
+
+        try
+        {
+            _proxy.CertificateManager.ApplyUnixSslUntrust();
+            InspectorUxTrace.Event("ApplyUnixUntrustOnUi.Done");
+        }
+        catch
+        {
+            InspectorUxTrace.Event("ApplyUnixUntrustOnUi.Fault");
+            // best-effort
+        }
+    }
+
+    private void RefreshTrustAfterRootRemove(bool machineStore)
+    {
+        if (OperatingSystem.IsWindows())
+            IsRootTrusted = IsRootPresentInStore(machineStore);
+        else if (OperatingSystem.IsMacOS())
+            IsRootTrusted = _proxy!.CertificateManager.IsOsRootStillPresent();
+        else
+            IsRootTrusted = _proxy!.CertificateManager.VerifyOsUserSslTrust();
+    }
+
+    /// <summary>
+    ///     After OS Root remove: optionally clear Firefox prefs, delete PFX/leaf cache, mint new root.
+    ///     Safe off the UI thread (no CryptUI).
+    /// </summary>
+    public bool MintNewRootCertificateCore(bool clearFirefox = true)
+    {
+        using var scope = InspectorUxTrace.Scope("MintNewRoot", $"clearFirefox={clearFirefox}");
+        if (_proxy is null)
+            return false;
+
+        if (clearFirefox)
+            ClearPendingFirefoxRootTrust();
+        else
+            PendingFirefoxRootClearName = null;
+
+        EnsureRootPfxPath();
+        var mgr = _proxy.CertificateManager;
+        using (InspectorUxTrace.Scope("MintNewRoot.ClearRootCertificate"))
+            mgr.ClearRootCertificate();
+
+        try
+        {
+            if (File.Exists(_rootPfxPath))
+                File.Delete(_rootPfxPath);
+        }
+        catch
+        {
+            // best-effort
+        }
+
+        try
+        {
+            var localCrts = Path.Combine(Path.GetDirectoryName(_rootPfxPath!)!, "crts");
+            if (Directory.Exists(localCrts))
+                Directory.Delete(localCrts, recursive: true);
+        }
+        catch
+        {
+            // best-effort
+        }
+
+        mgr.PfxFilePath = _rootPfxPath!;
+        bool ok;
+        using (InspectorUxTrace.Scope("MintNewRoot.CreateRootCertificate"))
+            ok = mgr.CreateRootCertificate(persistToFile: true);
+        // Brand-new thumbprint cannot be in the Root store yet - do not open Crypt32 here
+        // (after Remove the store is hot; a useless Find routinely stalls Clear+Install).
+        IsRootTrusted = UseInMemoryTrustState && _inMemoryTrusted;
+
+        using (InspectorUxTrace.Scope("MintNewRoot.PruneLegacySharedCrts"))
+            PruneLegacySharedCrts(force: true);
+        return ok && mgr.RootCertificate != null;
+    }
+
+    /// <summary>Test seam: override marker + shared-crts paths under a temp directory.</summary>
+    public string? LegacyCrtsTestRoot { get; set; }
+
+    private string LegacySharedCrtsMarkerPath()
+    {
+        EnsureRootPfxPath();
+        var dir = LegacyCrtsTestRoot ?? Path.GetDirectoryName(_rootPfxPath!)!;
+        return Path.Combine(dir, "legacy-shared-crts-cleared");
+    }
+
+    private string ResolveLegacySharedCrtsDirectory()
+    {
+        if (LegacyCrtsTestRoot != null)
+            return Path.Combine(LegacyCrtsTestRoot, "shared-crts");
+        return Titanium.Web.Proxy.Network.DefaultCertificateDiskCache.GetSharedLeafCertificateDirectory();
+    }
+
+    private void TryPruneLegacySharedCrtsOnce()
+    {
+        var marker = LegacySharedCrtsMarkerPath();
+        if (File.Exists(marker))
+            return;
+        PruneLegacySharedCrts(force: false);
+    }
+
+    /// <summary>
+    ///     Best-effort delete of shared <c>Titanium.Web.Proxy/crts</c> (never the shared root PFX).
+    ///     When <paramref name="force"/> is false, writes the one-time Start marker.
+    /// </summary>
+    public void PruneLegacySharedCrts(bool force)
+    {
+        _ = force; // Callers pass Start vs rotate; marker write is identical.
+        try
+        {
+            var sharedCrts = ResolveLegacySharedCrtsDirectory();
+            if (Directory.Exists(sharedCrts))
+                Directory.Delete(sharedCrts, recursive: true);
+        }
+        catch
+        {
+            // best-effort
+        }
+
+        // Start (force=false) and rotate (force=true) both ensure the one-time marker exists.
+        try
+        {
+            File.WriteAllText(LegacySharedCrtsMarkerPath(), DateTime.UtcNow.ToString("O"));
+        }
+        catch
+        {
+            // best-effort
+        }
+    }
+
+    public bool RefreshTrustState(bool machineStore = false)
+    {
+        if (UseInMemoryTrustState)
+        {
+            IsRootTrusted = _inMemoryTrusted;
+            return IsRootTrusted;
+        }
+
+        // Windows Root store presence == trust. On macOS/Linux, presence is not enough -
+        // VerifyOsUserSslTrust checks Keychain/NSS SSL trust (security verify-cert / certutil).
+        if (OperatingSystem.IsWindows())
+        {
+            IsRootTrusted = IsRootPresentInStore(machineStore);
+            return IsRootTrusted;
+        }
+
+        if (_proxy is null)
+        {
+            IsRootTrusted = false;
+            return false;
+        }
+
+        IsRootTrusted = _proxy.CertificateManager.VerifyOsUserSslTrust();
+        return IsRootTrusted;
+    }
+
+    public bool IsRootPresentInStore(bool machineStore)
+    {
+        if (UseInMemoryTrustState)
+        {
+            return _inMemoryTrusted;
+        }
+
+        var cert = RootCertificate;
+        if (cert is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            using var store = new X509Store(StoreName.Root,
+                machineStore ? StoreLocation.LocalMachine : StoreLocation.CurrentUser);
+            store.Open(OpenFlags.ReadOnly);
+            var found = store.Certificates.Find(X509FindType.FindByThumbprint, cert.Thumbprint, validOnly: false);
+            return found.Count > 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public string? ExportRootCertificate(string? destinationPath = null)
+    {
+        var cert = RootCertificate;
+        if (cert is null)
+        {
+            return null;
+        }
+
+        EnsureRootPfxPath();
+        var path = destinationPath ?? Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
+            "TitaniumInspector-RootCA.cer");
+        if (Directory.Exists(path))
+        {
+            throw new IOException("Export path is a directory: " + path);
+        }
+
+        var der = cert.Export(X509ContentType.Cert);
+        if (IsPemExportPath(path))
+        {
+            File.WriteAllText(path, EncodeCertificatePem(der), Encoding.ASCII);
+        }
+        else
+        {
+            File.WriteAllBytes(path, der);
+        }
+
+        return path;
+    }
+
+    internal static bool IsPemExportPath(string path) =>
+        Path.GetExtension(path).Equals(".pem", StringComparison.OrdinalIgnoreCase);
+
+    internal static string EncodeCertificatePem(byte[] der)
+    {
+        var b64 = Convert.ToBase64String(der);
+        var sb = new StringBuilder(b64.Length + 64);
+        sb.Append("-----BEGIN CERTIFICATE-----\n");
+        for (var i = 0; i < b64.Length; i += 64)
+        {
+            var len = Math.Min(64, b64.Length - i);
+            sb.Append(b64, i, len);
+            sb.Append('\n');
+        }
+
+        sb.Append("-----END CERTIFICATE-----\n");
+        return sb.ToString();
+    }
+
+    private void EnsureRootPfxPath()
+    {
+        if (_rootPfxPath is not null)
+        {
+            return;
+        }
+
+        var dir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "TitaniumInspector");
+        Directory.CreateDirectory(dir);
+        _rootPfxPath = Path.Combine(dir, "rootCert.pfx");
+    }
+
+    private Task OnBeforeTunnelConnect(object sender, TunnelConnectSessionEventArgs e)
+    {
+        var host = e.HttpClient.Request.RequestUri?.Host
+                   ?? TryHost(e.HttpClient.Request);
+        if (MatchesWinAuthHost(host))
+        {
+            // NTLM and Negotiate are connection-bound and are not defined on HTTP/2.
+            e.UpstreamHttpProtocol = UpstreamHttpProtocol.Http11;
+        }
+
+        var disableDecrypt = MitmBypass.ShouldDisableSslDecrypt(
+            host,
+            DecryptSkipHosts,
+            userOnlyHosts: DecryptOnlyHosts);
+        var learnedBypass = !disableDecrypt && DecryptHttps && IsLearnedDecryptBypass(host);
+        e.DecryptSsl = DecryptHttps && !disableDecrypt && !learnedBypass;
+        e.AllowHttpProtocolTranslation = true;
+        // Opaque tunnels cannot show an error page after CONNECT 200 (the browser just sees a closed
+        // connection). Dial first so DNS/refused/timeout surface as a 502/504 CONNECT response; the
+        // dialed connection is reused for the tunnel, so no extra dial is paid.
+        e.EstablishServerConnectionBeforeResponse = !e.DecryptSsl;
+        var opaqueReason = OpaqueTunnelReason.None;
+        if (learnedBypass)
+            opaqueReason = OpaqueTunnelReason.LearnedFailure;
+        else if (disableDecrypt || !DecryptHttps)
+            opaqueReason = MitmBypass.ResolveOpaqueReason(host, DecryptHttps, DecryptSkipHosts, userOnlyHosts: DecryptOnlyHosts);
+
+        if (!Capturing)
+        {
+            return Task.CompletedTask;
+        }
+
+        try
+        {
+            // Opaque HTTPS (DecryptHttps=false) never hits BeforeRequest - publish CONNECT here
+            // so the session list matches Fiddler when decryption is off.
+            var snap = CreateTunnelSnapshot(e, opaqueReason);
+            if (opaqueReason != OpaqueTunnelReason.None)
+            {
+                Note(e.HttpClient, "stats.event.opaque", failure: false);
+            }
+
+            AttachTunnelByteCounters(e, snap);
+            _live[e.HttpClient] = snap;
+            SessionCaptured?.Invoke(this, snap);
+            ScheduleProcessResolve(snap, e.HttpClient.ProcessId);
+        }
+        catch
+        {
+            // never break the proxy pipeline for capture failures
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private Task OnBeforeTunnelConnectResponse(object sender, TunnelConnectSessionEventArgs e)
+    {
+        if (!_live.TryGetValue(e.HttpClient, out var snap))
+        {
+            return Task.CompletedTask;
+        }
+
+        try
+        {
+            ApplyConnectCompletion(snap, e);
+            PublishEvents(snap, e.HttpClient);
+            SessionUpdated?.Invoke(this, snap);
+        }
+        catch
+        {
+            // ignore
+        }
+        finally
+        {
+            // CONNECT capture is done after the response. Keep the snapshot in SessionStore;
+            // tunnel byte counters hold the snap via closure. Leaving DecryptSsl entries in
+            // _live roots every CONNECT HttpClient for the process lifetime.
+            _live.TryRemove(e.HttpClient, out _);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private SessionSnapshot CreateTunnelSnapshot(TunnelConnectSessionEventArgs e, OpaqueTunnelReason opaqueReason)
+    {
+        var req = e.HttpClient.Request;
+
+        return new SessionSnapshot
+        {
+            Id = NextSessionId(),
+            ConnectionId = e.ClientConnectionId,
+            Method = "CONNECT",
+            Url = req.RequestUriString ?? req.Url ?? "",
+            Host = TryHost(req),
+            StartedUtc = DateTimeOffset.UtcNow,
+            RequestHeadersText = FormatHeaders(req.Headers),
+            Protocol = SessionDisplayFormat.FormatHttpProtocol(req.HttpVersion),
+            IsTunnel = true,
+            OpaqueReason = opaqueReason,
+        };
+    }
+
+    private async Task OnBeforeRequest(object sender, SessionEventArgs e) // NOSONAR S3776 -- Capture pipeline (scripts, AutoResponder, breakpoints) shares session state; splitting would hide ordering.
+    {
+        try
+        {
+            // Buffer when safe. GraphQL tools must NOT force GetRequestBody past the skip
+            // (huge POST would RST HTTP/2 with ENHANCE_YOUR_CALM).
+            if (e.HttpClient.Request.HasBody && ShouldBufferBody(e.HttpClient.Request, e))
+            {
+                RememberWire(e.HttpClient, request: true, e.HttpClient.Request.ContentLength);
+                e.HttpClient.Request.KeepBody = true;
+                await e.GetRequestBody(CancellationToken.None);
+            }
+
+            // Before scripts so the grid snapshot and the server see the same headers.
+            var tweaks = RequestCaptureTweaks.Apply(e.HttpClient.Request, DisableCaching, ForceUncompressed);
+            if (tweaks.HasFlag(RequestTweakChanges.Caching))
+            {
+                Note(e.HttpClient, "stats.event.cache", failure: false);
+            }
+
+            if (tweaks.HasFlag(RequestTweakChanges.Encoding))
+            {
+                Note(e.HttpClient, "stats.event.uncompressed", failure: false);
+            }
+
+            if (SessionScriptHost.HasEffect(ScriptOnRequest))
+            {
+                Note(e.HttpClient, "stats.event.script", failure: false);
+            }
+
+            if (SessionScriptHost.ApplyOnRequest(ScriptOnRequest, e))
+            {
+                MarkLocalAnswer(e.HttpClient);
+                return;
+            }
+
+            string? requestBody = null;
+            var needsBodyForTools =
+                (AutoResponder is { Enabled: true } && AutoResponder.HasEnabledGraphQlRule()) ||
+                (MapRemote is { Enabled: true } && MapRemote.HasEnabledGraphQlRule()) ||
+                (Breakpoints is { Enabled: true } && !string.IsNullOrWhiteSpace(Breakpoints.GraphQlOperationName));
+            if (needsBodyForTools && e.HttpClient.Request.IsBodyRead)
+            {
+                requestBody = await e.GetRequestBodyAsString(CancellationToken.None);
+            }
+
+            var requestUrl = e.HttpClient.Request.Url ?? "";
+
+            // AutoResponder / Map Local before breakpoints / origin.
+            var autoResponded = false;
+            if (AutoResponder is not null &&
+                AutoResponder.TryMatch(requestUrl, requestBody, out var rule) &&
+                rule is not null &&
+                AutoResponderViewModel.TryResolveResponse(rule, out var inlineBody, out var mapLocalPath, out _, out _))
+            {
+                if (mapLocalPath is not null)
+                {
+                    e.RespondStreaming(
+                        ProxyResults.File(mapLocalPath, rule.ContentType, (HttpStatusCode)rule.StatusCode),
+                        closeServerConnection: false);
+                }
+                else
+                {
+                    var headers = new List<HttpHeader>
+                    {
+                        new("Content-Type", rule.ContentType),
+                    };
+                    e.GenericResponse(inlineBody ?? Array.Empty<byte>(), (HttpStatusCode)rule.StatusCode, headers);
+                }
+
+                autoResponded = true;
+                MarkLocalAnswer(e.HttpClient);
+                Note(e.HttpClient, "stats.event.rule", failure: false);
+            }
+
+            // Map Remote: rewrite URL before origin (only when not already answered).
+            if (!autoResponded &&
+                MapRemote is not null &&
+                MapRemote.TryRewrite(requestUrl, requestBody, out var rewritten, out _) &&
+                !string.IsNullOrEmpty(rewritten))
+            {
+                e.HttpClient.Request.Url = rewritten;
+                Note(e.HttpClient, "stats.event.rule", failure: false);
+            }
+
+            if (Breakpoints is { Enabled: true } &&
+                (string.IsNullOrWhiteSpace(Breakpoints.GraphQlOperationName) ||
+                 GraphQlOperationMatcher.MatchesOperation(requestBody, Breakpoints.GraphQlOperationName)) &&
+                Breakpoints.TryEnter(CreatePreviewSnapshot(e, assignId: false), out var hit))
+            {
+                Note(e.HttpClient, "stats.event.breakpoint", failure: false);
+                var action = await hit.WaitAsync(CancellationToken.None);
+                if (action == BreakpointAction.Abort)
+                {
+                    MarkLocalAnswer(e.HttpClient);
+                    e.GenericResponse("Aborted by Titanium Inspector breakpoint", HttpStatusCode.Forbidden);
+                    return;
+                }
+
+                if (hit.EditedBody is not null)
+                {
+                    e.SetRequestBodyString(hit.EditedBody);
+                }
+            }
+
+            if (!autoResponded)
+            {
+                TryEnableWindowsAuthentication(e);
+            }
+
+            if (!Capturing)
+            {
+                await PaceBufferedUploadAsync(e).ConfigureAwait(false);
+                return;
+            }
+
+            var snap = CreatePreviewSnapshot(e, assignId: true);
+            _live[e.HttpClient] = snap;
+            SessionCaptured?.Invoke(this, snap);
+            ScheduleProcessResolve(snap, e.HttpClient.ProcessId);
+            await PaceBufferedUploadAsync(e).ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // never break the proxy pipeline for capture failures
+        }
+    }
+
+    private async Task OnBeforeResponse(object sender, SessionEventArgs e)
+    {
+        try
+        {
+            await TryBufferResponseBodyAsync(e);
+            ApplyResponseScriptAndNotes(e);
+
+            if (await TryAbortAtResponseBreakpointAsync(e))
+            {
+                return;
+            }
+
+            var snap = EnsureLiveSnapshotForResponse(e);
+            if (snap is null)
+            {
+                return;
+            }
+
+            var responseEdited = false;
+            try
+            {
+                FillResponse(snap, e);
+            }
+            finally
+            {
+                // Publish whatever was filled (status, headers, protocol are set first) even if a later
+                // step throws, so the grid row never stays blank.
+                SessionUpdated?.Invoke(this, snap);
+            }
+
+            if (_exchange.TryGetValue(e.HttpClient, out var state))
+            {
+                responseEdited = state.ResponseEdited;
+            }
+
+            await ApplyResponseThrottleAsync(e, responseEdited).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            InspectorUxTrace.Event("BeforeResponse.Failed",
+                $"{e.HttpClient.Request.Url} ver={e.HttpClient.Request.HttpVersion}->{e.HttpClient.Response.HttpVersion} " +
+                $"status={e.HttpClient.Response.StatusCode} {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private async Task TryBufferResponseBodyAsync(SessionEventArgs e)
+    {
+        if (!e.HttpClient.Response.HasBody || !ShouldBufferBody(e.HttpClient.Response, e))
+        {
+            return;
+        }
+
+        RememberWire(e.HttpClient, request: false, e.HttpClient.Response.ContentLength);
+        e.HttpClient.Response.KeepBody = true;
+        try
+        {
+            await e.GetResponseBody(CancellationToken.None);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Body capture is best-effort: the row must still get its status / protocol / headers.
+            InspectorUxTrace.Event("BeforeResponse.BodyBufferFailed",
+                $"{e.HttpClient.Request.Url} ver={e.HttpClient.Request.HttpVersion}->{e.HttpClient.Response.HttpVersion} " +
+                $"{ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private void ApplyResponseScriptAndNotes(SessionEventArgs e)
+    {
+        if (SessionScriptHost.HasEffect(ScriptOnResponse))
+        {
+            Note(e.HttpClient, "stats.event.script", failure: false);
+        }
+
+        if (SessionScriptHost.ApplyOnResponse(ScriptOnResponse, e))
+        {
+            MarkLocalAnswer(e.HttpClient);
+        }
+
+        if (e.EnableWinAuth && e.HttpClient.Response.StatusCode == (int)HttpStatusCode.RequestEntityTooLarge)
+        {
+            Note(e.HttpClient, "stats.event.winAuthTooLarge", failure: true);
+        }
+    }
+
+    private async Task<bool> TryAbortAtResponseBreakpointAsync(SessionEventArgs e)
+    {
+        if (!BreakpointOnResponse ||
+            Breakpoints is not { Enabled: true } ||
+            !Breakpoints.TryEnter(CreatePreviewSnapshot(e, assignId: false), out var hit))
+        {
+            return false;
+        }
+
+        Note(e.HttpClient, "stats.event.breakpoint", failure: false);
+        var action = await hit.WaitAsync(CancellationToken.None);
+        if (action == BreakpointAction.Abort)
+        {
+            MarkLocalAnswer(e.HttpClient);
+            e.GenericResponse("Aborted by Titanium Inspector response breakpoint", HttpStatusCode.Forbidden);
+            return true;
+        }
+
+        if (hit.EditedBody is not null)
+        {
+            e.SetResponseBodyString(hit.EditedBody);
+            Exchange(e.HttpClient).ResponseEdited = true;
+        }
+
+        return false;
+    }
+
+    private SessionSnapshot? EnsureLiveSnapshotForResponse(SessionEventArgs e)
+    {
+        if (_live.TryGetValue(e.HttpClient, out var snap))
+        {
+            return snap;
+        }
+
+        if (!Capturing)
+        {
+            return null;
+        }
+
+        snap = CreatePreviewSnapshot(e, assignId: true);
+        _live[e.HttpClient] = snap;
+        SessionCaptured?.Invoke(this, snap);
+        ScheduleProcessResolve(snap, e.HttpClient.ProcessId);
+        return snap;
+    }
+
+    private Task OnAfterResponse(object sender, SessionEventArgs e)
+    {
+        if (_live.TryGetValue(e.HttpClient, out var snap))
+        {
+            FinalizeStreamingRequestBody(snap);
+            FinalizeStreamingBody(snap);
+            // Response/reason first, duration last: DurationMs is what marks the session as finished.
+            RecordMissingResponse(snap, e);
+            ApplyTiming(snap, e.Timing, e.UpstreamConnectionTiming, snap.StartedUtc);
+            if (e.Timing?.AttemptCount > 1)
+            {
+                Note(e.HttpClient, "stats.event.retry", failure: false);
+            }
+
+            PublishEvents(snap, e.HttpClient);
+            SessionUpdated?.Invoke(this, snap);
+        }
+
+        _live.TryRemove(e.HttpClient, out _);
+        _exchange.TryRemove(e.HttpClient, out _);
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    ///     The session is over but BeforeResponse never filled a response (origin refused / reset, timeout,
+    ///     client gave up). Keep the proxy's synthetic 502/504 when it sent one; otherwise record why there
+    ///     is no response so Inspect does not claim the response is still on its way.
+    /// </summary>
+    private static void RecordMissingResponse(SessionSnapshot snap, SessionEventArgs e)
+    {
+        if (snap.IsTunnel || snap.StatusCode is > 0)
+        {
+            return;
+        }
+
+        try
+        {
+            if (e.HttpClient.Response is { StatusCode: >= 100 and <= 599 })
+            {
+                FillResponse(snap, e);
+            }
+        }
+        catch
+        {
+            // Fall through to the failure reason below.
+        }
+
+        if (snap.StatusCode is null or 0)
+        {
+            snap.FailureReason = DescribeNoResponse(e.Exception);
+        }
+    }
+
+    internal static string DescribeNoResponse(Exception? ex)
+    {
+        for (var inner = ex; inner is not null; inner = inner.InnerException)
+        {
+            switch (inner)
+            {
+                case Titanium.Web.Proxy.Exceptions.ProxyTimeoutException:
+                case TimeoutException:
+                    return "Timed out waiting for the server to respond.";
+                case System.Net.Sockets.SocketException { SocketErrorCode: System.Net.Sockets.SocketError.ConnectionRefused }:
+                    return "Connection refused by the server.";
+                case System.Net.Sockets.SocketException { SocketErrorCode: System.Net.Sockets.SocketError.ConnectionReset }:
+                    return "Connection reset by the server.";
+                case System.Net.Sockets.SocketException { SocketErrorCode: System.Net.Sockets.SocketError.HostNotFound }:
+                case System.Net.Sockets.SocketException { SocketErrorCode: System.Net.Sockets.SocketError.NoData }:
+                    return "Could not resolve the server host name.";
+                case System.Net.Sockets.SocketException { SocketErrorCode: System.Net.Sockets.SocketError.TimedOut }:
+                    return "Timed out connecting to the server.";
+                case OperationCanceledException:
+                    return "The request was cancelled before a response arrived (the client likely disconnected).";
+            }
+        }
+
+        return ex is null
+            ? "The connection closed before the server replied."
+            : $"The connection failed before a response arrived: {ex.GetBaseException().Message}";
+    }
+
+    /// <summary>Capture stopped while sessions were still waiting on the origin.</summary>
+    private void FinalizeInFlightSessions()
+    {
+        foreach (var snap in _live.Values)
+        {
+            if (snap.IsTunnel || snap.StatusCode is > 0 || snap.FailureReason is not null)
+            {
+                continue;
+            }
+
+            snap.FailureReason = "Capture was stopped before a response arrived.";
+            ApplyTiming(snap, null, null, snap.StartedUtc);
+            SessionUpdated?.Invoke(this, snap);
+        }
+    }
+
+    private Task OnServerCertValidation(object sender, CertificateValidationEventArgs e)
+    {
+        // When a callback is subscribed, Core returns args.IsValid only (default false).
+        // Accept valid public chains; optionally ignore all errors when the user opts in.
+        e.IsValid = IgnoreServerCertificateErrors
+                    || e.SslPolicyErrors == SslPolicyErrors.None;
+        if (e.SslPolicyErrors != SslPolicyErrors.None)
+        {
+            Note(e.Session.HttpClient, "stats.event.tls", failure: true);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private SessionSnapshot CreatePreviewSnapshot(SessionEventArgs e, bool assignId)
+    {
+        var req = e.HttpClient.Request;
+        var originalBody = req.IsBodyRead && req.HasBody ? req.Body : null;
+        var bodyBytes = InspectorBodyLimits.TruncateBytes(originalBody);
+        var bodyText = bodyBytes is null ? null : InspectorBodyLimits.TruncateText(Encoding.UTF8.GetString(bodyBytes));
+        GrpcJsonTranscodeSessionMark.TryGet(e.UserData, out var mark);
+
+        var snap = new SessionSnapshot
+        {
+            Id = assignId ? NextSessionId() : 0,
+            ConnectionId = e.ClientConnectionId,
+            Method = mark?.ClientMethod ?? req.Method ?? "GET",
+            Url = BuildDisplayUrl(req, mark),
+            Host = TryHost(req),
+            StartedUtc = DateTimeOffset.UtcNow,
+            RequestHeadersText = FormatHeaders(req.Headers),
+            RequestBodyBytes = bodyBytes,
+            RequestBodyText = bodyText,
+            ContentType = mark?.ClientContentType ?? req.ContentType,
+            Protocol = SessionDisplayFormat.FormatHttpProtocol(req.HttpVersion),
+            IsTunnel = req.Method?.Equals("CONNECT", StringComparison.OrdinalIgnoreCase) == true,
+            IsWebSocket = req.UpgradeToWebSocket,
+            IsGrpc = req.ContentType?.Contains("grpc", StringComparison.OrdinalIgnoreCase) == true ||
+                     mark is not null,
+            IsTranscoded = mark is not null,
+            IsMultipart = req.ContentType?.Contains("multipart/", StringComparison.OrdinalIgnoreCase) == true,
+            IsServerSentEvents =
+                (req.Headers.GetFirstHeader("Accept")?.Value?.Contains("text/event-stream", StringComparison.OrdinalIgnoreCase) == true),
+        };
+
+        ApplyRequestBodyCapture(snap, req, originalBody);
+        SyncHttpBodySize(snap);
+        ApplyTranscodeMark(snap, mark);
+        if (mark?.ClientRequestBody is { Length: > 0 } clientBody)
+        {
+            snap.RequestBodyBytes = InspectorBodyLimits.TruncateBytes(clientBody);
+            snap.RequestBodyText = InspectorBodyLimits.TruncateText(Encoding.UTF8.GetString(clientBody));
+            snap.RequestBodyOriginalSize = clientBody.LongLength;
+            snap.RequestBodyCapture = clientBody.Length > MaxBodyBytes
+                ? BodyCaptureState.Truncated
+                : BodyCaptureState.Complete;
+            SyncHttpBodySize(snap);
+        }
+
+        if (mark?.UpstreamRequestBody is { Length: > 0 } upstreamReq)
+        {
+            snap.UpstreamRequestBodyBytes = InspectorBodyLimits.TruncateBytes(upstreamReq);
+            snap.GrpcFrames = ProtocolFrameInspectors.ParseGrpcFrames(snap.UpstreamRequestBodyBytes);
+            snap.ProtobufDecodedText = ProtobufMessageDecoder.DecodeWireFormat(snap.UpstreamRequestBodyBytes);
+        }
+
+        if (assignId && snap.IsWebSocket)
+        {
+            AttachLiveWebSocketFrames(e, snap);
+        }
+
+        return snap;
+    }
+
+    private static void ApplyTranscodeMark(SessionSnapshot snap, GrpcJsonTranscodeSessionMark? mark)
+    {
+        if (mark is null) return;
+        snap.IsTranscoded = true;
+        snap.ClientMethod = mark.ClientMethod;
+        snap.ClientPathAndQuery = mark.ClientPathAndQuery;
+        snap.ClientContentType = mark.ClientContentType;
+        snap.UpstreamMethod = mark.UpstreamMethod;
+        snap.UpstreamPath = mark.UpstreamPath;
+        snap.UpstreamContentType = mark.UpstreamContentType;
+    }
+
+    private static string BuildDisplayUrl(Request req, GrpcJsonTranscodeSessionMark? mark)
+    {
+        if (mark is null)
+            return req.Url ?? "";
+
+        // Prefer absolute URL with client path when available.
+        var url = req.Url ?? "";
+        if (Uri.TryCreate(url, UriKind.Absolute, out var abs))
+        {
+            var builder = new UriBuilder(abs)
+            {
+                Path = mark.ClientPathAndQuery.Split('?', 2)[0],
+                Query = mark.ClientPathAndQuery.Contains('?', StringComparison.Ordinal)
+                    ? mark.ClientPathAndQuery.Split('?', 2)[1]
+                    : string.Empty
+            };
+            return builder.Uri.ToString();
+        }
+
+        return mark.ClientPathAndQuery;
+    }
+
+    private long NextSessionId() => Interlocked.Increment(ref _nextId);
+
+    /// <summary>Reset the session ID sequence (tests / clear-sessions).</summary>
+    public void ResetSessionIdSequence() => Interlocked.Exchange(ref _nextId, 0);
+
+    private void StartProcessResolveWorker()
+    {
+        StopProcessResolveWorker();
+        if (!ClientProcessId.IsSupported)
+        {
+            return;
+        }
+
+        var channel = Channel.CreateUnbounded<ProcessResolveWork>(new UnboundedChannelOptions
+        {
+            SingleReader = true,
+            SingleWriter = false,
+            AllowSynchronousContinuations = false,
+        });
+        var cts = new CancellationTokenSource();
+        _processResolveChannel = channel;
+        _processResolveCts = cts;
+        _ = Task.Run(() => ProcessResolveLoopAsync(channel.Reader, cts.Token), cts.Token);
+    }
+
+    private void StopProcessResolveWorker()
+    {
+        var cts = _processResolveCts;
+        var channel = _processResolveChannel;
+        _processResolveCts = null;
+        _processResolveChannel = null;
+
+        try
+        {
+            channel?.Writer.TryComplete();
+        }
+        catch
+        {
+            // ignore
+        }
+
+        try
+        {
+            cts?.Cancel();
+        }
+        catch
+        {
+            // ignore
+        }
+
+        cts?.Dispose();
+    }
+
+    private void ScheduleProcessResolve(SessionSnapshot snap, Lazy<int> processId)
+    {
+        var channel = _processResolveChannel;
+        if (channel is null)
+        {
+            return;
+        }
+
+        channel.Writer.TryWrite(new ProcessResolveWork(snap, processId));
+    }
+
+    private async Task ProcessResolveLoopAsync(
+        ChannelReader<ProcessResolveWork> reader,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await foreach (var work in reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            {
+                try
+                {
+                    ApplyResolvedProcess(work);
+                }
+                catch
+                {
+                    // never break the resolve loop for a single session
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // expected on stop
+        }
+    }
+
+    private void ApplyResolvedProcess(ProcessResolveWork work)
+    {
+        var processId = work.ProcessId.Value;
+        if (processId <= 0)
+            return;
+
+        string? processName = null;
+        try
+        {
+            processName = System.Diagnostics.Process.GetProcessById(processId).ProcessName;
+        }
+        catch
+        {
+            // process may have exited; keep pid when known
+        }
+
+        if (work.Snap.ProcessId == processId &&
+            string.Equals(work.Snap.ProcessName, processName, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        work.Snap.ProcessId = processId;
+        work.Snap.ProcessName = processName;
+        SessionUpdated?.Invoke(this, work.Snap);
+    }
+
+    private static void FillResponse(SessionSnapshot snap, SessionEventArgs e) // NOSONAR S3776 -- Snapshot fill walks protocol-specific body/header branches in one place.
+    {
+        var resp = e.HttpClient.Response;
+        snap.StatusCode = resp.StatusCode;
+        snap.ResponseHeadersText = FormatHeaders(resp.Headers);
+        snap.Protocol = SessionDisplayFormat.FormatClientServer(
+            e.HttpClient.Request.HttpVersion, resp.HttpVersion);
+        // Body throws BodyNotFoundException when the response has no body (204, Content-Length: 0, 304),
+        // even though such responses are marked IsBodyRead. That used to abort FillResponse and leave the
+        // row without status / origin protocol.
+        var originalBody = resp.IsBodyRead && resp.HasBody ? resp.Body : null;
+        var bodyBytes = InspectorBodyLimits.TruncateBytes(originalBody);
+        snap.ResponseBodyBytes = bodyBytes;
+        snap.ResponseBodyText = bodyBytes is null ? null : InspectorBodyLimits.TruncateText(Encoding.UTF8.GetString(bodyBytes));
+        ApplyResponseBodyCapture(snap, resp, e.HttpClient.Request, originalBody);
+        SyncHttpBodySize(snap);
+
+        ApplyTiming(snap, e.Timing, e.UpstreamConnectionTiming, snap.StartedUtc);
+
+        if (GrpcJsonTranscodeSessionMark.TryGet(e.UserData, out var mark) && mark is not null)
+        {
+            ApplyTranscodeMark(snap, mark);
+            if (mark.UpstreamResponseBody is { Length: > 0 } upstreamResp)
+            {
+                snap.UpstreamResponseBodyBytes = InspectorBodyLimits.TruncateBytes(upstreamResp);
+                snap.GrpcFrames = ProtocolFrameInspectors.ParseGrpcFrames(snap.UpstreamResponseBodyBytes);
+            }
+        }
+
+        if (snap.IsWebSocket)
+        {
+            // Prefer live frames when present; otherwise best-effort parse.
+            snap.WebSocketFrames ??= ProtocolFrameInspectors.ParseWebSocketFrames(bodyBytes ?? snap.RequestBodyBytes);
+        }
+
+        var contentType = resp.ContentType ?? snap.ContentType ?? "";
+        if (contentType.Contains("text/event-stream", StringComparison.OrdinalIgnoreCase) ||
+            snap.IsServerSentEvents)
+        {
+            snap.IsServerSentEvents = true;
+            snap.SseEvents = SseEventParser.Parse(snap.ResponseBodyText);
+        }
+
+        ApplyResponseBodyViews(snap, bodyBytes);
+
+        if (snap.IsTranscoded && snap.UpstreamResponseBodyBytes is { Length: > 0 })
+        {
+            snap.ProtobufDecodedText = ProtobufMessageDecoder.DecodeWireFormat(snap.UpstreamResponseBodyBytes);
+        }
+    }
+
+    /// <summary>
+    ///     Structured views (gRPC frames, protobuf, multipart) derived from the response body preview.
+    ///     Runs when the body was buffered, and again once a streamed body's preview is final,
+    ///     so unknown-length gRPC / multipart responses keep their decoded views.
+    /// </summary>
+    private static void ApplyResponseBodyViews(SessionSnapshot snap, byte[]? bodyBytes)
+    {
+        if (bodyBytes is not { Length: > 0 })
+        {
+            return;
+        }
+
+        if (snap.IsGrpc && !snap.IsTranscoded)
+        {
+            snap.GrpcFrames = ProtocolFrameInspectors.ParseGrpcFrames(bodyBytes);
+            snap.ProtobufDecodedText = ProtobufMessageDecoder.DecodeWireFormat(bodyBytes);
+        }
+
+        if (snap.IsMultipart)
+        {
+            snap.MultipartParts = ProtocolFrameInspectors.ParseMultipart(snap.ContentType, bodyBytes);
+        }
+    }
+
+    private void RefreshShaper()
+    {
+        var profile = _throttleProfile;
+        var next = profile is null ? null : new LinkShaper(profile);
+        var previous = Interlocked.Exchange(ref _linkShaper, next);
+        previous?.ReleaseWaiters();
+        previous?.Dispose();
+    }
+
+    private void DisposeShaper()
+    {
+        var previous = Interlocked.Exchange(ref _linkShaper, null);
+        previous?.ReleaseWaiters();
+        previous?.Dispose();
+    }
+
+    private void RememberWire(object key, bool request, long length)
+    {
+        if (Volatile.Read(ref _linkShaper) is null || length <= 0)
+        {
+            return;
+        }
+
+        var state = Exchange(key);
+        if (request)
+        {
+            state.RequestWire = length;
+        }
+        else
+        {
+            state.ResponseWire = length;
+        }
+    }
+
+    private void MarkLocalAnswer(object key) => Exchange(key).LocalAnswer = true;
+
+    private ExchangeThrottleState Exchange(object key) =>
+        _exchange.GetOrAdd(key, static _ => new ExchangeThrottleState());
+
+    private async Task PaceBufferedUploadAsync(SessionEventArgs e)
+    {
+        var shaper = Volatile.Read(ref _linkShaper);
+        if (shaper is null)
+        {
+            return;
+        }
+
+        if (_exchange.TryGetValue(e.HttpClient, out var state) && state.LocalAnswer)
+        {
+            return;
+        }
+
+        // HTTP/2 pays the exchange latency here, on the request side: a wait in BeforeRequest overlaps across
+        // streams, while one in BeforeResponse serializes them (see ApplyResponseThrottleAsync).
+        if (LatencyPaidOnRequestSide(e))
+        {
+            await shaper.WaitAsync(shaper.LatencyDelay, CancellationToken.None).ConfigureAwait(false);
+            Note(e.HttpClient, ThrottleEventKey(shaper.Profile), failure: false);
+        }
+
+        var request = e.HttpClient.Request;
+        if (!request.IsBodyRead || !request.HasBody)
+        {
+            return;
+        }
+
+        var wire = state?.RequestWire > 0 ? state.RequestWire : request.Body.LongLength;
+        if (wire <= 0)
+        {
+            return;
+        }
+
+        await shaper.WaitAsync(shaper.Reserve(ThrottleDirection.Upload, wire), CancellationToken.None).ConfigureAwait(false);
+    }
+
+    internal async Task ApplyResponseThrottleAsync(SessionEventArgs e, bool responseEdited)
+    {
+        var shaper = Volatile.Read(ref _linkShaper);
+        if (shaper is null)
+        {
+            return;
+        }
+
+        _exchange.TryGetValue(e.HttpClient, out var state);
+        if (state is { LocalAnswer: true })
+        {
+            return;
+        }
+
+        // A native HTTP/2 exchange (client and origin both HTTP/2) runs this hook inline on the connection's
+        // frame loop, so waiting here would stall every stream on the connection: N parallel responses would
+        // cost N latencies and a long bandwidth wait would starve PING and WINDOW_UPDATE. The latency was
+        // already paid on the request side (PaceBufferedUploadAsync), where the wait overlaps across streams,
+        // and bandwidth is paid by the streamed replacement, which Core writes off the frame loop.
+        var nativeHttp2 = IsNativeHttp2Exchange(e);
+
+        var response = e.HttpClient.Response;
+        byte[]? plain = response.IsBodyRead && response.HasBody ? response.Body : null;
+        var wire = state?.ResponseWire > 0 ? state.ResponseWire : plain?.LongLength ?? 0;
+        var transcoded = GrpcJsonTranscodeSessionMark.TryGet(e.UserData, out _);
+
+        if (!LatencyPaidOnRequestSide(e))
+        {
+            await shaper.WaitAsync(shaper.LatencyDelay, CancellationToken.None).ConfigureAwait(false);
+            Note(e.HttpClient, ThrottleEventKey(shaper.Profile), failure: false);
+
+            shaper = Volatile.Read(ref _linkShaper);
+            if (shaper is null)
+            {
+                return;
+            }
+        }
+
+        if (plain is { Length: > 0 }
+            && ProgressiveDelivery.TryBuild(
+                response,
+                e.HttpClient.Request,
+                plain,
+                wire,
+                transcoded,
+                responseEdited,
+                // On a frame-loop exchange there is no inline burst fallback, so even a small body goes through
+                // the streamed path (one paced slice) instead of arriving unshaped.
+                minWireBytes: nativeHttp2 ? 1 : ProgressiveDelivery.MinWireBytes) is { } plan
+            && TryStreamPlan(e, plan))
+        {
+            return;
+        }
+
+        if (nativeHttp2 || wire <= 0)
+        {
+            return;
+        }
+
+        await shaper.WaitAsync(shaper.Reserve(ThrottleDirection.Download, wire), CancellationToken.None).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    ///     Installs the streamed replacement. Core refuses it when the response can no longer be replaced; that
+    ///     returns false so the caller falls back to one bandwidth wait (or, on a frame-loop exchange, leaves
+    ///     the response unshaped) instead of failing the exchange.
+    /// </summary>
+    private bool TryStreamPlan(SessionEventArgs e, ProgressivePlan plan)
+    {
+        try
+        {
+            StreamPlan(e, plan);
+            return true;
+        }
+        catch (InvalidOperationException ex)
+        {
+            InspectorUxTrace.Event("Throttle.TrickleRefused",
+                $"{e.HttpClient.Request.Url} ver={e.HttpClient.Request.HttpVersion}: {ex.Message}");
+            return false;
+        }
+    }
+
+    private void StreamPlan(SessionEventArgs e, ProgressivePlan plan)
+    {
+        var charge = plan.ChargeWireBytes;
+        // A streamed replacement skips Core's own response processing, where Via is appended. Append it only
+        // where the buffered response would have carried it: Core's native HTTP/2 path sends a response whose
+        // body was read (as capture does) without a Via entry, so adding one here would make the throttled
+        // response differ from the unthrottled one.
+        if (!IsNativeHttp2Exchange(e)
+            && _proxy?.ViaHeaderPseudonym is { Length: > 0 } pseudonym
+            && !e.IsTransparent
+            && !e.IsSocks)
+        {
+            ProgressiveDelivery.AppendVia(plan.Response.Headers, plan.Response.HttpVersion, pseudonym);
+        }
+
+        var http1Client = e.HttpClient.Request.HttpVersion.Major < 2;
+        if (http1Client)
+        {
+            ProgressiveDelivery.MarkConnectionClose(plan.Response.Headers);
+        }
+
+        e.RespondStreaming(
+            plan.Response,
+            (stream, ct) => ProgressiveDelivery.WritePacedAsync(
+                stream,
+                plan.Wire,
+                charge,
+                () => Volatile.Read(ref _linkShaper),
+                ct),
+            // The origin body was already consumed for capture. A replacement response does not inherit that
+            // state, so with closeServerConnection:false Core waits to drain bytes that never come and stops
+            // reading the client's next request. closeServerConnection:true skips the drain, but Core then also
+            // ends an HTTP/1 client connection after this response, which is why that case says so with
+            // Connection: close. An HTTP/2 or HTTP/3 client is multiplexed and there is nothing to drain, so
+            // the origin connection is left alone.
+            closeServerConnection: http1Client);
+    }
+
+    /// <summary>Client and origin are both HTTP/2: BeforeResponse runs inline on the connection frame loop.</summary>
+    private static bool IsNativeHttp2Exchange(SessionEventArgs e) =>
+        e.HttpClient.Request.HttpVersion.Major == 2 && e.HttpClient.Response.HttpVersion.Major == 2;
+
+    /// <summary>Multiplexed clients pay the exchange latency in BeforeRequest, where waits overlap across streams.</summary>
+    private static bool LatencyPaidOnRequestSide(SessionEventArgs e) =>
+        e.HttpClient.Request.HttpVersion.Major == 2;
+
+    private static string ThrottleEventKey(NetworkThrottleProfile profile) => profile.Name switch
+    {
+        "Slow 3G" => "stats.event.throttle.slow3g",
+        "Fast 3G" => "stats.event.throttle.fast3g",
+        "LTE" => "stats.event.throttle.lte",
+        _ => "stats.event.throttle",
+    };
+
+    /// <summary>
+    ///     HTTP/2 body-write hooks run on the connection frame loop. Sleeping there stalls every
+    ///     stream and WINDOW_UPDATE on that connection, so relay pacing is HTTP/1 and HTTP/3 only.
+    /// </summary>
+    private static bool ShouldPaceRelay(SessionEventArgs session)
+    {
+        var request = session.HttpClient.Request.HttpVersion;
+        var response = session.HttpClient.Response.HttpVersion;
+        return request.Major != 2 && response.Major != 2;
+    }
+
+    private static async Task PaceRelayAsync(LinkShaper shaper, ThrottleDirection direction, int byteCount, Action tee)
+    {
+        if (byteCount > 0)
+        {
+            await shaper.WaitAsync(shaper.Reserve(direction, byteCount)).ConfigureAwait(false);
+        }
+
+        tee();
+    }
+
+    private Task PaceWebSocketFrameAsync(
+        LinkShaper shaper,
+        SessionSnapshot snap,
+        WsThrottleFlags flags,
+        WebSocketFrameDirection direction,
+        long byteCount,
+        Action<TimeSpan> setDelay)
+    {
+        var throttleDirection = direction == WebSocketFrameDirection.ClientToServer
+            ? ThrottleDirection.Upload
+            : ThrottleDirection.Download;
+        var delay = byteCount > 0 ? shaper.Reserve(throttleDirection, byteCount) : TimeSpan.Zero;
+        if (flags.TryChargeLatency(throttleDirection))
+        {
+            delay += shaper.LatencyDelay;
+        }
+
+        if (delay > LinkShaper.MaxWait)
+        {
+            delay = LinkShaper.MaxWait;
+        }
+
+        setDelay(delay);
+        SessionUpdated?.Invoke(this, snap);
+        return Task.CompletedTask;
+    }
+
+    private void AttachLiveWebSocketFrames(SessionEventArgs e, SessionSnapshot snap)
+    {
+        // Immutable snapshots: proxy threads append while the UI dispatcher may
+        // enumerate WebSocketFrames (EstimateInMemoryBodyBytes). A shared List
+        // threw InvalidOperationException and killed the process (tray + system proxy gone).
+        var live = new LiveWebSocketFrames();
+        snap.WebSocketFrames = live.Current;
+        WsThrottleFlags? wsFlags = null;
+        e.BeforeWebSocketFrame += (_, args) =>
+        {
+            var direction = args.Direction == WebSocketFrameDirection.ClientToServer ? "Client" : "Server";
+            var opcode = args.OpCode.ToString();
+            live.Append(snap, ProtocolFrameInspectors.FromLiveFrame(direction, opcode, args.Data));
+            var shaper = Volatile.Read(ref _linkShaper);
+            if (shaper is null)
+            {
+                SessionUpdated?.Invoke(this, snap);
+                return Task.CompletedTask;
+            }
+
+            var flags = wsFlags ??= new WsThrottleFlags();
+            return PaceWebSocketFrameAsync(shaper, snap, flags, args.Direction, args.Data.Length, delay => args.Delay = delay);
+        };
+        e.WebSocketFrameElided += (_, args) =>
+        {
+            var direction = args.Direction == WebSocketFrameDirection.ClientToServer ? "Client" : "Server";
+            live.Append(snap, ProtocolFrameInspectors.ElidedFrame(direction, args.OpCode.ToString(), args.DeclaredPayloadLength));
+            var shaper = Volatile.Read(ref _linkShaper);
+            if (shaper is null)
+            {
+                SessionUpdated?.Invoke(this, snap);
+                return Task.CompletedTask;
+            }
+
+            var flags = wsFlags ??= new WsThrottleFlags();
+            var bytes = args.DeclaredPayloadLength < 0 ? 0 : args.DeclaredPayloadLength;
+            return PaceWebSocketFrameAsync(shaper, snap, flags, args.Direction, bytes, delay => args.Delay = delay);
+        };
+    }
+
+    internal Task OnRequestBodyWriteThrottle(object sender, BeforeBodyWriteEventArgs e)
+    {
+        // No lambda in this method: a closure would allocate on the None path.
+        var shaper = Volatile.Read(ref _linkShaper);
+        if (shaper is null || !ShouldPaceRelay(e.Session))
+        {
+            TeeRequestIfStreaming(e);
+            return Task.CompletedTask;
+        }
+
+        return PaceRequestRelayAsync(shaper, e);
+    }
+
+    internal Task OnResponseBodyWriteThrottle(object sender, BeforeBodyWriteEventArgs e)
+    {
+        var shaper = Volatile.Read(ref _linkShaper);
+        if (shaper is null || !ShouldPaceRelay(e.Session))
+        {
+            TeeResponseIfStreaming(e);
+            return Task.CompletedTask;
+        }
+
+        return PaceResponseRelayAsync(shaper, e);
+    }
+
+    private Task PaceRequestRelayAsync(LinkShaper shaper, BeforeBodyWriteEventArgs e) =>
+        PaceRelayAsync(shaper, ThrottleDirection.Upload, e.BodyBytes?.Length ?? 0, () => TeeRequestIfStreaming(e));
+
+    private Task PaceResponseRelayAsync(LinkShaper shaper, BeforeBodyWriteEventArgs e) =>
+        PaceRelayAsync(shaper, ThrottleDirection.Download, e.BodyBytes?.Length ?? 0, () => TeeResponseIfStreaming(e));
+
+    private void TeeRequestIfStreaming(BeforeBodyWriteEventArgs e)
+    {
+        if (e.Session.HttpClient.Request.IsBodyRead
+            || !_live.TryGetValue(e.Session.HttpClient, out var snap)
+            || snap.RequestBodyCapture != BodyCaptureState.Streaming)
+        {
+            return;
+        }
+
+        TeeRequestChunk(snap, e);
+    }
+
+    private void TeeResponseIfStreaming(BeforeBodyWriteEventArgs e)
+    {
+        // Preview tee only for relayed unknown-length bodies (not buffered). Do not tee NotCaptured huge downloads.
+        if (e.Session.HttpClient.Response.IsBodyRead)
+        {
+            return;
+        }
+
+        if (!_live.TryGetValue(e.Session.HttpClient, out var snap))
+        {
+            return;
+        }
+
+        if (snap.ResponseBodyCapture != BodyCaptureState.Streaming)
+        {
+            return;
+        }
+
+        TeeResponseChunk(snap, e);
+    }
+
+    private void TeeResponseChunk(SessionSnapshot snap, BeforeBodyWriteEventArgs e)
+    {
+        var chunk = e.BodyBytes;
+        var len = chunk?.Length ?? 0;
+        if (len > 0)
+        {
+            snap.ResponseBytesSeen += len;
+            snap.ResponseBodyOriginalSize = snap.ResponseBytesSeen;
+            snap.BodySize = snap.ResponseBytesSeen;
+            SyncHttpBodySize(snap);
+
+            var tee = snap.ResponseTeeStream;
+            if (tee is null)
+            {
+                tee = new MemoryStream(Math.Min(MaxBodyBytes, Math.Max(len, 4096)));
+                snap.ResponseTeeStream = tee;
+            }
+
+            if (tee.Length < MaxBodyBytes)
+            {
+                var toWrite = (int)Math.Min(len, MaxBodyBytes - tee.Length);
+                tee.Write(chunk!, 0, toWrite);
+            }
+        }
+
+        if (e.IsLastChunk)
+        {
+            FinalizeStreamingBody(snap);
+            SessionUpdated?.Invoke(this, snap);
+            return;
+        }
+
+        var now = DateTime.UtcNow.Ticks;
+        var last = snap.LastTeeUiUtcTicks;
+        if (last != 0 && (now - last) < TimeSpan.FromMilliseconds(InspectorBodyLimits.TeeUiCoalesceMs).Ticks)
+        {
+            return;
+        }
+
+        snap.LastTeeUiUtcTicks = now;
+        PublishTeePreview(snap);
+        SessionUpdated?.Invoke(this, snap);
+    }
+
+    private static void PublishTeePreview(SessionSnapshot snap)
+    {
+        var tee = snap.ResponseTeeStream;
+        if (tee is null || tee.Length == 0)
+        {
+            return;
+        }
+
+        var bytes = InspectorBodyLimits.DecodeCapturedPrefix(tee.ToArray(), snap.ResponseContentEncoding);
+        snap.ResponseBodyBytes = bytes;
+        snap.ResponseBodyText = InspectorBodyLimits.TruncateText(Encoding.UTF8.GetString(bytes));
+        if (snap.IsServerSentEvents)
+        {
+            snap.SseEvents = SseEventParser.Parse(snap.ResponseBodyText);
+        }
+    }
+
+    private static void FinalizeStreamingBody(SessionSnapshot snap)
+    {
+        if (snap.ResponseBodyCapture != BodyCaptureState.Streaming)
+        {
+            snap.ResponseTeeStream?.Dispose();
+            snap.ResponseTeeStream = null;
+            return;
+        }
+
+        PublishTeePreview(snap);
+        snap.ResponseBodyStreamOpen = false;
+        var captured = snap.ResponseBodyBytes?.LongLength ?? 0;
+        var seen = snap.ResponseBytesSeen;
+        // Seen counts wire bytes; captured is the (possibly decoded) preview. Either the wire
+        // exceeded the tee cap, or decoding hit the preview cap.
+        if (seen > MaxBodyBytes || (captured >= MaxBodyBytes && captured != seen))
+        {
+            snap.ResponseBodyCapture = BodyCaptureState.Truncated;
+        }
+        else if (captured > 0)
+        {
+            snap.ResponseBodyCapture = BodyCaptureState.Complete;
+        }
+        else if (seen == 0 && !snap.IsServerSentEvents)
+        {
+            snap.ResponseBodyCapture = BodyCaptureState.None;
+        }
+
+        ApplyResponseBodyViews(snap, snap.ResponseBodyBytes);
+
+        snap.ResponseBodyOriginalSize = snap.ResponseBytesSeen > 0
+            ? snap.ResponseBytesSeen
+            : snap.ResponseBodyOriginalSize;
+        if (snap.ResponseBytesSeen > 0)
+        {
+            snap.BodySize = snap.ResponseBytesSeen;
+        }
+
+        SyncHttpBodySize(snap);
+
+        snap.ResponseTeeStream?.Dispose();
+        snap.ResponseTeeStream = null;
+    }
+
+    private void TeeRequestChunk(SessionSnapshot snap, BeforeBodyWriteEventArgs e)
+    {
+        var chunk = e.BodyBytes;
+        var len = chunk?.Length ?? 0;
+        if (len > 0)
+        {
+            snap.RequestBytesSeen += len;
+            snap.RequestBodyOriginalSize = snap.RequestBytesSeen;
+
+            var tee = snap.RequestTeeStream;
+            if (tee is null)
+            {
+                tee = new MemoryStream(Math.Min(MaxBodyBytes, Math.Max(len, 4096)));
+                snap.RequestTeeStream = tee;
+            }
+
+            if (tee.Length < MaxBodyBytes)
+            {
+                var toWrite = (int)Math.Min(len, MaxBodyBytes - tee.Length);
+                tee.Write(chunk!, 0, toWrite);
+            }
+        }
+
+        if (e.IsLastChunk)
+        {
+            FinalizeStreamingRequestBody(snap);
+            SyncHttpBodySize(snap);
+            SessionUpdated?.Invoke(this, snap);
+            return;
+        }
+
+        var now = DateTime.UtcNow.Ticks;
+        var last = snap.LastRequestTeeUiUtcTicks;
+        if (last != 0 && (now - last) < TimeSpan.FromMilliseconds(InspectorBodyLimits.TeeUiCoalesceMs).Ticks)
+        {
+            return;
+        }
+
+        snap.LastRequestTeeUiUtcTicks = now;
+        PublishRequestTeePreview(snap);
+        SessionUpdated?.Invoke(this, snap);
+    }
+
+    private static void PublishRequestTeePreview(SessionSnapshot snap)
+    {
+        var tee = snap.RequestTeeStream;
+        if (tee is null || tee.Length == 0)
+        {
+            return;
+        }
+
+        var bytes = InspectorBodyLimits.DecodeCapturedPrefix(tee.ToArray(), snap.RequestContentEncoding);
+        snap.RequestBodyBytes = bytes;
+        snap.RequestBodyText = InspectorBodyLimits.TruncateText(Encoding.UTF8.GetString(bytes));
+    }
+
+    private static void FinalizeStreamingRequestBody(SessionSnapshot snap)
+    {
+        if (snap.RequestBodyCapture == BodyCaptureState.Streaming)
+        {
+            PublishRequestTeePreview(snap);
+            var captured = snap.RequestBodyBytes?.LongLength ?? 0;
+            var seen = snap.RequestBytesSeen;
+            if (seen > MaxBodyBytes || (captured >= MaxBodyBytes && captured != seen))
+            {
+                snap.RequestBodyCapture = BodyCaptureState.Truncated;
+            }
+            else if (captured > 0)
+            {
+                snap.RequestBodyCapture = BodyCaptureState.Complete;
+            }
+            else
+            {
+                snap.RequestBodyCapture = BodyCaptureState.None;
+            }
+
+            if (seen > 0)
+            {
+                snap.RequestBodyOriginalSize = seen;
+            }
+        }
+
+        snap.RequestTeeStream?.Dispose();
+        snap.RequestTeeStream = null;
+    }
+
+    private static void ApplyRequestBodyCapture(SessionSnapshot snap, Request req, byte[]? originalBody)
+    {
+        if (originalBody is not null && req.IsBodyRead)
+        {
+            snap.RequestBodyOriginalSize = originalBody.LongLength;
+            snap.RequestBodyCapture = originalBody.Length > MaxBodyBytes
+                ? BodyCaptureState.Truncated
+                : BodyCaptureState.Complete;
+            return;
+        }
+
+        if (!req.HasBody)
+        {
+            snap.RequestBodyCapture = BodyCaptureState.None;
+            return;
+        }
+
+        if (!req.IsBodyRead && req.ContentLength < 0)
+        {
+            // Unknown length (chunked / H2 without Content-Length) is relayed, not buffered;
+            // a bounded preview is teed from the body-write hook.
+            snap.RequestBodyCapture = BodyCaptureState.Streaming;
+            snap.RequestContentEncoding = req.ContentEncoding;
+            return;
+        }
+
+        var limit = InspectorBodyLimits.MaxMapLocalFileBytes;
+        if (req.ContentLength > limit)
+        {
+            snap.RequestBodyCapture = BodyCaptureState.NotCaptured;
+            snap.RequestBodyOriginalSize = req.ContentLength;
+            return;
+        }
+
+        snap.RequestBodyCapture = BodyCaptureState.None;
+    }
+
+    /// <summary>
+    /// Size column shows the larger of request/response body sizes so a large POST with a
+    /// tiny response is not labeled "10 B" while Inspect shows megabytes of request body.
+    /// CONNECT tunnels keep wire totals from <see cref="AddTunnelBytes"/> and are skipped.
+    /// </summary>
+    private static void SyncHttpBodySize(SessionSnapshot snap)
+    {
+        if (snap.IsTunnel)
+        {
+            return;
+        }
+
+        long? best = snap.BodySize;
+        TakeMax(ref best, snap.RequestBodyOriginalSize);
+        TakeMax(ref best, snap.ResponseBodyOriginalSize);
+        TakeMax(ref best, snap.RequestBodyBytes?.LongLength);
+        TakeMax(ref best, snap.ResponseBodyBytes?.LongLength);
+        if (best is not null)
+        {
+            snap.BodySize = best;
+        }
+    }
+
+    private static void TakeMax(ref long? best, long? candidate)
+    {
+        if (candidate is null or < 0)
+        {
+            return;
+        }
+
+        best = best is null ? candidate : Math.Max(best.Value, candidate.Value);
+    }
+
+    private static void ApplyResponseBodyCapture(
+        SessionSnapshot snap,
+        Response resp,
+        Request req,
+        byte[]? originalBody)
+    {
+        var contentType = resp.ContentType ?? snap.ContentType ?? "";
+        var isSse = InspectorBodyLimits.LooksLikeSseContentType(contentType)
+                    || snap.IsServerSentEvents;
+        if (isSse)
+        {
+            snap.IsServerSentEvents = true;
+        }
+
+        if (originalBody is not null && resp.IsBodyRead)
+        {
+            ApplyBufferedResponseBody(snap, originalBody);
+            return;
+        }
+
+        if (req.UpgradeToWebSocket)
+        {
+            snap.ResponseBodyCapture = BodyCaptureState.None;
+            snap.BodySize ??= resp.ContentLength >= 0 ? resp.ContentLength : null;
+            return;
+        }
+
+        // Unknown length is never buffered (see ShouldBufferBody): relay + bounded preview tee.
+        if (isSse || (resp.HasBody && !resp.IsBodyRead && resp.ContentLength < 0))
+        {
+            ApplyStreamingResponseBody(snap, resp);
+            return;
+        }
+
+        ApplyFiniteUnbufferedResponseBody(snap, resp);
+    }
+
+    /// <summary>
+    ///     Known-length (or empty) response that was not buffered: either too large to capture, or
+    ///     a body we chose to buffer but never read. Neither is previewed.
+    /// </summary>
+    private static void ApplyFiniteUnbufferedResponseBody(SessionSnapshot snap, Response resp)
+    {
+        if (resp.HasBody && resp.ContentLength > InspectorBodyLimits.MaxMapLocalFileBytes)
+        {
+            snap.ResponseBodyCapture = BodyCaptureState.NotCaptured;
+            snap.ResponseBodyOriginalSize = resp.ContentLength;
+            snap.BodySize = resp.ContentLength;
+            return;
+        }
+
+        if (resp.HasBody && !resp.IsBodyRead)
+        {
+            // Should not happen for finite bodies we chose to buffer; treat as not captured.
+            snap.ResponseBodyCapture = BodyCaptureState.NotCaptured;
+            snap.ResponseBodyOriginalSize = resp.ContentLength >= 0 ? resp.ContentLength : null;
+            snap.BodySize = snap.ResponseBodyOriginalSize;
+            return;
+        }
+
+        snap.ResponseBodyCapture = BodyCaptureState.None;
+        snap.BodySize ??= resp.ContentLength >= 0 ? resp.ContentLength : null;
+    }
+
+    private static void ApplyBufferedResponseBody(SessionSnapshot snap, byte[] originalBody)
+    {
+        snap.ResponseBodyOriginalSize = originalBody.LongLength;
+        snap.ResponseBodyCapture = originalBody.Length > MaxBodyBytes
+            ? BodyCaptureState.Truncated
+            : BodyCaptureState.Complete;
+        snap.BodySize = originalBody.LongLength;
+        snap.ResponseBodyStreamOpen = false;
+    }
+
+    private static void ApplyStreamingResponseBody(SessionSnapshot snap, Response resp)
+    {
+        snap.ResponseContentEncoding = resp.ContentEncoding;
+        snap.ResponseBodyCapture = BodyCaptureState.Streaming;
+        snap.ResponseBodyStreamOpen = true;
+        snap.BodySize = snap.ResponseBytesSeen > 0 ? snap.ResponseBytesSeen : null;
+    }
+
+    private bool MatchesWinAuthHost(string? host)
+    {
+        var matcher = Volatile.Read(ref _winAuthMatcher);
+        return matcher is not null && matcher.Matches(host);
+    }
+
+    private void TryEnableWindowsAuthentication(SessionEventArgs e)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var host = TryHost(e.HttpClient.Request);
+        if (!MatchesWinAuthHost(host))
+        {
+            return;
+        }
+
+        e.EnableWinAuth = true;
+        e.UpstreamHttpProtocol = UpstreamHttpProtocol.Http11;
+        Note(e.HttpClient, "stats.event.winAuth", failure: false);
+    }
+
+    private static string? TryHost(Request req)
+    {
+        try
+        {
+            return req.RequestUri?.Host ?? req.Host;
+        }
+        catch
+        {
+            return req.Host;
+        }
+    }
+
+    private static void ApplyConnectCompletion(SessionSnapshot snap, TunnelConnectSessionEventArgs e)
+    {
+        var resp = e.HttpClient.Response;
+        snap.StatusCode = resp.StatusCode != 0 ? resp.StatusCode : 200;
+        snap.ResponseHeadersText = FormatHeaders(resp.Headers);
+        snap.Protocol = SessionDisplayFormat.FormatClientServer(
+            e.HttpClient.Request.HttpVersion, resp.HttpVersion);
+        ApplyTiming(snap, e.Timing, e.UpstreamConnectionTiming, snap.StartedUtc);
+        snap.TtfbMs ??= snap.DurationMs;
+        snap.BodySize ??= 0;
+    }
+
+    private static void AttachTunnelByteCounters(TunnelConnectSessionEventArgs e, SessionSnapshot snap)
+    {
+        e.DataSent += (_, args) => AddTunnelBytes(snap, sent: args.Count, received: 0);
+        e.DataReceived += (_, args) => AddTunnelBytes(snap, sent: 0, received: args.Count);
+    }
+
+    private static void AddTunnelBytes(SessionSnapshot snap, int sent, int received)
+    {
+        if (sent != 0)
+        {
+            snap.AddSentBytes(sent);
+        }
+
+        if (received != 0)
+        {
+            snap.AddReceivedBytes(received);
+        }
+
+        // BodySize is UI-only best-effort; concurrent writers both compute a valid total.
+        snap.BodySize = snap.SentBytes + snap.ReceivedBytes;
+    }
+
+    private void Note(object key, string localizationKey, bool failure)
+    {
+        var buffer = _eventNotes.GetOrAdd(key, static _ => new SessionEventBuffer());
+        buffer.Add(localizationKey, failure);
+    }
+
+    private void PublishEvents(SessionSnapshot snap, object key)
+    {
+        if (!_eventNotes.TryRemove(key, out var buffer))
+        {
+            return;
+        }
+
+        var notes = buffer.Freeze(snap.StartedUtc);
+        snap.Events = notes.Count == 0 ? null : notes;
+    }
+
+    private static void ApplyTiming(
+        SessionSnapshot snap,
+        HttpRequestTiming? timing,
+        UpstreamConnectionTiming? connection,
+        DateTimeOffset startedUtc)
+    {
+        if (timing is not null)
+        {
+            snap.DurationMs = SessionDisplayFormat.RoundMs(timing.TotalDuration.TotalMilliseconds);
+            if (timing.TimeToFirstByte is TimeSpan ttfb)
+            {
+                snap.TtfbMs = SessionDisplayFormat.RoundMs(ttfb.TotalMilliseconds);
+            }
+
+            if (!snap.IsTunnel)
+            {
+                var phases = HarTimingMap.Map(timing, connection);
+                snap.BlockedMs = PhaseOrNull(phases.BlockedMs);
+                snap.DnsMs = PhaseOrNull(phases.DnsMs);
+                snap.ConnectMs = PhaseOrNull(phases.ConnectMs);
+                snap.TlsMs = PhaseOrNull(phases.SslMs);
+                snap.SendMs = PhaseOrNull(phases.SendMs);
+                snap.WaitMs = PhaseOrNull(phases.WaitMs);
+                snap.ReceiveMs = PhaseOrNull(phases.ReceiveMs);
+                snap.ConnectionReused = phases.Reused;
+                snap.TimingAttempts = timing.AttemptCount;
+                snap.TimingRecorded = true;
+                snap.TimingEstimated = false;
+            }
+
+            return;
+        }
+
+        snap.DurationMs = SessionDisplayFormat.RoundMs(
+            Math.Max(0, (DateTimeOffset.UtcNow - startedUtc).TotalMilliseconds));
+    }
+
+    private static double? PhaseOrNull(double milliseconds) => milliseconds < 0 ? null : milliseconds;
+
+    private static string FormatHeaders(HeaderCollection headers)
+    {
+        var sb = new StringBuilder();
+        foreach (var h in headers)
+        {
+            sb.Append(h.Name).Append(": ").Append(h.Value).AppendLine();
+        }
+
+        return sb.ToString();
+    }
+
+    /// <summary>
+    ///     Whole-body buffering for the session grid is only safe when the size is known up front.
+    ///     <see cref="ProxyServer.MaxBufferedBodyBytes" /> is a hard abort budget: exceeding it RSTs
+    ///     HTTP/2 streams (ENHANCE_YOUR_CALM) or drops the connection. A body with no declared length
+    ///     (chunked, H2 without Content-Length, close-delimited, SSE) can exceed it at any point
+    ///     regardless of what it is, so it is relayed untouched and previewed through the bounded
+    ///     body-write tee instead. Known lengths within the budget are buffered (decompressed) as before;
+    ///     a non-positive budget means "unbounded" and always buffers. WebSocket upgrades are never buffered.
+    /// </summary>
+    private static bool ShouldBufferBody(RequestResponseBase message, SessionEventArgs session) =>
+        session.CanBufferBody(message);
+
+    public void Dispose() => EnsureShutdown();
+
+    private sealed class ExchangeThrottleState
+    {
+        public long RequestWire = -1;
+        public long ResponseWire = -1;
+        public bool LocalAnswer;
+        public bool ResponseEdited;
+    }
+
+    private sealed class WsThrottleFlags
+    {
+        private int _uploadLatency;
+        private int _downloadLatency;
+
+        public bool TryChargeLatency(ThrottleDirection direction)
+        {
+            if (direction == ThrottleDirection.Upload)
+            {
+                return Interlocked.Exchange(ref _uploadLatency, 1) == 0;
+            }
+
+            return Interlocked.Exchange(ref _downloadLatency, 1) == 0;
+        }
+    }
+}

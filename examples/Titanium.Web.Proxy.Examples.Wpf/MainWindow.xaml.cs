@@ -3,16 +3,22 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.Quic;
 using System.Text;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Input;
+using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using Microsoft.Extensions.Logging;
 using Titanium.Web.Proxy.EventArguments;
+using Titanium.Web.Proxy.Examples.Shared;
 using Titanium.Web.Proxy.Http;
 using Titanium.Web.Proxy.Models;
+using Titanium.Web.Proxy.Network;
+using Titanium.Web.Proxy.Options;
 
 namespace Titanium.Web.Proxy.Examples.Wpf
 {
@@ -27,6 +33,12 @@ namespace Titanium.Web.Proxy.Examples.Wpf
         public static readonly DependencyProperty ServerConnectionCountProperty = DependencyProperty.Register(
             nameof(ServerConnectionCount), typeof(int), typeof(MainWindow), new PropertyMetadata(default(int)));
 
+        public static readonly DependencyProperty Http3ClientConnectionCountProperty = DependencyProperty.Register(
+            nameof(Http3ClientConnectionCount), typeof(int), typeof(MainWindow), new PropertyMetadata(default(int)));
+
+        public static readonly DependencyProperty Http3ServerConnectionCountProperty = DependencyProperty.Register(
+            nameof(Http3ServerConnectionCount), typeof(int), typeof(MainWindow), new PropertyMetadata(default(int)));
+
         private readonly ProxyServer proxyServer;
 
         private readonly Dictionary<HttpWebClient, SessionListItem> sessionDictionary =
@@ -34,61 +46,80 @@ namespace Titanium.Web.Proxy.Examples.Wpf
 
         private int lastSessionNumber;
         private SessionListItem selectedSession;
+        private bool proxyShutdownDone;
+        private readonly bool trustRootCertificate;
+        private readonly bool trustRootCertificateMachine;
 
         public MainWindow()
         {
-            proxyServer = new ProxyServer();
+            // false,false: do not auto-trust on Start/SetAsSystemProxy — trust is opt-in via TWP_TRUST_ROOT.
+            proxyServer = new ProxyServer(false, false, false);
 
-            //proxyServer.EnableHttp2 = true;
+            // Session traffic is shown in the UI. Library diagnostics go to a rolling file only when
+            // diagnosing (Debug builds, or TWP_ENABLE_FILE_LOG=1). Console stays off for WinExe.
+            proxyServer.Logging.EnableConsole = false;
+#if DEBUG
+            proxyServer.Logging.EnableFile = true;
+            proxyServer.Logging.MinimumLevel = LogLevel.Trace;
+#else
+            var enableFileLog = Environment.GetEnvironmentVariable("TWP_ENABLE_FILE_LOG") is "1" or "true" or "TRUE";
+            proxyServer.Logging.EnableFile = enableFileLog;
+            proxyServer.Logging.MinimumLevel = enableFileLog ? LogLevel.Warning : LogLevel.Error;
+#endif
+            if (proxyServer.Logging.EnableFile)
+            {
+                proxyServer.Logging.FilePath = Path.Combine(AppContext.BaseDirectory, "logs", "wpf-proxy.log");
+            }
+            var certificateDirectory = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Titanium.Web.Proxy");
+            Directory.CreateDirectory(certificateDirectory);
+            proxyServer.CertificateManager.PfxFilePath = Path.Combine(certificateDirectory, "rootCert.pfx");
+            // Browser MITM: ECDSA P-256 leaves + persist (see CertificateManager.ApplyFastColdStartLeafSettings).
+            proxyServer.CertificateManager.ApplyFastColdStartLeafSettings();
 
-            //proxyServer.CertificateManager.CertificateEngine = CertificateEngine.DefaultWindows;
+            // Opt-in MITM root trust (same as Basic):
+            //   TWP_TRUST_ROOT=1           → Current User Personal + Trusted Root
+            //   TWP_TRUST_ROOT_MACHINE=1   → also Local Machine stores (needs elevation)
+            trustRootCertificate = Environment.GetEnvironmentVariable("TWP_TRUST_ROOT") is "1" or "true" or "TRUE";
+            trustRootCertificateMachine =
+                Environment.GetEnvironmentVariable("TWP_TRUST_ROOT_MACHINE") is "1" or "true" or "TRUE";
+            if (trustRootCertificate || trustRootCertificateMachine)
+            {
+                proxyServer.CertificateManager.EnsureRootCertificate();
+                proxyServer.CertificateManager.TrustRootCertificate(machineTrusted: trustRootCertificateMachine);
+            }
 
-            ////Set a password for the .pfx file
-            //proxyServer.CertificateManager.PfxPassword = "PfxPassword";
-
-            ////Set Name(path) of the Root certificate file
-            //proxyServer.CertificateManager.PfxFilePath = @"C:\NameFolder\rootCert.pfx";
-
-            ////do you want Replace an existing Root certificate file(.pfx) if password is incorrect(RootCertificate=null)?  yes====>true
-            //proxyServer.CertificateManager.OverwritePfxFile = true;
-
-            ////save all fake certificates in folder "crts"(will be created in proxy dll directory)
-            ////if create new Root certificate file(.pfx) ====> delete folder "crts"
-            //proxyServer.CertificateManager.SaveFakeCertificates = true;
-
+            // Match ProxyProfile.Balanced / library defaults (same as the Basic example).
+            proxyServer.Profile = ProxyProfile.Balanced;
             proxyServer.ForwardToUpstreamGateway = true;
-
-            //increase the ThreadPool (for server prod)
-            //proxyServer.ThreadPoolWorkerThread = Environment.ProcessorCount * 6;
-
-            ////if you need Load or Create Certificate now. ////// "true" if you need Enable===> Trust the RootCertificate used by this proxy server
-            //proxyServer.CertificateManager.EnsureRootCertificate(true);
-
-            ////or load directly certificate(As Administrator if need this)
-            ////and At the same time chose path and password
-            ////if password is incorrect and (overwriteRootCert=true)(RootCertificate=null) ====> replace an existing .pfx file
-            ////note : load now (if existed)
-            //proxyServer.CertificateManager.LoadRootCertificate(@"C:\NameFolder\rootCert.pfx", "PfxPassword");
 
             var explicitEndPoint = new ExplicitProxyEndPoint(IPAddress.Any, 8000);
 
             proxyServer.AddEndPoint(explicitEndPoint);
-            //proxyServer.UpStreamHttpProxy = new ExternalProxy
-            //{
-            //    HostName = "158.69.115.45",
-            //    Port = 3128,
-            //    UserName = "Titanium",
-            //    Password = "Titanium",
-            //};
 
-            //var socksEndPoint = new SocksProxyEndPoint(IPAddress.Any, 1080, true)
-            //{
-            //    // Generic Certificate hostname to use
-            //    // When SNI is disabled by client
-            //    //GenericCertificateName = "google.com"
-            //};
-
-            //proxyServer.AddEndPoint(socksEndPoint);
+            // HTTP/3 (experimental — suppress TWP001). Example default is on; library Balanced stays off.
+            // Set TWP_ENABLE_HTTP3=0 to disable. Requires MsQuic + supported OS; see wiki/HTTP-3.md.
+#pragma warning disable TWP001
+            var enableHttp3 = Environment.GetEnvironmentVariable("TWP_ENABLE_HTTP3") switch
+            {
+                "0" or "false" or "FALSE" => false,
+                _ => true
+            };
+            if (enableHttp3 && QuicListener.IsSupported)
+            {
+                proxyServer.EnableHttp3 = true;
+                // Learn H3 from Alt-Svc; set TWP_ENABLE_SVCB_DNS=1 for proactive HTTPS/SVCB discovery.
+                proxyServer.EnableHttpsSvcbDnsDiscovery =
+                    Environment.GetEnvironmentVariable("TWP_ENABLE_SVCB_DNS") is "1" or "true" or "TRUE";
+                var quicEndPoint = new TransparentQuicProxyEndPoint(IPAddress.Any, 443)
+                {
+                    ForwardHost = "localhost",
+                    ForwardPort = 443
+                };
+                proxyServer.AddEndPoint(quicEndPoint);
+            }
+#pragma warning restore TWP001
 
             proxyServer.BeforeRequest += ProxyServer_BeforeRequest;
             proxyServer.BeforeResponse += ProxyServer_BeforeResponse;
@@ -97,17 +128,184 @@ namespace Titanium.Web.Proxy.Examples.Wpf
             explicitEndPoint.BeforeTunnelConnectResponse += ProxyServer_BeforeTunnelConnectResponse;
             proxyServer.ClientConnectionCountChanged += delegate
             {
-                Dispatcher.Invoke(() => { ClientConnectionCount = proxyServer.ClientConnectionCount; });
+                Dispatcher.BeginInvoke(() => { ClientConnectionCount = proxyServer.ClientConnectionCount; });
             };
             proxyServer.ServerConnectionCountChanged += delegate
             {
-                Dispatcher.Invoke(() => { ServerConnectionCount = proxyServer.ServerConnectionCount; });
+                Dispatcher.BeginInvoke(() => { ServerConnectionCount = proxyServer.ServerConnectionCount; });
             };
-            proxyServer.Start();
+            proxyServer.Http3ClientConnectionCountChanged += delegate
+            {
+                Dispatcher.BeginInvoke(() => { Http3ClientConnectionCount = proxyServer.Http3ClientConnectionCount; });
+            };
+            proxyServer.Http3ServerConnectionCountChanged += delegate
+            {
+                Dispatcher.BeginInvoke(() => { Http3ServerConnectionCount = proxyServer.Http3ServerConnectionCount; });
+            };
 
-            proxyServer.SetAsSystemProxy(explicitEndPoint, ProxyProtocolType.AllHttp);
+            try
+            {
+                proxyServer.Start();
+            }
+            catch (Exception ex) when (IsAddressAlreadyInUse(ex))
+            {
+                System.Diagnostics.Debug.WriteLine("Port 8000 in use; falling back to ephemeral port 0");
+                proxyServer.RemoveEndPoint(explicitEndPoint);
+                explicitEndPoint = new ExplicitProxyEndPoint(IPAddress.Any, 0);
+                explicitEndPoint.BeforeTunnelConnectRequest += ProxyServer_BeforeTunnelConnectRequest;
+                explicitEndPoint.BeforeTunnelConnectResponse += ProxyServer_BeforeTunnelConnectResponse;
+                proxyServer.AddEndPoint(explicitEndPoint);
+                proxyServer.Start();
+            }
+
+            System.Diagnostics.Debug.WriteLine(
+                $"Listening on ExplicitProxyEndPoint at {explicitEndPoint.IpAddress}:{explicitEndPoint.Port}");
+
+            // Screenshot automation (TWP_CAPTURE_PATH) skips system-proxy registration so CI/desktop
+            // capture runs do not alter the machine's proxy settings.
+            var capturePath = Environment.GetEnvironmentVariable("TWP_CAPTURE_PATH");
+            if (string.IsNullOrWhiteSpace(capturePath))
+            {
+                proxyServer.SetAsSystemProxy(explicitEndPoint, ProxyProtocolType.AllHttp,
+                    KnownMitmExclusions.CreateSystemProxySettings(settings =>
+                    {
+                        // Route localhost/loopback traffic through the proxy for this example.
+                        settings.ProxyLoopback = true;
+                    }));
+            }
 
             InitializeComponent();
+
+            // Always clear system proxy when the window closes (graceful or App.Shutdown).
+            // Without this, browsers keep pointing at a dead :8000 and hang after exit.
+            Closed += (_, _) => ShutdownProxy();
+
+            if (!string.IsNullOrWhiteSpace(capturePath))
+            {
+                Loaded += async (_, _) =>
+                {
+                    ToggleSystemProxy.IsChecked = false;
+                    await CaptureScreenshotAndExitAsync(capturePath);
+                };
+            }
+        }
+
+        private static bool IsAddressAlreadyInUse(Exception ex)
+        {
+            for (var cur = ex; cur != null; cur = cur.InnerException)
+            {
+                if (cur is System.Net.Sockets.SocketException se &&
+                    (se.SocketErrorCode == System.Net.Sockets.SocketError.AddressAlreadyInUse
+                     || se.NativeErrorCode is 10048 or 98))
+                    return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        ///     Renders this window to JPEG via <see cref="RenderTargetBitmap" /> (works when desktop
+        ///     bit-blit cannot see the WPF surface) then shuts down. Used for wiki screenshot refresh.
+        /// </summary>
+        private async Task CaptureScreenshotAndExitAsync(string capturePath)
+        {
+            WindowState = WindowState.Maximized;
+            var delayMs = 12000;
+            if (int.TryParse(Environment.GetEnvironmentVariable("TWP_CAPTURE_DELAY_MS"), out var parsed) &&
+                parsed > 0)
+                delayMs = parsed;
+
+            // Wait for demo traffic (prefer a completed example.org row with a real upstream id).
+            for (var i = 0; i < delayMs / 200; i++)
+            {
+                await Task.Delay(200);
+                var demo = Sessions.FirstOrDefault(s =>
+                    !s.IsTunnelConnect &&
+                    s.ServerConnectionId.HasValue &&
+                    (s.Host?.Contains("example.org", StringComparison.OrdinalIgnoreCase) == true ||
+                     s.Url?.Contains("example", StringComparison.OrdinalIgnoreCase) == true));
+                if (demo != null)
+                {
+                    SelectedSession = demo;
+                    break;
+                }
+            }
+
+            if (SelectedSession == null)
+            {
+                var any = Sessions.FirstOrDefault(s =>
+                    !s.IsTunnelConnect && s.ServerConnectionId.HasValue);
+                if (any != null) SelectedSession = any;
+            }
+
+            await Dispatcher.InvokeAsync(() => { }, System.Windows.Threading.DispatcherPriority.Render);
+            await Task.Delay(500);
+
+            var dpi = VisualTreeHelper.GetDpi(this);
+            var width = Math.Max(1, (int)Math.Ceiling(ActualWidth * dpi.DpiScaleX));
+            var height = Math.Max(1, (int)Math.Ceiling(ActualHeight * dpi.DpiScaleY));
+            var rtb = new RenderTargetBitmap(width, height, 96 * dpi.DpiScaleX, 96 * dpi.DpiScaleY,
+                PixelFormats.Pbgra32);
+            rtb.Render(this);
+
+            var encoder = new JpegBitmapEncoder { QualityLevel = 90 };
+            encoder.Frames.Add(BitmapFrame.Create(rtb));
+            Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(capturePath))!);
+            await using (var fs = File.Create(capturePath))
+                encoder.Save(fs);
+
+            Application.Current.Shutdown();
+        }
+
+        /// <summary>
+        ///     Stops the proxy and restores Windows system proxy settings. Safe to call more than once.
+        /// </summary>
+        internal void EnsureProxyShutdown() => ShutdownProxy();
+
+        private void ShutdownProxy()
+        {
+            if (proxyShutdownDone) return;
+            proxyShutdownDone = true;
+
+            try
+            {
+                if (proxyServer.ProxyRunning)
+                    proxyServer.Stop();
+                else
+                    proxyServer.RestoreOriginalProxySettings();
+            }
+            catch (Exception)
+            {
+                // Best-effort: still try Dispose below.
+                try
+                {
+                    proxyServer.RestoreOriginalProxySettings();
+                }
+                catch (Exception)
+                {
+                    // ignored
+                }
+            }
+
+            try
+            {
+                if (trustRootCertificate || trustRootCertificateMachine)
+                    proxyServer.CertificateManager.RemoveTrustedRootCertificate(
+                        machineTrusted: trustRootCertificateMachine);
+            }
+            catch (Exception)
+            {
+                // ignored
+            }
+
+            try
+            {
+                proxyServer.Dispose();
+            }
+            catch (Exception)
+            {
+                // ignored
+            }
         }
 
         public ObservableCollectionEx<SessionListItem> Sessions { get; } =
@@ -138,10 +336,23 @@ namespace Titanium.Web.Proxy.Examples.Wpf
             set => SetValue(ServerConnectionCountProperty, value);
         }
 
+        public int Http3ClientConnectionCount
+        {
+            get => (int)GetValue(Http3ClientConnectionCountProperty);
+            set => SetValue(Http3ClientConnectionCountProperty, value);
+        }
+
+        public int Http3ServerConnectionCount
+        {
+            get => (int)GetValue(Http3ServerConnectionCountProperty);
+            set => SetValue(Http3ServerConnectionCountProperty, value);
+        }
+
         private async Task ProxyServer_BeforeTunnelConnectRequest(object sender, TunnelConnectSessionEventArgs e)
         {
             var hostname = e.HttpClient.Request.RequestUri.Host;
-            if (hostname.EndsWith("webex.com")) e.DecryptSsl = false;
+            if (KnownMitmExclusions.ShouldDisableSslDecrypt(hostname))
+                e.DecryptSsl = false;
 
             await Dispatcher.InvokeAsync(() => { AddSession(e); });
         }
@@ -156,8 +367,6 @@ namespace Titanium.Web.Proxy.Examples.Wpf
 
         private async Task ProxyServer_BeforeRequest(object sender, SessionEventArgs e)
         {
-            //if (e.HttpClient.Request.HttpVersion.Major != 2) return;
-
             SessionListItem item = null;
             await Dispatcher.InvokeAsync(() => { item = AddSession(e); });
 
@@ -172,25 +381,26 @@ namespace Titanium.Web.Proxy.Examples.Wpf
 
         private async Task ProxyServer_BeforeResponse(object sender, SessionEventArgs e)
         {
-            SessionListItem item = null;
-            await Dispatcher.InvokeAsync(() =>
+            var item = await Dispatcher.InvokeAsync(() =>
             {
-                if (sessionDictionary.TryGetValue(e.HttpClient, out item)) item.Update(e);
+                if (!sessionDictionary.TryGetValue(e.HttpClient, out var found))
+                    return null;
+
+                found.Update(e);
+                // Prefer showing a real request/response in the detail pane once traffic arrives.
+                if (SelectedSession == null && found is { IsTunnelConnect: false })
+                    SelectedSession = found;
+                return found;
             });
 
-            //e.HttpClient.Response.Headers.AddHeader("X-Titanium-Header", "HTTP/2 works");
+            if (item != null && e.HttpClient.Response.HasBody)
+            {
+                e.HttpClient.Response.KeepBody = true;
+                await e.GetResponseBody();
 
-            //e.SetResponseBody(Encoding.ASCII.GetBytes("TITANIUMMMM!!!!"));
-
-            if (item != null)
-                if (e.HttpClient.Response.HasBody)
-                {
-                    e.HttpClient.Response.KeepBody = true;
-                    await e.GetResponseBody();
-
-                    await Dispatcher.InvokeAsync(() => { item.Update(e); });
-                    if (item == SelectedSession) await Dispatcher.InvokeAsync(SelectedSessionChanged);
-                }
+                await Dispatcher.InvokeAsync(() => { item.Update(e); });
+                if (item == SelectedSession) await Dispatcher.InvokeAsync(SelectedSessionChanged);
+            }
         }
 
         private async Task ProxyServer_AfterResponse(object sender, SessionEventArgs e)
@@ -216,15 +426,12 @@ namespace Titanium.Web.Proxy.Examples.Wpf
             var item = new SessionListItem
             {
                 Number = lastSessionNumber,
-                ClientConnectionId = e.ClientConnectionId,
-                ServerConnectionId = e.ServerConnectionId,
                 HttpClient = e.HttpClient,
                 ClientRemoteEndPoint = e.ClientRemoteEndPoint,
                 ClientLocalEndPoint = e.ClientLocalEndPoint,
                 IsTunnelConnect = isTunnelConnect
             };
 
-            //if (isTunnelConnect || e.HttpClient.Request.UpgradeToWebSocket)
             e.DataReceived += (sender, args) =>
             {
                 var session = (SessionEventArgsBase)sender;
@@ -235,10 +442,6 @@ namespace Titanium.Web.Proxy.Examples.Wpf
                     if (tunnelType != TunnelType.Unknown) li.Protocol = TunnelTypeToString(tunnelType);
 
                     li.ReceivedDataCount += args.Count;
-
-                    //if (tunnelType == TunnelType.Http2)
-                    AppendTransferLog(session.GetHashCode() + (isTunnelConnect ? "_tunnel" : "") + "_received",
-                        args.Buffer, args.Offset, args.Count);
                 }
             };
 
@@ -252,47 +455,14 @@ namespace Titanium.Web.Proxy.Examples.Wpf
                     if (tunnelType != TunnelType.Unknown) li.Protocol = TunnelTypeToString(tunnelType);
 
                     li.SentDataCount += args.Count;
-
-                    //if (tunnelType == TunnelType.Http2)
-                    AppendTransferLog(session.GetHashCode() + (isTunnelConnect ? "_tunnel" : "") + "_sent",
-                        args.Buffer, args.Offset, args.Count);
                 }
             };
-
-            if (e is TunnelConnectSessionEventArgs te)
-            {
-                te.DecryptedDataReceived += (sender, args) =>
-                {
-                    var session = (SessionEventArgsBase)sender;
-                    //var tunnelType = session.HttpClient.ConnectRequest?.TunnelType ?? TunnelType.Unknown;
-                    //if (tunnelType == TunnelType.Http2)
-                    AppendTransferLog(session.GetHashCode() + "_decrypted_received", args.Buffer, args.Offset,
-                        args.Count);
-                };
-
-                te.DecryptedDataSent += (sender, args) =>
-                {
-                    var session = (SessionEventArgsBase)sender;
-                    //var tunnelType = session.HttpClient.ConnectRequest?.TunnelType ?? TunnelType.Unknown;
-                    //if (tunnelType == TunnelType.Http2)
-                    AppendTransferLog(session.GetHashCode() + "_decrypted_sent", args.Buffer, args.Offset, args.Count);
-                };
-            }
 
             item.Update(e);
             return item;
         }
 
-        private void AppendTransferLog(string fileName, byte[] buffer, int offset, int count)
-        {
-            //string basePath = @"c:\!titanium\";
-            //using (var fs = new FileStream(basePath + fileName, FileMode.Append, FileAccess.Write, FileShare.Read))
-            //{
-            //    fs.Write(buffer, offset, count);
-            //}
-        }
-
-        private string TunnelTypeToString(TunnelType tunnelType)
+        private static string TunnelTypeToString(TunnelType tunnelType)
         {
             switch (tunnelType)
             {
@@ -347,7 +517,6 @@ namespace Titanium.Web.Proxy.Examples.Wpf
             var truncated = data.Length > truncateLimit;
             if (truncated) data = data.Take(truncateLimit).ToArray();
 
-            //string hexStr = string.Join(" ", data.Select(x => x.ToString("X2")));
             var sb = new StringBuilder();
             sb.AppendLine("URI: " + request.RequestUri);
             sb.Append(request.HeaderText);
@@ -367,7 +536,6 @@ namespace Titanium.Web.Proxy.Examples.Wpf
             truncated = data.Length > truncateLimit;
             if (truncated) data = data.Take(truncateLimit).ToArray();
 
-            //hexStr = string.Join(" ", data.Select(x => x.ToString("X2")));
             sb = new StringBuilder();
             sb.Append(response.HeaderText);
             sb.Append(response.Encoding.GetString(data));
@@ -406,7 +574,8 @@ namespace Titanium.Web.Proxy.Examples.Wpf
             var button = (ToggleButton)sender;
             if (button.IsChecked == true)
                 proxyServer.SetAsSystemProxy((ExplicitProxyEndPoint)proxyServer.ProxyEndPoints[0],
-                    ProxyProtocolType.AllHttp);
+                    ProxyProtocolType.AllHttp,
+                    KnownMitmExclusions.CreateSystemProxySettings(settings => settings.ProxyLoopback = true));
             else
                 proxyServer.RestoreOriginalProxySettings();
         }

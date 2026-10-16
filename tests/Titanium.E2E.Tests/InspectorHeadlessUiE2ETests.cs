@@ -1,0 +1,205 @@
+using System.Net;
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+using Titanium.E2E.Tests.Harness;
+using Titanium.Inspector.Services;
+using Titanium.Inspector.ViewModels;
+
+namespace Titanium.E2E.Tests;
+
+/// <summary>
+/// UI-layer smoke without Avalonia headless session (avoids platform hangs on CI).
+/// Drives ViewModel commands the same way the Avalonia UI binds them.
+/// </summary>
+[TestClass]
+public class InspectorHeadlessUiE2ETests
+{
+    [TestMethod]
+    [TestCategory("E2E-UI")]
+    public async Task Commands_StartInstallProxy_AutoResponder_Composer()
+    {
+        var settingsPath = Path.Combine(Path.GetTempPath(), "twp-insp-e2e-" + Guid.NewGuid().ToString("N") + ".json");
+        var settings = new SettingsService(settingsPath);
+        settings.Current.AutoSystemProxyOnStart = false;
+        settings.Save();
+        var registry = new SessionRegistry();
+        var buffer = new SessionStreamBuffer(registry);
+        var updates = new UpdateService(settings);
+        var recorder = new RecordingSystemProxyController();
+        var interception = new InterceptionService(recorder) { UseInMemoryTrustState = true };
+        var vm = new MainWindowViewModel(buffer, registry, updates, settings, interception);
+
+        Assert.IsNotNull(vm.StartCaptureCommand);
+        Assert.IsNotNull(vm.InstallCaCommand);
+        Assert.IsNotNull(vm.ToggleSystemProxyCommand);
+
+        vm.BindPort = 0;
+        vm.BindAddress = "127.0.0.1";
+
+        // Execute commands like the Avalonia bindings do (RelayCommand is async void).
+        vm.StartCaptureCommand.Execute(null);
+        var deadline = DateTime.UtcNow.AddSeconds(15);
+        while ((!interception.IsRunning || vm.StatusText != "Ready") && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(50);
+        }
+
+        Assert.IsTrue(interception.IsRunning, vm.StatusText);
+        Assert.IsTrue(vm.Capturing);
+        Assert.AreEqual("Ready", vm.StatusText);
+        Assert.IsTrue(
+            vm.EndpointStatusText.Contains("Proxy running", StringComparison.OrdinalIgnoreCase),
+            vm.EndpointStatusText);
+
+        vm.InstallCaCommand.Execute(null);
+        await Task.Delay(100);
+
+        vm.ToggleSystemProxyCommand.Execute(null);
+        var deadlineProxy = DateTime.UtcNow.AddSeconds(10);
+        while (recorder.SetCount < 1 && DateTime.UtcNow < deadlineProxy)
+        {
+            await Task.Delay(50);
+        }
+
+        Assert.AreEqual(1, recorder.SetCount, "System proxy should go through controller seam");
+        Assert.IsTrue(vm.SystemProxy);
+        Assert.IsTrue(
+            vm.StatusText.StartsWith("System proxy enabled", StringComparison.Ordinal),
+            vm.StatusText);
+        if (OperatingSystem.IsWindows())
+        {
+            Assert.IsTrue(vm.StatusText.Contains("quic", StringComparison.OrdinalIgnoreCase), vm.StatusText);
+        }
+        else if (OperatingSystem.IsMacOS())
+        {
+            Assert.IsTrue(vm.StatusText.Contains("Firefox", StringComparison.OrdinalIgnoreCase), vm.StatusText);
+        }
+
+        vm.AutoResponderMatch = "*ui-e2e*";
+        vm.AutoResponderStatus = 201;
+        vm.AutoResponderBody = "from-ui";
+        vm.AddAutoResponderRuleCommand.Execute(null);
+        Assert.AreEqual(1, vm.AutoResponder.Rules.Count);
+
+        using var origin = new EchoOrigin();
+        vm.ComposerMethod = "GET";
+        vm.ComposerUrl = origin.BaseUrl + "ui-composer";
+        vm.SendComposerCommand.Execute(null);
+        // Do not match "Composer sending…" (set immediately before ReplayAsync); wait for settle.
+        deadline = DateTime.UtcNow.AddSeconds(20);
+        while (!IsComposerSettled(vm) && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(50);
+        }
+
+        Assert.IsTrue(IsComposerSettled(vm), vm.StatusText);
+
+        vm.StopCaptureCommand.Execute(null);
+        await Task.Delay(100);
+        Assert.IsFalse(interception.IsRunning);
+
+        try
+        {
+            if (File.Exists(settingsPath))
+            {
+                File.Delete(settingsPath);
+            }
+        }
+        catch
+        {
+            // ignore
+        }
+    }
+
+    [TestMethod]
+    [TestCategory("E2E-UI")]
+    public async Task StartCapture_HttpsTraffic_AppearsInSessionsCollection()
+    {
+        var settingsPath = Path.Combine(Path.GetTempPath(), "twp-insp-sess-" + Guid.NewGuid().ToString("N") + ".json");
+        var settings = new SettingsService(settingsPath);
+        var registry = new SessionRegistry();
+        var buffer = new SessionStreamBuffer(registry);
+        var updates = new UpdateService(settings);
+        var interception = new InterceptionService(new RecordingSystemProxyController());
+        settings.Current.IgnoreServerCertificateErrors = true;
+        settings.Save();
+        var vm = new MainWindowViewModel(buffer, registry, updates, settings, interception);
+
+        vm.BindPort = 0;
+        vm.BindAddress = "127.0.0.1";
+        vm.StartCaptureCommand.Execute(null);
+
+        var deadline = DateTime.UtcNow.AddSeconds(15);
+        while (interception.BoundPort <= 0 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(50);
+        }
+
+        Assert.IsTrue(interception.IsRunning, vm.StatusText);
+        Assert.IsTrue(interception.BoundPort > 0, "StartCapture must publish BoundPort before traffic");
+        Assert.IsTrue(interception.IgnoreServerCertificateErrors, "StartCapture must keep ignore-errors from settings");
+        interception.UseInMemoryTrustState = true;
+        interception.DecryptHttps = true;
+        interception.InstallRootCertificate(false);
+
+        using var origin = new HttpsEchoOrigin();
+        using var handler = new HttpClientHandler
+        {
+            Proxy = new WebProxy($"http://127.0.0.1:{interception.BoundPort}"),
+            UseProxy = true,
+            ServerCertificateCustomValidationCallback = (_, cert, _, _) => cert is not null,
+        };
+        using var http = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(20) };
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        var response = await http.GetAsync($"https://127.0.0.1:{origin.Port}/ui-session-grid", cts.Token);
+        Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+
+        deadline = DateTime.UtcNow.AddSeconds(8);
+        var sessions = SessionListPoll.Copy(vm.Sessions);
+        while (!sessions.Any(s => s.Url.Contains("ui-session-grid", StringComparison.OrdinalIgnoreCase))
+               && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(50);
+            sessions = SessionListPoll.Copy(vm.Sessions);
+        }
+
+        Assert.IsTrue(sessions.Length > 0, $"Expected sessions in UI collection; status={vm.StatusText}");
+        Assert.IsTrue(
+            sessions.Any(s => s.Url.Contains("ui-session-grid", StringComparison.OrdinalIgnoreCase)),
+            string.Join(", ", sessions.Select(s => s.Url)));
+        Assert.IsTrue(vm.SessionCountText.Contains("Sessions:", StringComparison.OrdinalIgnoreCase), vm.SessionCountText);
+
+        vm.EnsureShutdown();
+        try { File.Delete(settingsPath); } catch { /* ignore */ }
+    }
+
+    [TestMethod]
+    [TestCategory("E2E-UI")]
+    public void ViewModel_ExposesBindAndInterception()
+    {
+        var settingsPath = Path.Combine(Path.GetTempPath(), "twp-insp-vm-" + Guid.NewGuid().ToString("N") + ".json");
+        var settings = new SettingsService(settingsPath);
+        var registry = new SessionRegistry();
+        var buffer = new SessionStreamBuffer(registry);
+        var updates = new UpdateService(settings);
+        var vm = new MainWindowViewModel(
+            buffer,
+            registry,
+            updates,
+            settings,
+            new InterceptionService(new RecordingSystemProxyController()));
+
+        Assert.AreEqual("127.0.0.1", vm.BindAddress);
+        Assert.AreEqual(8866, vm.BindPort);
+        Assert.IsNotNull(vm.Interception);
+        Assert.IsFalse(vm.Interception.IsRunning);
+        try { File.Delete(settingsPath); } catch { /* ignore */ }
+    }
+
+    private static bool IsComposerSettled(MainWindowViewModel vm)
+    {
+        var status = vm.StatusText;
+        return status.Contains("Composer →", StringComparison.Ordinal)
+               || status.Contains("Composer failed", StringComparison.OrdinalIgnoreCase)
+               || vm.Sessions.Count > 0;
+    }
+}

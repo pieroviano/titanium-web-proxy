@@ -1,0 +1,957 @@
+using System.Globalization;
+
+namespace Titanium.Web.Proxy.RpsLoadProbe;
+
+internal static class Cli
+{
+    public static int Run(string[] args)
+    {
+        if (args.Length == 0 || args.Contains("-h") || args.Contains("--help"))
+        {
+            PrintHelp();
+            return args.Length == 0 ? 2 : 0;
+        }
+
+        string? command = null;
+        string? modeText = null;
+        string? nginxPath = null;
+        string? haproxyPath = null;
+        string? envoyPath = null;
+        string? resultsDir = null;
+        var concurrency = new List<int>();
+        var warmupSec = 5;
+        var durationSec = 20;
+        var enableHttps = false;
+        var enableH2c = false;
+        var enableQuic = false;
+        var httpsOnly = false;
+        var httpsProtocols = "http1and2";
+        var extraHttpsOrigins = 0;
+        var originHttpPort = 0;
+        var originHttpsPort = 0;
+        var originQuicPort = 0;
+        var originHttpsExtraPorts = new List<int>();
+        int? maxCachedConnections = null;
+        var repeats = 1;
+        var method = "GET";
+        var responseBytes = WorkloadOptions.TinyJsonBytes;
+        var requestBytes = 0;
+        var keepAlive = true;
+        var delayMs = 0;
+        var lossPercent = 0.0;
+        var earlyResponseAfter = 0;
+        var enableWebSocket = false;
+        var enableGrpc = false;
+        var clientReadChunkBytes = 0;
+        var clientReadSleepMs = 0;
+        var stopOnSloFail = true;
+        (int Index, int Count)? armShard = null;
+        string? armNameContains = null;
+        string? armNameExcludes = null;
+        var printArms = false;
+        var printGroups = false;
+        string? armGroupKey = null;
+
+        for (var i = 0; i < args.Length; i++)
+        {
+            switch (args[i])
+            {
+                case "--serve":
+                    command = "serve";
+                    break;
+                case "--serve-origin":
+                    command = "serve-origin";
+                    break;
+                case "--serve-proxy":
+                    command = "serve-proxy";
+                    break;
+                case "--ramp":
+                    command = "ramp";
+                    break;
+                case "--mode":
+                    modeText = RequireValue(args, ref i, "--mode");
+                    break;
+                case "--https":
+                    enableHttps = true;
+                    break;
+                case "--https-only":
+                    httpsOnly = true;
+                    break;
+                case "--https-protocols":
+                    httpsProtocols = RequireValue(args, ref i, "--https-protocols");
+                    break;
+                case "--h2c":
+                    enableH2c = true;
+                    break;
+                case "--quic":
+                    enableQuic = true;
+                    break;
+                case "--extra-https-origins":
+                    extraHttpsOrigins = int.Parse(RequireValue(args, ref i, "--extra-https-origins"),
+                        CultureInfo.InvariantCulture);
+                    break;
+                case "--origin-http-port":
+                    originHttpPort = int.Parse(RequireValue(args, ref i, "--origin-http-port"),
+                        CultureInfo.InvariantCulture);
+                    break;
+                case "--origin-https-port":
+                    originHttpsPort = int.Parse(RequireValue(args, ref i, "--origin-https-port"),
+                        CultureInfo.InvariantCulture);
+                    break;
+                case "--origin-quic-port":
+                    originQuicPort = int.Parse(RequireValue(args, ref i, "--origin-quic-port"),
+                        CultureInfo.InvariantCulture);
+                    break;
+                case "--origin-https-extra-port":
+                    originHttpsExtraPorts.Add(int.Parse(RequireValue(args, ref i, "--origin-https-extra-port"),
+                        CultureInfo.InvariantCulture));
+                    break;
+                case "--nginx-path":
+                    nginxPath = RequireValue(args, ref i, "--nginx-path");
+                    break;
+                case "--haproxy-path":
+                    haproxyPath = RequireValue(args, ref i, "--haproxy-path");
+                    break;
+                case "--envoy-path":
+                    envoyPath = RequireValue(args, ref i, "--envoy-path");
+                    break;
+                case "--results-dir":
+                    resultsDir = RequireValue(args, ref i, "--results-dir");
+                    break;
+                case "--max-cached-connections":
+                    maxCachedConnections = int.Parse(RequireValue(args, ref i, "--max-cached-connections"),
+                        CultureInfo.InvariantCulture);
+                    break;
+                case "--concurrency":
+                    foreach (var part in RequireValue(args, ref i, "--concurrency")
+                                 .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                    {
+                        concurrency.Add(int.Parse(part, CultureInfo.InvariantCulture));
+                    }
+
+                    break;
+                case "--warmup-sec":
+                    warmupSec = int.Parse(RequireValue(args, ref i, "--warmup-sec"), CultureInfo.InvariantCulture);
+                    break;
+                case "--duration-sec":
+                    durationSec = int.Parse(RequireValue(args, ref i, "--duration-sec"), CultureInfo.InvariantCulture);
+                    break;
+                case "--repeats":
+                    repeats = int.Parse(RequireValue(args, ref i, "--repeats"), CultureInfo.InvariantCulture);
+                    break;
+                case "--arm-shard":
+                {
+                    var shardText = RequireValue(args, ref i, "--arm-shard").Trim();
+                    if (shardText.Length > 0 && !shardText.Contains('/')
+                        && !string.Equals(shardText, "all", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // Group key (wiki row), e.g. h1c-h1c or h3-h3-body64k. List with --print-groups.
+                        if (!shardText.All(c => char.IsAsciiLetterOrDigit(c) || c == '-'))
+                            return Fail("--arm-shard group key may only contain letters, digits and '-'");
+                        armGroupKey = shardText;
+                    }
+                    else if (!string.Equals(shardText, "all", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var parts = shardText.Split('/', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+                        if (parts.Length != 2
+                            || !int.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out var idx)
+                            || !int.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var count)
+                            || count < 1 || idx < 1 || idx > count)
+                        {
+                            return Fail("--arm-shard must be 'all', i/n (1-based i, n >= 1) or a group key");
+                        }
+
+                        armShard = (idx, count);
+                    }
+
+                    break;
+                }
+                case "--arm-contains":
+                    armNameContains = RequireValue(args, ref i, "--arm-contains").Trim();
+                    if (armNameContains.Length == 0)
+                        return Fail("--arm-contains must be a non-empty substring");
+                    break;
+                case "--arm-excludes":
+                    armNameExcludes = RequireValue(args, ref i, "--arm-excludes").Trim();
+                    if (armNameExcludes.Length == 0)
+                        return Fail("--arm-excludes must be a non-empty substring");
+                    break;
+                case "--method":
+                    method = RequireValue(args, ref i, "--method").ToUpperInvariant();
+                    if (method is not ("GET" or "POST"))
+                        return Fail("--method must be GET or POST");
+                    break;
+                case "--response-bytes":
+                    responseBytes = int.Parse(RequireValue(args, ref i, "--response-bytes"),
+                        CultureInfo.InvariantCulture);
+                    break;
+                case "--request-bytes":
+                    requestBytes = int.Parse(RequireValue(args, ref i, "--request-bytes"),
+                        CultureInfo.InvariantCulture);
+                    break;
+                case "--no-keepalive":
+                    keepAlive = false;
+                    break;
+                case "--delay-ms":
+                    delayMs = int.Parse(RequireValue(args, ref i, "--delay-ms"), CultureInfo.InvariantCulture);
+                    break;
+                case "--loss-percent":
+                    lossPercent = double.Parse(RequireValue(args, ref i, "--loss-percent"),
+                        CultureInfo.InvariantCulture);
+                    break;
+                case "--early-response-after":
+                    earlyResponseAfter = int.Parse(RequireValue(args, ref i, "--early-response-after"),
+                        CultureInfo.InvariantCulture);
+                    break;
+                case "--websocket":
+                    enableWebSocket = true;
+                    break;
+                case "--grpc":
+                    enableGrpc = true;
+                    break;
+                case "--client-read-chunk":
+                    clientReadChunkBytes = int.Parse(RequireValue(args, ref i, "--client-read-chunk"),
+                        CultureInfo.InvariantCulture);
+                    break;
+                case "--client-read-sleep-ms":
+                    clientReadSleepMs = int.Parse(RequireValue(args, ref i, "--client-read-sleep-ms"),
+                        CultureInfo.InvariantCulture);
+                    break;
+                case "--stop-on-slo-fail":
+                    stopOnSloFail = true;
+                    break;
+                case "--no-stop-on-slo-fail":
+                    stopOnSloFail = false;
+                    break;
+                case "--print-arms":
+                    printArms = true;
+                    if (command == null)
+                        command = "ramp";
+                    break;
+                case "--print-groups":
+                    printGroups = true;
+                    if (command == null)
+                        command = "ramp";
+                    break;
+                default:
+                    ProbeLog.Error($"Unknown argument: {args[i]}");
+                    PrintHelp();
+                    return 2;
+            }
+        }
+
+        var workload = new WorkloadOptions
+        {
+            Method = method,
+            ResponseBytes = Math.Max(1, responseBytes),
+            RequestBytes = Math.Max(0, requestBytes),
+            KeepAlive = keepAlive,
+            DelayMs = Math.Max(0, delayMs),
+            LossPercent = Math.Clamp(lossPercent, 0, 100),
+            EarlyResponseAfterBytes = Math.Max(0, earlyResponseAfter),
+            IsWebSocket = enableWebSocket,
+            IsGrpc = enableGrpc,
+            ClientReadChunkBytes = Math.Max(0, clientReadChunkBytes),
+            ClientReadSleepMs = Math.Max(0, clientReadSleepMs)
+        };
+
+        using var cts = new CancellationTokenSource();
+        Console.CancelKeyPress += (_, e) =>
+        {
+            e.Cancel = true;
+            cts.Cancel();
+        };
+
+        try
+        {
+            return command switch
+            {
+                "serve-origin" => ServeOriginHost.RunAsync(new ServeOriginFlags
+                    {
+                        EnableHttps = enableHttps,
+                        EnableH2c = enableH2c,
+                        EnableQuic = enableQuic,
+                        HttpsOnly = httpsOnly,
+                        HttpsProtocols = httpsProtocols,
+                        ExtraHttpsOrigins = extraHttpsOrigins
+                    }, cts.Token, workload).GetAwaiter().GetResult(),
+                "serve-proxy" => RunServeProxy(modeText, originHttpPort, originHttpsPort, originQuicPort,
+                    originHttpsExtraPorts, nginxPath, haproxyPath, envoyPath, maxCachedConnections, cts.Token, workload),
+                "serve" => RunServe(modeText, nginxPath, haproxyPath, envoyPath, maxCachedConnections, cts.Token, workload),
+                "ramp" => RunRamp(modeText, nginxPath, haproxyPath, envoyPath, resultsDir, concurrency, warmupSec, durationSec,
+                    maxCachedConnections, repeats, workload, stopOnSloFail, armShard, armGroupKey, armNameContains, armNameExcludes, printArms, printGroups, cts.Token),
+                _ => Fail("Required: --serve | --serve-origin | --serve-proxy | --ramp")
+            };
+        }
+        catch (OperationCanceledException)
+        {
+            return 130;
+        }
+        catch (Exception ex)
+        {
+            // ChildProcessStack only reads stderr on early exit; ProbeLog is stdout.
+            Console.Error.WriteLine(ex.ToString());
+            ProbeLog.Error(ex.ToString());
+            return 1;
+        }
+    }
+
+    private static int RunServe(string? modeText, string? nginxPath, string? haproxyPath, string? envoyPath,
+        int? maxCachedConnections, CancellationToken ct, WorkloadOptions workload)
+    {
+        if (modeText == null || !TryParseMode(modeText, out var mode))
+            return Fail("Required: --serve --mode <see --help>");
+        return ServeHost.RunAsync(mode, nginxPath, haproxyPath, envoyPath, maxCachedConnections, ct, workload)
+            .GetAwaiter().GetResult();
+    }
+
+    private static int RunServeProxy(string? modeText, int originHttpPort, int originHttpsPort, int originQuicPort,
+        IReadOnlyList<int> extraHttpsPorts, string? nginxPath, string? haproxyPath, string? envoyPath,
+        int? maxCachedConnections, CancellationToken ct, WorkloadOptions workload)
+    {
+        if (modeText == null || !TryParseMode(modeText, out var mode) || IsMultiArmMode(mode))
+            return Fail("Required: --serve-proxy --mode <single arm>");
+        return ServeProxyHost.RunAsync(mode, originHttpPort, originHttpsPort, originQuicPort, extraHttpsPorts,
+                nginxPath, haproxyPath, envoyPath, maxCachedConnections, ct, workload)
+            .GetAwaiter().GetResult();
+    }
+
+    private static bool IsMultiArmMode(ProbeMode mode) => mode is ProbeMode.Compare or ProbeMode.CompareHttp2
+        or ProbeMode.CompareTls or ProbeMode.CompareTerminate or ProbeMode.CompareSame or ProbeMode.CompareBridges
+        or ProbeMode.CompareHttp3Cleartext or ProbeMode.CompareNginxHttps or ProbeMode.CompareHaproxySmoke
+        or ProbeMode.CompareEnvoySmoke
+        or ProbeMode.CompareMitm or ProbeMode.CompareMatrix or ProbeMode.CompareProduct
+        or ProbeMode.CompareProductSmoke or ProbeMode.CompareSpot or ProbeMode.CompareCeiling
+        or ProbeMode.CompareBodies
+        or ProbeMode.ComparePost
+        or ProbeMode.CompareLossy or ProbeMode.CompareTlsCost or ProbeMode.CompareArch
+        or ProbeMode.CompareGrpc or ProbeMode.CompareWsH1Tls or ProbeMode.CompareWsH2
+        or ProbeMode.CompareSaturation
+        or ProbeMode.CompareEditions
+        or ProbeMode.ExplicitPoolSweep;
+
+    private static int RunRamp(string? modeText, string? nginxPath, string? haproxyPath, string? envoyPath,
+        string? resultsDir, List<int> concurrency, int warmupSec, int durationSec, int? maxCachedConnections,
+        int repeats, WorkloadOptions workload, bool stopOnSloFail, (int Index, int Count)? armShard,
+        string? armGroupKey, string? armNameContains, string? armNameExcludes, bool printArms, bool printGroups, CancellationToken ct)
+    {
+        if (modeText == null || !TryParseMode(modeText, out var mode))
+            return Fail("Required: --ramp --mode <see --help>");
+
+        var options = new RampOptions
+        {
+            Mode = mode,
+            NginxPath = nginxPath,
+            HaproxyPath = haproxyPath,
+            EnvoyPath = envoyPath,
+            ResultsDir = resultsDir ?? Path.Combine(AppContext.BaseDirectory, "results"),
+            Warmup = TimeSpan.FromSeconds(warmupSec),
+            StepDuration = TimeSpan.FromSeconds(durationSec),
+            MaxCachedConnections = maxCachedConnections,
+            Repeats = Math.Max(1, repeats),
+            StopOnSloFail = stopOnSloFail,
+            ArmShard = armShard,
+            ArmGroupKey = armGroupKey,
+            ArmNameContains = armNameContains,
+            ArmNameExcludes = armNameExcludes,
+            ConcurrencySteps = concurrency.Count > 0
+                ? concurrency.ToArray()
+                : [8, 16, 24, 32, 48, 64, 128, 256, 512],
+            Workload = workload
+        };
+        if (printGroups)
+        {
+            // Tab-separated: <group-key>\t<arm-count>. Stdout only; ProbeLog lines start with '['.
+            foreach (var (key, armCount) in RampOrchestrator.ListArmGroups(options))
+                Console.WriteLine($"{key}\t{armCount}");
+            return 0;
+        }
+
+        if (printArms)
+        {
+            foreach (var name in RampOrchestrator.ListArmNames(options))
+                Console.WriteLine(name);
+            return 0;
+        }
+
+        return RampOrchestrator.RunAsync(options, ct).GetAwaiter().GetResult();
+    }
+
+    private static int Fail(string message)
+    {
+        ProbeLog.Error(message);
+        PrintHelp();
+        return 2;
+    }
+
+    private static string RequireValue(string[] args, ref int i, string name)
+    {
+        if (i + 1 >= args.Length)
+            throw new ArgumentException($"Missing value for {name}");
+        return args[++i];
+    }
+
+    private static bool TryParseMode(string text, out ProbeMode mode)
+    {
+        var key = text.Trim();
+        if (PeerWire.TryParseName(key, out mode))
+            return true;
+
+        switch (key.ToLowerInvariant())
+        {
+            case "reverse-http1":
+                mode = ProbeMode.ReverseHttp1;
+                return true;
+            case "bare-reverse-http1":
+                mode = ProbeMode.BareReverseHttp1;
+                return true;
+            case "nginx-reverse-http1":
+                mode = ProbeMode.NginxReverseHttp1;
+                return true;
+            case "haproxy-reverse-http1":
+                mode = ProbeMode.HaproxyReverseHttp1;
+                return true;
+            case "yarp-reverse-http1":
+                mode = ProbeMode.YarpReverseHttp1;
+                return true;
+            case "https-mitm":
+                mode = ProbeMode.HttpsMitm;
+                return true;
+            case "http-mitm":
+                mode = ProbeMode.HttpMitm;
+                return true;
+            case "reverse-http1-mitm":
+                mode = ProbeMode.ReverseHttp1Mitm;
+                return true;
+            case "reverse-http1-tls":
+                mode = ProbeMode.ReverseHttp1Tls;
+                return true;
+            case "reverse-http1-to-https":
+                mode = ProbeMode.ReverseHttp1ToHttps;
+                return true;
+            case "bare-reverse-http1-tls":
+                mode = ProbeMode.BareReverseHttp1Tls;
+                return true;
+            case "nginx-reverse-http1-tls":
+                mode = ProbeMode.NginxReverseHttp1Tls;
+                return true;
+            case "nginx-reverse-http1-to-https":
+                mode = ProbeMode.NginxReverseHttp1ToHttps;
+                return true;
+            case "nginx-reverse-http1-tls-to-https":
+                mode = ProbeMode.NginxReverseHttp1TlsToHttps;
+                return true;
+            case "haproxy-reverse-http1-tls":
+                mode = ProbeMode.HaproxyReverseHttp1Tls;
+                return true;
+            case "haproxy-reverse-http1-to-https":
+                mode = ProbeMode.HaproxyReverseHttp1ToHttps;
+                return true;
+            case "haproxy-reverse-http1-tls-to-https":
+                mode = ProbeMode.HaproxyReverseHttp1TlsToHttps;
+                return true;
+            case "yarp-reverse-http1-tls":
+                mode = ProbeMode.YarpReverseHttp1Tls;
+                return true;
+            case "yarp-reverse-http1-to-https":
+                mode = ProbeMode.YarpReverseHttp1ToHttps;
+                return true;
+            case "reverse-http2":
+                mode = ProbeMode.ReverseHttp2;
+                return true;
+            case "reverse-http2-cleartext":
+                mode = ProbeMode.ReverseHttp2Cleartext;
+                return true;
+            case "reverse-http2-to-h2c":
+                mode = ProbeMode.ReverseHttp2ToH2c;
+                return true;
+            case "yarp-reverse-http2-to-h2c":
+                mode = ProbeMode.YarpReverseHttp2ToH2c;
+                return true;
+            case "reverse-h2c":
+                mode = ProbeMode.ReverseH2c;
+                return true;
+            case "yarp-reverse-h2c":
+                mode = ProbeMode.YarpReverseH2c;
+                return true;
+            case "reverse-h2c-to-h2c":
+                mode = ProbeMode.ReverseH2cToH2c;
+                return true;
+            case "yarp-reverse-h2c-to-h2c":
+                mode = ProbeMode.YarpReverseH2cToH2c;
+                return true;
+            case "reverse-h2c-to-h1":
+                mode = ProbeMode.ReverseH2cToH1;
+                return true;
+            case "yarp-reverse-h2c-to-h1":
+                mode = ProbeMode.YarpReverseH2cToH1;
+                return true;
+            case "reverse-h2c-to-h3":
+                mode = ProbeMode.ReverseH2cToH3;
+                return true;
+            case "yarp-reverse-h2c-to-h3":
+                mode = ProbeMode.YarpReverseH2cToH3;
+                return true;
+            case "nginx-reverse-http2":
+                mode = ProbeMode.NginxReverseHttp2;
+                return true;
+            case "nginx-grpc-http2":
+            case "nginx-reverse-grpc":
+                mode = ProbeMode.NginxReverseGrpc;
+                return true;
+            case "nginx-reverse-http2-to-https-http1":
+                mode = ProbeMode.NginxReverseHttp2ToHttpsHttp1;
+                return true;
+            case "nginx-reverse-http3-cleartext":
+                mode = ProbeMode.NginxReverseHttp3Cleartext;
+                return true;
+            case "nginx-reverse-http3-to-https-http1":
+                mode = ProbeMode.NginxReverseHttp3ToHttpsHttp1;
+                return true;
+            case "haproxy-reverse-http2":
+                mode = ProbeMode.HaproxyReverseHttp2;
+                return true;
+            case "haproxy-reverse-http2-to-https-http1":
+                mode = ProbeMode.HaproxyReverseHttp2ToHttpsHttp1;
+                return true;
+            case "haproxy-reverse-http3-cleartext":
+                mode = ProbeMode.HaproxyReverseHttp3Cleartext;
+                return true;
+            case "haproxy-reverse-http3-to-https-http1":
+                mode = ProbeMode.HaproxyReverseHttp3ToHttpsHttp1;
+                return true;
+            case "compare-nginx-https":
+                mode = ProbeMode.CompareNginxHttps;
+                return true;
+            case "compare-haproxy-smoke":
+                mode = ProbeMode.CompareHaproxySmoke;
+                return true;
+            case "envoy-reverse-http1":
+                mode = ProbeMode.EnvoyReverseHttp1;
+                return true;
+            case "envoy-reverse-http1-tls":
+                mode = ProbeMode.EnvoyReverseHttp1Tls;
+                return true;
+            case "envoy-reverse-http1-to-https":
+                mode = ProbeMode.EnvoyReverseHttp1ToHttps;
+                return true;
+            case "envoy-reverse-http1-tls-to-https":
+                mode = ProbeMode.EnvoyReverseHttp1TlsToHttps;
+                return true;
+            case "envoy-reverse-http2":
+                mode = ProbeMode.EnvoyReverseHttp2;
+                return true;
+            case "envoy-reverse-http2-to-https-http1":
+                mode = ProbeMode.EnvoyReverseHttp2ToHttpsHttp1;
+                return true;
+            case "envoy-reverse-http3-cleartext":
+                mode = ProbeMode.EnvoyReverseHttp3Cleartext;
+                return true;
+            case "envoy-reverse-http3-to-https-http1":
+                mode = ProbeMode.EnvoyReverseHttp3ToHttpsHttp1;
+                return true;
+            case "compare-envoy-smoke":
+                mode = ProbeMode.CompareEnvoySmoke;
+                return true;
+            case "yarp-reverse-http2":
+                mode = ProbeMode.YarpReverseHttp2;
+                return true;
+            case "reverse-http3":
+                mode = ProbeMode.ReverseHttp3;
+                return true;
+            case "reverse-http3-cleartext":
+                mode = ProbeMode.ReverseHttp3Cleartext;
+                return true;
+            case "yarp-reverse-http3-cleartext":
+                mode = ProbeMode.YarpReverseHttp3Cleartext;
+                return true;
+            case "reverse-http11-to-http2":
+                mode = ProbeMode.ReverseHttp11ToHttp2;
+                return true;
+            case "yarp-reverse-http11-to-http2":
+                mode = ProbeMode.YarpReverseHttp11ToHttp2;
+                return true;
+            case "reverse-http1-to-http3":
+                mode = ProbeMode.ReverseHttp1ToHttp3;
+                return true;
+            case "yarp-reverse-http1-to-http3":
+                mode = ProbeMode.YarpReverseHttp1ToHttp3;
+                return true;
+            case "reverse-http2-to-http3":
+                mode = ProbeMode.ReverseHttp2ToHttp3;
+                return true;
+            case "yarp-reverse-http2-to-http3":
+                mode = ProbeMode.YarpReverseHttp2ToHttp3;
+                return true;
+            case "reverse-http3-to-http2":
+                mode = ProbeMode.ReverseHttp3ToHttp2;
+                return true;
+            case "yarp-reverse-http3-to-http2":
+                mode = ProbeMode.YarpReverseHttp3ToHttp2;
+                return true;
+            case "reverse-http3-to-h2c":
+                mode = ProbeMode.ReverseHttp3ToH2c;
+                return true;
+            case "yarp-reverse-http3-to-h2c":
+                mode = ProbeMode.YarpReverseHttp3ToH2c;
+                return true;
+            case "reverse-http1-to-h2c":
+                mode = ProbeMode.ReverseHttp1ToH2c;
+                return true;
+            case "yarp-reverse-http1-to-h2c":
+                mode = ProbeMode.YarpReverseHttp1ToH2c;
+                return true;
+            case "reverse-http1-plain-to-h2c":
+                mode = ProbeMode.ReverseHttp1PlainToH2c;
+                return true;
+            case "yarp-reverse-http1-plain-to-h2c":
+                mode = ProbeMode.YarpReverseHttp1PlainToH2c;
+                return true;
+            case "reverse-http1-plain-to-http2":
+                mode = ProbeMode.ReverseHttp1PlainToHttp2;
+                return true;
+            case "yarp-reverse-http1-plain-to-http2":
+                mode = ProbeMode.YarpReverseHttp1PlainToHttp2;
+                return true;
+            case "reverse-http1-plain-to-http3":
+                mode = ProbeMode.ReverseHttp1PlainToHttp3;
+                return true;
+            case "yarp-reverse-http1-plain-to-http3":
+                mode = ProbeMode.YarpReverseHttp1PlainToHttp3;
+                return true;
+            case "reverse-h2c-to-https":
+                mode = ProbeMode.ReverseH2cToHttps;
+                return true;
+            case "yarp-reverse-h2c-to-https":
+                mode = ProbeMode.YarpReverseH2cToHttps;
+                return true;
+            case "yarp-reverse-http1-tls-to-https":
+                mode = ProbeMode.YarpReverseHttp1TlsToHttps;
+                return true;
+            case "yarp-reverse-http2-to-https-http1":
+                mode = ProbeMode.YarpReverseHttp2ToHttpsHttp1;
+                return true;
+            case "yarp-reverse-http3-to-https-http1":
+                mode = ProbeMode.YarpReverseHttp3ToHttpsHttp1;
+                return true;
+            case "yarp-reverse-http3-to-http3":
+                mode = ProbeMode.YarpReverseHttp3ToHttp3;
+                return true;
+            case "explicit-http1-multi":
+                mode = ProbeMode.ExplicitHttp1Multi;
+                return true;
+            case "explicit-http2-multi":
+                mode = ProbeMode.ExplicitHttp2Multi;
+                return true;
+            case "compare":
+                mode = ProbeMode.Compare;
+                return true;
+            case "compare-http2":
+                mode = ProbeMode.CompareHttp2;
+                return true;
+            case "compare-tls":
+                mode = ProbeMode.CompareTls;
+                return true;
+            case "compare-terminate":
+                mode = ProbeMode.CompareTerminate;
+                return true;
+            case "compare-same":
+                mode = ProbeMode.CompareSame;
+                return true;
+            case "compare-bridges":
+                mode = ProbeMode.CompareBridges;
+                return true;
+            case "compare-http3-cleartext":
+                mode = ProbeMode.CompareHttp3Cleartext;
+                return true;
+            case "compare-mitm":
+                mode = ProbeMode.CompareMitm;
+                return true;
+            case "compare-matrix":
+                mode = ProbeMode.CompareMatrix;
+                return true;
+            case "compare-product":
+                mode = ProbeMode.CompareProduct;
+                return true;
+            case "compare-product-smoke":
+                mode = ProbeMode.CompareProductSmoke;
+                return true;
+            case "compare-spot":
+                mode = ProbeMode.CompareSpot;
+                return true;
+            case "compare-ceiling":
+                mode = ProbeMode.CompareCeiling;
+                return true;
+            case "compare-bodies":
+                mode = ProbeMode.CompareBodies;
+                return true;
+            case "compare-post":
+                mode = ProbeMode.ComparePost;
+                return true;
+            case "compare-lossy":
+                mode = ProbeMode.CompareLossy;
+                return true;
+            case "compare-tls-cost":
+                mode = ProbeMode.CompareTlsCost;
+                return true;
+            case "compare-arch":
+                mode = ProbeMode.CompareArch;
+                return true;
+            case "compare-grpc":
+                mode = ProbeMode.CompareGrpc;
+                return true;
+            case "compare-ws-h1tls":
+                mode = ProbeMode.CompareWsH1Tls;
+                return true;
+            case "compare-ws-h2":
+                mode = ProbeMode.CompareWsH2;
+                return true;
+            case "compare-saturation":
+                mode = ProbeMode.CompareSaturation;
+                return true;
+            case "compare-editions":
+                mode = ProbeMode.CompareEditions;
+                return true;
+            case "twp-cli-reverse-http1":
+                mode = ProbeMode.TwpCliReverseHttp1;
+                return true;
+            case "twp-cli-reverse-http1-tls":
+                mode = ProbeMode.TwpCliReverseHttp1Tls;
+                return true;
+            case "twp-cli-reverse-http1-route":
+                mode = ProbeMode.TwpCliReverseHttp1Route;
+                return true;
+            case "twp-cli-plus-base-http1":
+                mode = ProbeMode.TwpCliPlusBaseHttp1;
+                return true;
+            case "twp-cli-plus-cache-http1":
+                mode = ProbeMode.TwpCliPlusCacheHttp1;
+                return true;
+            case "twp-cli-intercept-http1":
+                mode = ProbeMode.TwpCliInterceptHttp1;
+                return true;
+            case "twp-cli-plus-waf-http1":
+                mode = ProbeMode.TwpCliPlusWafHttp1;
+                return true;
+            case "twp-cli-plus-cidr-http1":
+                mode = ProbeMode.TwpCliPlusCidrHttp1;
+                return true;
+            case "twp-cli-plus-jwt-http1":
+                mode = ProbeMode.TwpCliPlusJwtHttp1;
+                return true;
+            case "twp-cli-plus-ratelimit-http1":
+                mode = ProbeMode.TwpCliPlusRateLimitHttp1;
+                return true;
+            case "twp-cli-plus-resilience-http1":
+                mode = ProbeMode.TwpCliPlusResilienceHttp1;
+                return true;
+            case "twp-cli-plus-discovery-file-http1":
+                mode = ProbeMode.TwpCliPlusDiscoveryFileHttp1;
+                return true;
+            case "twp-cli-plus-metrics-scrape-http1":
+                mode = ProbeMode.TwpCliPlusMetricsScrapeHttp1;
+                return true;
+            case "twp-cli-plus-cache-hit-http1":
+                mode = ProbeMode.TwpCliPlusCacheHitHttp1;
+                return true;
+            case "twp-cli-plus-cors-http1":
+                mode = ProbeMode.TwpCliPlusCorsHttp1;
+                return true;
+            case "twp-cli-plus-circuit-http1":
+                mode = ProbeMode.TwpCliPlusCircuitHttp1;
+                return true;
+            case "twp-cli-plus-retry-http1":
+                mode = ProbeMode.TwpCliPlusRetryHttp1;
+                return true;
+            case "twp-cli-static-http1":
+                mode = ProbeMode.TwpCliStaticHttp1;
+                return true;
+            case "twp-cli-logging-http1":
+                mode = ProbeMode.TwpCliLoggingHttp1;
+                return true;
+            case "twp-cli-lb-leasttime-http1":
+                mode = ProbeMode.TwpCliLbLeastTimeHttp1;
+                return true;
+            case "twp-cli-dialect-twp-http1":
+                mode = ProbeMode.TwpCliDialectTwpHttp1;
+                return true;
+            case "origin-direct":
+                mode = ProbeMode.OriginDirect;
+                return true;
+            case "yarp-reverse-http2-to-https":
+                mode = ProbeMode.YarpReverseHttp2ToHttps;
+                return true;
+            case "mitm-http2-to-http1":
+                mode = ProbeMode.MitmHttp2ToHttp1;
+                return true;
+            case "mitm-http3-to-http1":
+                mode = ProbeMode.MitmHttp3ToHttp1;
+                return true;
+            case "explicit-pool-sweep":
+                mode = ProbeMode.ExplicitPoolSweep;
+                return true;
+            default:
+                mode = default;
+                return false;
+        }
+    }
+
+    private static void PrintHelp()
+    {
+        ProbeLog.Info(
+            """
+            RpsLoadProbe — saturation RPS harness for Titanium.Web.Proxy.
+            Published comparisons: wiki/Performance.md
+
+            Usage:
+              RpsLoadProbe --serve --mode <mode> [--nginx-path PATH] [--haproxy-path PATH] [--envoy-path PATH] [--max-cached-connections N] [--response-bytes N]
+              RpsLoadProbe --serve-origin [--https [--https-only] [--https-protocols http1|http1and2] [--extra-https-origins N] | --h2c | --quic]
+              RpsLoadProbe --serve-proxy --mode <arm> [--origin-http-port N] [--origin-https-port N] [--origin-quic-port N]
+              RpsLoadProbe --ramp  --mode <mode> [options]
+              --ramp always uses three processes (load gen + origin child + proxy child). --serve is debug-only.
+
+            Modes:
+              reverse-http1           TWP TransparentProxyEndPoint -> Kestrel HTTP/1
+              bare-reverse-http1      Thin C# HTTP/1 reverse (runtime-ceiling control)
+              nginx-reverse-http1     Control arm: native reverse -> same Kestrel HTTP/1 origin
+              haproxy-reverse-http1   Control arm: HAProxy reverse -> same Kestrel HTTP/1 origin
+              yarp-reverse-http1      Control arm: managed reverse -> same Kestrel HTTP/1 origin
+              reverse-http1-tls       TWP TLS terminate -> cleartext HTTP/1 origin
+              reverse-http1-to-https  TWP cleartext HTTP/1 -> HTTPS HTTP/1 origin
+              bare-reverse-http1-tls  Thin C# TLS-terminate HTTP/1 reverse
+              nginx-reverse-http1-tls Control arm: TLS reverse -> cleartext HTTP/1 origin
+              haproxy-reverse-http1-tls Control arm: HAProxy TLS reverse -> cleartext HTTP/1 origin
+              yarp-reverse-http1-tls  Control arm: TLS terminate -> cleartext HTTP/1 origin
+              yarp-reverse-http1-to-https Control arm: cleartext HTTP/1 -> HTTPS HTTP/1
+              https-mitm              TWP Explicit CONNECT MITM -> Kestrel HTTPS
+              http-mitm               TWP Explicit intercepting proxy -> cleartext HTTP/1 origin
+              reverse-http1-mitm      TWP transparent dual-TLS H1 MITM -> Kestrel HTTPS
+              mitm-http2-to-http1     TWP H2 TLS MITM -> H2→H1 bridge -> Kestrel HTTPS/h1
+              mitm-http3-to-http1     TWP H3 MITM -> bridge -> Kestrel HTTPS/h1
+              reverse-http2           TWP Transparent TLS+h2 MITM -> Kestrel HTTPS (h2)
+              reverse-http2-cleartext TWP TLS+h2 terminate -> H2→H1 bridge -> Kestrel HTTP/1
+              reverse-http2-to-h2c     TWP TLS+h2 terminate -> prior-knowledge h2c -> Kestrel HTTP/2 cleartext
+              yarp-reverse-http2-to-h2c Control arm: TLS+h2 -> prior-knowledge h2c
+              reverse-h2c             TWP cleartext h2c reverse -> Kestrel HTTPS/h2
+              yarp-reverse-h2c        Control arm: cleartext h2c -> HTTPS/h2
+              reverse-h2c-to-h2c      TWP cleartext h2c reverse -> Kestrel HTTP/2 cleartext
+              yarp-reverse-h2c-to-h2c Control arm: cleartext h2c -> h2c
+              reverse-h2c-to-h1       TWP cleartext h2c reverse -> H2→H1 bridge -> Kestrel HTTP/1
+              yarp-reverse-h2c-to-h1  Control arm: cleartext h2c -> HTTP/1
+              reverse-h2c-to-h3       TWP cleartext h2c reverse -> H2→H3 bridge -> Quic/h3 origin
+              yarp-reverse-h2c-to-h3  Control arm: cleartext h2c -> HTTP/3 origin
+              nginx-reverse-http2     Control arm: ssl+http2 -> cleartext HTTP/1 origin
+              nginx-reverse-http2-to-https-http1 Control arm: ssl+http2 -> HTTPS HTTP/1 (proxy_ssl)
+              nginx-reverse-http3-cleartext Control arm: QUIC/h3 -> cleartext HTTP/1 (needs http_v3_module)
+              nginx-reverse-http3-to-https-http1 Control arm: QUIC/h3 -> HTTPS HTTP/1 (proxy_ssl)
+              nginx-reverse-h2c-to-h1 / -to-https  Control: prior-knowledge h2c (nginx 1.25.1+ http2 on)
+              haproxy-/envoy- 5×5 remainder       h2c inbound and H2/H3 origin (see product-arm-matrix.py)
+              nginx-reverse-http1-to-https Control arm: cleartext HTTP/1 -> HTTPS HTTP/1 (proxy_ssl)
+              nginx-reverse-http1-tls-to-https Control arm: TLS HTTP/1 -> HTTPS HTTP/1 (dual TLS)
+              haproxy-reverse-http2   Control arm: HAProxy ssl+alpn h2 -> cleartext HTTP/1 origin
+              haproxy-reverse-http2-to-https-http1 Control arm: HAProxy ssl+h2 -> HTTPS HTTP/1
+              haproxy-reverse-http3-cleartext Control arm: QUIC/h3 -> cleartext HTTP/1 (needs USE_QUIC)
+              haproxy-reverse-http3-to-https-http1 Control arm: QUIC/h3 -> HTTPS HTTP/1 (needs USE_QUIC)
+              haproxy-reverse-http1-to-https Control arm: cleartext HTTP/1 -> HTTPS HTTP/1
+              haproxy-reverse-http1-tls-to-https Control arm: TLS HTTP/1 -> HTTPS HTTP/1 (dual TLS)
+              compare-nginx-https     Smoke: TWP+YARP+nginx on HTTPS-origin terminate wires
+              compare-haproxy-smoke   Smoke: TWP+YARP+HAProxy reverse peers
+              envoy-reverse-http1     Control arm: Envoy reverse -> same Kestrel HTTP/1 origin
+              envoy-reverse-http1-tls Control arm: Envoy TLS reverse -> cleartext HTTP/1 origin
+              envoy-reverse-http2     Control arm: Envoy ssl+alpn h2 -> cleartext HTTP/1 origin
+              envoy-reverse-http2-to-https-http1 Control arm: Envoy ssl+h2 -> HTTPS HTTP/1
+              envoy-reverse-http3-cleartext Control arm: QUIC/h3 -> cleartext HTTP/1 (needs HTTP/3)
+              envoy-reverse-http3-to-https-http1 Control arm: QUIC/h3 -> HTTPS HTTP/1
+              envoy-reverse-http1-to-https Control arm: cleartext HTTP/1 -> HTTPS HTTP/1
+              envoy-reverse-http1-tls-to-https Control arm: TLS HTTP/1 -> HTTPS HTTP/1 (dual TLS)
+              compare-envoy-smoke     Smoke: TWP+YARP+Envoy reverse peers
+              yarp-reverse-http2      Control arm: TLS+h2 -> cleartext HTTP/1 origin
+              reverse-http3           TWP TransparentQuic (h3) -> Quic HTTPS/h3 origin
+              reverse-http3-cleartext TWP QUIC/h3 terminate -> cleartext HTTP/1 origin
+              yarp-reverse-http3-cleartext Control arm: HTTP/3 terminate -> cleartext HTTP/1
+              reverse-http11-to-http2 TWP H1 TLS -> H1→H2 bridge -> Kestrel HTTPS/h2
+              yarp-reverse-http11-to-http2 Control arm: H1 TLS -> HTTPS/h2
+              reverse-http1-to-http3  TWP H1 TLS -> H1→H3 bridge -> Quic/h3 origin
+              yarp-reverse-http1-to-http3 Control arm: H1 TLS -> HTTP/3 origin
+              reverse-http2-to-http3  TWP H2 TLS -> H2→H3 bridge -> Quic/h3 origin
+              yarp-reverse-http2-to-http3 Control arm: H2 TLS -> HTTP/3 origin
+              reverse-http3-to-http2  TWP H3 -> H3→H2 bridge -> Kestrel HTTPS/h2
+              yarp-reverse-http3-to-http2 Control arm: H3 -> HTTPS/h2
+              reverse-http3-to-h2c    TWP H3 -> H3→H2 bridge -> prior-knowledge h2c
+              yarp-reverse-http3-to-h2c Control arm: H3 -> h2c
+              reverse-http1-to-h2c    TWP H1 TLS -> H1→H2 bridge -> prior-knowledge h2c
+              yarp-reverse-http1-to-h2c Control arm: H1 TLS -> h2c
+              reverse-http1-plain-to-h2c TWP H1 plain -> H1→H2 bridge -> prior-knowledge h2c
+              yarp-reverse-http1-plain-to-h2c Control arm: H1 plain -> h2c
+              reverse-http1-plain-to-http2 TWP H1 plain -> H1→H2 bridge -> Kestrel HTTPS/h2
+              yarp-reverse-http1-plain-to-http2 Control arm: H1 plain -> HTTPS/h2
+              reverse-http1-plain-to-http3 TWP H1 plain -> H1→H3 bridge -> Quic/h3 origin
+              yarp-reverse-http1-plain-to-http3 Control arm: H1 plain -> HTTP/3 origin
+              reverse-h2c-to-https    TWP cleartext h2c -> H2→H1 bridge -> Kestrel HTTPS/h1
+              yarp-reverse-h2c-to-https Control arm: cleartext h2c -> HTTPS/h1
+              yarp-reverse-http1-tls-to-https Control arm: H1 TLS -> HTTPS/h1 (dual-crypto)
+              yarp-reverse-http2-to-https-http1 Control arm: H2 TLS -> HTTPS/h1
+              yarp-reverse-http3-to-https-http1 Control arm: H3 -> HTTPS/h1
+              yarp-reverse-http3-to-http3 Control arm: H3 -> HTTP/3 origin
+              explicit-http1-multi    Explicit MITM across 16 HTTPS origins (fan-out)
+              explicit-http2-multi    Same fan-out forcing HTTP/2
+              compare                 Sequential HTTP/1 compare (+ MITM)
+              compare-http2           Sequential: TWP h2 MITM, control H2 terminate, TWP h3
+              compare-tls             Sequential: H1 TLS terminate, TWP h2 MITM, H2 terminate, TWP h3
+              compare-terminate       Fair terminate: H1 TLS, H2→H1, H3→H1 (+ control arms)
+              compare-same            Same-protocol: H1 cleartext, H1 TLS, H1 MITM, H2 MITM, H3 MITM (+ control arms)
+              compare-bridges         Cross-version bridges (H1↔H2↔H3; TWP + control arms)
+              compare-http3-cleartext H3→H1 cleartext only (TWP + YARP + nginx when available)
+              compare-mitm            True MITM 5×5 lite + full-session mutate twins + CONNECT
+              compare-matrix          Full 5×5 reverse matrix: all TWP + YARP (+ nginx terminate peers)
+              compare-product         Same-job: compare-matrix reverse peers + compare-mitm TWP
+              compare-product-smoke   Gate-arm subset + validate-compare-product-gates (Mac quick check)
+              compare-ceiling         TWP vs bare C# vs control arms on H1 / H1 TLS / H2→H1 reverse
+              compare-bodies          Heavier reverse GET (64 KiB + 256 KiB) vs control arms
+              compare-post            POST 64 KiB request+response reverse vs control arms
+              compare-lossy           64 KiB GET under userspace delay/loss vs control arms
+              compare-tls-cost        H1 TLS terminate: keep-alive tiny / new-conn tiny / keep-alive 256 KiB
+              compare-arch            Slow consumer, early response, H2 duplex, WebSocket H1 Upgrade vs control arms
+              compare-grpc            Unary gRPC RPC/s: H2 TLS→H2 TLS + H2 TLS→h2c (TWP / YARP / nginx / HAProxy / Envoy)
+              compare-ws-h1tls        WebSocket echo on H1 TLS→H1 TLS (dual-TLS / proxy_ssl)
+              compare-ws-h2           WebSocket RFC 8441 extended CONNECT H2 TLS→H1 plain (TWP / YARP / HAProxy / Envoy)
+              compare-saturation      Calibration: origin-direct (+ bombardier) + H1 plain peers;
+                                      then H2 TLS→H1 and H3→H1 peers; CSV proxy_rss/cpu columns
+                                      (proxy child + descendants; origin PID on origin-direct)
+              origin-direct           Load generator → origin child only (no proxy)
+              yarp-reverse-http2-to-https Control arm: TLS+h2 -> HTTPS/h2
+              explicit-pool-sweep     Fan-out with MaxCachedConnections 4 / 32 / 128
+
+            Options:
+              --nginx-path PATH
+              --haproxy-path PATH
+              --envoy-path PATH
+              --results-dir DIR
+              --https / --https-only / --https-protocols http1|http1and2 / --extra-https-origins N
+              --h2c / --quic         Origin listen shape for --serve-origin
+              --origin-http-port N / --origin-https-port N / --origin-quic-port N
+              --origin-https-extra-port N   Repeatable; explicit-multi extras
+              --concurrency LIST      Default: 8,16,24,32,48,64,128,256,512
+              --warmup-sec N
+              --duration-sec N
+              --repeats N             Full arm sequence N times; print median peaks (default 1)
+              --arm-shard i/n|all|KEY Exclusive comparison-group (wiki-row) partition; all = no split;
+                                      KEY (e.g. h1c-h1c, h3-h3-body64k) runs exactly one wiki row
+              --arm-contains TEXT     Keep only arms whose name contains TEXT (surgical re-run);
+              --arm-excludes TEXT     Drop arms whose name matches TEXT (same comma/$ syntax);
+                                      comma-separated alternatives, trailing $ = name ends with
+              --max-cached-connections N   Override ProxyServer.MaxCachedConnections for TWP arms
+              --method GET|POST       Default GET (compare-post sets POST per arm)
+              --response-bytes N      Origin response size (default ~64 B tiny JSON)
+              --request-bytes N       POST body size (default 0)
+              --no-keepalive          New TCP/TLS connection per request (handshake cost)
+              --delay-ms N            Userspace one-way delay via TCP lossy shim (0 = off; ignored on H3/UDP)
+              --loss-percent P        TCP connection stall % or UDP datagram drop % (0 = off)
+              --early-response-after N  Origin starts response after N request bytes (0 = drain-then-write)
+              --websocket             Origin /ws echo; client uses ClientWebSocket
+              --grpc                  Origin MapGrpcService Echo; client uses Grpc.Net.Client unary
+              --print-arms            Resolve arm list (+ optional --arm-shard) and exit (no ramp)
+              --print-groups          Print "<group-key>\t<arm-count>" per wiki row for the mode and exit
+            """);
+    }
+}

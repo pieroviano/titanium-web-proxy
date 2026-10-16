@@ -1,252 +1,146 @@
-## Titanium Web Proxy
+# Titanium Web Proxy
 
-A lightweight HTTP(S) proxy server written in C#.
+A lightweight, high-performance HTTP(S) proxy for Windows, Linux, and macOS.
 
-[![.NET Core](https://github.com/justcoding121/titanium-web-proxy/actions/workflows/dotnetcore.yml/badge.svg?branch=develop)](https://github.com/justcoding121/titanium-web-proxy/actions/workflows/dotnetcore.yml) [![Join the chat at https://gitter.im/Titanium-Web-Proxy/Lobby](https://badges.gitter.im/Titanium-Web-Proxy/Lobby.svg)](https://gitter.im/Titanium-Web-Proxy/Lobby?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
+**[Website](https://titaniumproxy.com)** · [Download](https://titaniumproxy.com/download) · [Docs](https://titaniumproxy.com/docs/getting-started) · [Releases](https://titaniumproxy.com/releases)
 
-Report bugs or raise issues here. For programming help use [StackOverflow](http://stackoverflow.com/questions/tagged/titanium-web-proxy) with the tag Titanium-Web-Proxy.
+| Product | Best for |
+|---------|----------|
+| **Titanium.Cli** (`titanium` / `twp`)<br>[Download](https://titaniumproxy.com/download#cli) | Standalone reverse / edge proxy from the command line |
+| **Titanium Inspector**<br>[Download](https://titaniumproxy.com/download#inspector) | Desktop MITM debugger — session grid, inspectors, AutoResponder, breakpoints, HAR export |
+| **Titanium.Plus**<br>`titanium update --plus` (after installing CLI) | Optional extra features for CLI such as control plane, dashboard, observability |
+| **Titanium.Web.Proxy**<br>[NuGet](https://www.nuget.org/packages/Titanium.Web.Proxy) | Embed a proxy (MITM and/or reverse) in a .NET app |
 
-* [API Documentation](https://justcoding121.github.io/titanium-web-proxy/docs/api/Titanium.Web.Proxy.ProxyServer.html)
-* [Wiki & Contribution guidelines](https://github.com/justcoding121/Titanium-Web-Proxy/wiki)
+Requires .NET 10 or later for the library. CLI and Inspector downloads are self-contained (no SDK needed to run them).
 
-### Features
+[![Build](https://github.com/justcoding121/titanium-web-proxy/actions/workflows/dotnetcore.yml/badge.svg?branch=develop)](https://github.com/justcoding121/titanium-web-proxy/actions/workflows/dotnetcore.yml)
+[![NuGet](https://img.shields.io/nuget/v/Titanium.Web.Proxy.svg)](https://www.nuget.org/packages/Titanium.Web.Proxy)
+[![NuGet downloads](https://img.shields.io/nuget/dt/Titanium.Web.Proxy.svg)](https://www.nuget.org/packages/Titanium.Web.Proxy)
 
-* Multithreaded and asynchronous proxy employing server connection pooling, certificate cache, and buffer pooling
-* View, modify, redirect and block requests or responses
-* Supports mutual SSL authentication, proxy authentication & automatic upstream proxy detection
-* Supports kerberos, NTLM authentication over HTTP protocols on windows domain controlled networks
-* SOCKS4/5 Proxy support
+## What you can do
 
-### Installation
-Install by [nuget](https://www.nuget.org/packages/Titanium.Web.Proxy)
+- Decrypt and inspect HTTPS in a native desktop Inspector on Windows, macOS, and Linux — AutoResponder, Map Local/Remote, breakpoints, Composer, HAR, curl/fetch
+- When a server blocks the proxy (TLS fingerprinting or other reasons), we detect it and automatically tunnel that traffic
+- Speak modern HTTP — HTTP/2 by default, optional HTTP/3, WebSocket, gRPC, SSE, GraphQL rules in the same grid
+- Run the same engine as a reverse / edge proxy from the CLI (YAML, load balancing, ACME, live reload)
+- Embed in .NET via NuGet (MIT); Inspector is free for personal and education use
 
-For beta releases on [beta branch](https://github.com/justcoding121/Titanium-Web-Proxy/tree/beta)
+Full catalog: [Features](https://titaniumproxy.com/docs/features). Protocol coverage: [protocol support matrix](https://github.com/justcoding121/titanium-web-proxy/wiki/Protocol-Support). HTTP/3 packaging: [HTTP/3 wiki](https://github.com/justcoding121/titanium-web-proxy/wiki/HTTP-3).
 
-    Install-Package Titanium.Web.Proxy -Pre
+## Performance
 
-For stable releases on [stable branch](https://github.com/justcoding121/Titanium-Web-Proxy/tree/stable)
+Tiny keep-alive GET (~56 B) on common reverse wires, plus WebSocket and unary gRPC:
 
-    Install-Package Titanium.Web.Proxy
+![Practical reverse proxy throughput on Linux (tiny requests)](wiki/images/rps-practical-linux.png)
 
-Supports
+Heavier reverse load (64 KB GET/POST on typical wires):
 
- * .NET Standard 2.0 or above
- * .NET Framework 4.5 or above
+![Practical reverse proxy throughput on Linux (64 KB)](wiki/images/rps-practical-heavier-linux.png)
 
-###  Note to contributors
+**RPS** is requests per second (gRPC bars are **RPC/s**). Compared on the same harness vs **YARP**, **nginx**, **HAProxy**, and **Envoy**. See [Performance](https://github.com/justcoding121/titanium-web-proxy/wiki/Performance).
 
-#### Road map
+## Installation
 
-* Fix [outstanding bugs](https://github.com/justcoding121/Titanium-Web-Proxy/issues?q=is%3Aopen+is%3Aissue+label%3Abug)
-* Support reading request and response body as stream [#823](https://github.com/justcoding121/Titanium-Web-Proxy/issues/823)
-* Stop throwing new exceptions [#634](https://github.com/justcoding121/Titanium-Web-Proxy/issues/634)
-* Support HTTP 2.0 
+**Inspector and CLI** (Windows, Linux, macOS): use [Download](https://titaniumproxy.com/download) — MSI / DMG / AppImage / `.deb` / `.rpm` / zip. Short walkthrough: [Install](https://titaniumproxy.com/docs/install).
 
-#### Collaborators
+After the CLI is on your PATH (or in the current folder):
 
-The owner of this project, [justcoding121](https://github.com/justcoding121), is considered to be inactive from this project due to his busy work schedule. However, we have a collaborator listed below who time and again shows up to maintain this project. Please create pull requests prioritizing bug fixes for the attention of collaborators.
+```shell
+titanium run -c twp.yaml
+titanium test -c twp.yaml
+titanium version --check
+titanium update
+```
 
-* [honfika](https://github.com/honfika)
- 
-### Development environment
+`titanium run` is foreground (Ctrl+C to stop). Boot persistence: `titanium service install -c twp.yaml` — [CLI — service](https://titaniumproxy.com/docs/cli#service). Each CLI zip also includes a `twp` alias.
 
-#### Windows
-* Visual Studio Code as IDE for .NET
-* Visual Studio 2022 as IDE for .NET Framework/.NET
+**Optional Plus:** `titanium update --plus`, then `plus.enabled: true` — [Plus](https://titaniumproxy.com/docs/plus).
 
-#### Mac OS
-* Visual Studio Code as IDE for .NET
-* Visual Studio 2022 as IDE for Mono
+<img src="wiki/images/inspector-screenshot.jpg" alt="Titanium Inspector screenshot" width="900" />
 
-#### Linux
-* Visual Studio Code as IDE for .NET
-* Mono develop as IDE for Mono
+### Library (.NET)
 
-### Usage
+```shell
+dotnet add package Titanium.Web.Proxy
+# Prerelease / beta:
+dotnet add package Titanium.Web.Proxy --prerelease
+```
 
-Refer the HTTP Proxy Server library in your project and look up the test project to learn usage. 
- 
-Setup HTTP proxy:
+## Quick start (library)
+
+Explicit HTTP(S) proxy on `127.0.0.1:8000` that logs each requested URL:
 
 ```csharp
-var proxyServer = new ProxyServer();
+using System;
+using System.Net;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using Titanium.Web.Proxy;
+using Titanium.Web.Proxy.EventArguments;
+using Titanium.Web.Proxy.Models;
 
-// locally trust root certificate used by this proxy 
-proxyServer.CertificateManager.TrustRootCertificate(true);
+using var proxyServer = new ProxyServer();
 
-// optionally set the Certificate Engine
-// Under Mono only BouncyCastle will be supported
-//proxyServer.CertificateManager.CertificateEngine = Network.CertificateEngine.BouncyCastle;
-
+proxyServer.Logging.MinimumLevel = LogLevel.Information;
 proxyServer.BeforeRequest += OnRequest;
-proxyServer.BeforeResponse += OnResponse;
-proxyServer.ServerCertificateValidationCallback += OnCertificateValidation;
-proxyServer.ClientCertificateSelectionCallback += OnCertificateSelection;
 
+var endPoint = new ExplicitProxyEndPoint(IPAddress.Loopback, 8000, decryptSsl: true);
+proxyServer.AddEndPoint(endPoint);
 
-var explicitEndPoint = new ExplicitProxyEndPoint(IPAddress.Any, 8000, true)
-{
-    // Use self-issued generic certificate on all https requests
-    // Optimizes performance by not creating a certificate for each https-enabled domain
-    // Useful when certificate trust is not required by proxy clients
-   //GenericCertificate = new X509Certificate2(Path.Combine(System.IO.Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location), "genericcert.pfx"), "password")
-};
+// Create and trust the root certificate used to decrypt HTTPS traffic.
+proxyServer.CertificateManager.EnsureRootCertificate(
+    userTrustRootCertificate: true,
+    machineTrustRootCertificate: false);
 
-// Fired when a CONNECT request is received
-explicitEndPoint.BeforeTunnelConnectRequest += OnBeforeTunnelConnectRequest;
-
-// An explicit endpoint is where the client knows about the existence of a proxy
-// So client sends request in a proxy friendly manner
-proxyServer.AddEndPoint(explicitEndPoint);
 proxyServer.Start();
-
-// Transparent endpoint is useful for reverse proxy (client is not aware of the existence of proxy)
-// A transparent endpoint usually requires a network router port forwarding HTTP(S) packets or DNS
-// to send data to this endPoint
-var transparentEndPoint = new TransparentProxyEndPoint(IPAddress.Any, 8001, true)
-{
-    // Generic Certificate hostname to use
-    // when SNI is disabled by client
-    GenericCertificateName = "google.com"
-};
-
-proxyServer.AddEndPoint(transparentEndPoint);
-
-//proxyServer.UpStreamHttpProxy = new ExternalProxy() { HostName = "localhost", Port = 8888 };
-//proxyServer.UpStreamHttpsProxy = new ExternalProxy() { HostName = "localhost", Port = 8888 };
-
-foreach (var endPoint in proxyServer.ProxyEndPoints)
-Console.WriteLine("Listening on '{0}' endpoint at Ip {1} and port: {2} ",
-    endPoint.GetType().Name, endPoint.IpAddress, endPoint.Port);
-
-// Only explicit proxies can be set as system proxy!
-proxyServer.SetAsSystemHttpProxy(explicitEndPoint);
-proxyServer.SetAsSystemHttpsProxy(explicitEndPoint);
-
-// wait here (You can use something else as a wait function, I am using this as a demo)
-Console.Read();
-
-// Unsubscribe & Quit
-explicitEndPoint.BeforeTunnelConnectRequest -= OnBeforeTunnelConnectRequest;
-proxyServer.BeforeRequest -= OnRequest;
-proxyServer.BeforeResponse -= OnResponse;
-proxyServer.ServerCertificateValidationCallback -= OnCertificateValidation;
-proxyServer.ClientCertificateSelectionCallback -= OnCertificateSelection;
-
+proxyServer.Logger.LogInformation("Proxy listening on 127.0.0.1:8000. Press Enter to stop.");
+await Console.In.ReadLineAsync();
 proxyServer.Stop();
-    
-```
-Sample request and response event handlers
 
-```csharp        
-
-private async Task OnBeforeTunnelConnectRequest(object sender, TunnelConnectSessionEventArgs e)
+Task OnRequest(object sender, SessionEventArgs e)
 {
-    string hostname = e.HttpClient.Request.RequestUri.Host;
-
-    if (hostname.Contains("dropbox.com"))
-    {
-         // Exclude Https addresses you don't want to proxy
-         // Useful for clients that use certificate pinning
-         // for example dropbox.com
-         e.DecryptSsl = false;
-    }
-}
-
-public async Task OnRequest(object sender, SessionEventArgs e)
-{
-    Console.WriteLine(e.HttpClient.Request.Url);
-
-    // read request headers
-    var requestHeaders = e.HttpClient.Request.Headers;
-
-    var method = e.HttpClient.Request.Method.ToUpper();
-    if ((method == "POST" || method == "PUT" || method == "PATCH"))
-    {
-        // Get/Set request body bytes
-        byte[] bodyBytes = await e.GetRequestBody();
-        e.SetRequestBody(bodyBytes);
-
-        // Get/Set request body as string
-        string bodyString = await e.GetRequestBodyAsString();
-        e.SetRequestBodyString(bodyString);
-    
-        // store request 
-        // so that you can find it from response handler 
-        e.UserData = e.HttpClient.Request;
-    }
-
-    // To cancel a request with a custom HTML content
-    // Filter URL
-    if (e.HttpClient.Request.RequestUri.AbsoluteUri.Contains("google.com"))
-    {
-        e.Ok("<!DOCTYPE html>" +
-            "<html><body><h1>" +
-            "Website Blocked" +
-            "</h1>" +
-            "<p>Blocked by titanium web proxy.</p>" +
-            "</body>" +
-            "</html>");
-    }
-
-    // Redirect example
-    if (e.HttpClient.Request.RequestUri.AbsoluteUri.Contains("wikipedia.org"))
-    {
-        e.Redirect("https://www.paypal.com");
-    }
-}
-
-// Modify response
-public async Task OnResponse(object sender, SessionEventArgs e)
-{
-    // read response headers
-    var responseHeaders = e.HttpClient.Response.Headers;
-
-    //if (!e.ProxySession.Request.Host.Equals("medeczane.sgk.gov.tr")) return;
-    if (e.HttpClient.Request.Method == "GET" || e.HttpClient.Request.Method == "POST")
-    {
-        if (e.HttpClient.Response.StatusCode == 200)
-        {
-            if (e.HttpClient.Response.ContentType != null && e.HttpClient.Response.ContentType.Trim().ToLower().Contains("text/html"))
-            {
-                byte[] bodyBytes = await e.GetResponseBody();
-                e.SetResponseBody(bodyBytes);
-
-                string body = await e.GetResponseBodyAsString();
-                e.SetResponseBodyString(body);
-            }
-        }
-    }
-    
-    if (e.UserData != null)
-    {
-        // access request from UserData property where we stored it in RequestHandler
-        var request = (Request)e.UserData;
-    }
-}
-
-// Allows overriding default certificate validation logic
-public Task OnCertificateValidation(object sender, CertificateValidationEventArgs e)
-{
-    // set IsValid to true/false based on Certificate Errors
-    if (e.SslPolicyErrors == System.Net.Security.SslPolicyErrors.None)
-        e.IsValid = true;
-
-    return Task.CompletedTask;
-}
-
-// Allows overriding default client certificate selection logic during mutual authentication
-public Task OnCertificateSelection(object sender, CertificateSelectionEventArgs e)
-{
-    // set e.clientCertificate to override
+    proxyServer.Logger.LogInformation("{Url}", e.HttpClient.Request.Url);
     return Task.CompletedTask;
 }
 ```
 
-**Console example application screenshot**
+<img src="wiki/images/basic-screenshot.jpg" alt="Basic console proxy screenshot" width="900" />
 
-![alt tag](https://raw.githubusercontent.com/justcoding121/Titanium-Web-Proxy/develop/examples/Titanium.Web.Proxy.Examples.Basic/Capture.PNG)
+Point your client at `127.0.0.1:8000` as its HTTP and HTTPS proxy. Trusting a generated root certificate changes the current user's certificate store — only do this on a machine you control.
 
-**GUI example application screenshot**
+## Examples and documentation
 
-![alt tag](https://raw.githubusercontent.com/justcoding121/Titanium-Web-Proxy/develop/examples/Titanium.Web.Proxy.Examples.Wpf/Capture.PNG)
+- **[Website](https://titaniumproxy.com)** — product docs, [download](https://titaniumproxy.com/download), [getting started](https://titaniumproxy.com/docs/getting-started), [features](https://titaniumproxy.com/docs/features), [release notes](https://titaniumproxy.com/releases)
+- **[Wiki](https://github.com/justcoding121/titanium-web-proxy/wiki)** — deeper guides (performance, streaming bodies, HTTP/3, protocol support) and a short [Features](https://github.com/justcoding121/titanium-web-proxy/wiki/Features) pointer
+- [Basic console proxy](examples/Titanium.Web.Proxy.Examples.Basic)
+- [WPF desktop example](examples/Titanium.Web.Proxy.Examples.Wpf)
+- [Windows service example](examples/Titanium.Web.Proxy.Examples.WindowsService)
+- [API reference](https://titaniumproxy.com/api/Titanium.Web.Proxy.ProxyServer.html)
+
+## Support and contributing
+
+- Bugs and feature requests: [GitHub Issues](https://github.com/justcoding121/Titanium-Web-Proxy/issues)
+- Programming questions: [Stack Overflow](https://stackoverflow.com/questions/tagged/titanium-web-proxy) (`titanium-web-proxy` tag)
+- Pull requests welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) (includes local QA tooling for maintainers)
+
+## Code quality
+
+[![Quality Gate](https://sonarcloud.io/api/project_badges/measure?project=justcoding121_titanium-web-proxy&metric=alert_status)](https://sonarcloud.io/summary/overall?id=justcoding121_titanium-web-proxy&branch=develop)
+[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=justcoding121_titanium-web-proxy&metric=coverage)](https://sonarcloud.io/summary/overall?id=justcoding121_titanium-web-proxy&branch=develop)
+[![Lines of Code](https://sonarcloud.io/api/project_badges/measure?project=justcoding121_titanium-web-proxy&metric=ncloc)](https://sonarcloud.io/summary/overall?id=justcoding121_titanium-web-proxy&branch=develop)
+[![Bugs](https://sonarcloud.io/api/project_badges/measure?project=justcoding121_titanium-web-proxy&metric=bugs)](https://sonarcloud.io/summary/overall?id=justcoding121_titanium-web-proxy&branch=develop)
+[![Vulnerabilities](https://sonarcloud.io/api/project_badges/measure?project=justcoding121_titanium-web-proxy&metric=vulnerabilities)](https://sonarcloud.io/summary/overall?id=justcoding121_titanium-web-proxy&branch=develop)
+[![Code Smells](https://sonarcloud.io/api/project_badges/measure?project=justcoding121_titanium-web-proxy&metric=code_smells)](https://sonarcloud.io/summary/overall?id=justcoding121_titanium-web-proxy&branch=develop)
+[![Security Rating](https://sonarcloud.io/api/project_badges/measure?project=justcoding121_titanium-web-proxy&metric=security_rating)](https://sonarcloud.io/summary/overall?id=justcoding121_titanium-web-proxy&branch=develop)
+[![Reliability Rating](https://sonarcloud.io/api/project_badges/measure?project=justcoding121_titanium-web-proxy&metric=reliability_rating)](https://sonarcloud.io/summary/overall?id=justcoding121_titanium-web-proxy&branch=develop)
+[![Maintainability Rating](https://sonarcloud.io/api/project_badges/measure?project=justcoding121_titanium-web-proxy&metric=sqale_rating)](https://sonarcloud.io/summary/overall?id=justcoding121_titanium-web-proxy&branch=develop)
+[![Duplicated Lines](https://sonarcloud.io/api/project_badges/measure?project=justcoding121_titanium-web-proxy&metric=duplicated_lines_density)](https://sonarcloud.io/summary/overall?id=justcoding121_titanium-web-proxy&branch=develop)
+[![Technical Debt](https://sonarcloud.io/api/project_badges/measure?project=justcoding121_titanium-web-proxy&metric=sqale_index)](https://sonarcloud.io/summary/overall?id=justcoding121_titanium-web-proxy&branch=develop)
+
+## Maintainers
+
+Actively maintained by [justcoding121](https://github.com/justcoding121). Past collaborator: [honfika](https://github.com/honfika).
+
+## License
+
+Titanium.Web.Proxy and Titanium.Cli are [MIT](LICENSE). Titanium Inspector and Titanium.Plus are [PolyForm Noncommercial 1.0.0](licenses/PolyForm-Noncommercial-1.0.0.txt).

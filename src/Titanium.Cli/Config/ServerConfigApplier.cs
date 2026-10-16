@@ -1,0 +1,635 @@
+using System.Globalization;
+using System.Net;
+using System.Security.Authentication;
+using System.Security.Cryptography.X509Certificates;
+using Titanium.Web.Proxy;
+using Titanium.Web.Proxy.Configuration.Models;
+using Titanium.Web.Proxy.Models;
+using Titanium.Web.Proxy.Network;
+using Titanium.Web.Proxy.Options;
+
+namespace Titanium.Cli.Config;
+
+/// <summary>
+///     Maps <see cref="ServerConfig"/> onto a live <see cref="ProxyServer"/>.
+///     Apply order: profile (if set), then individual overlays. Null fields leave current values.
+/// </summary>
+internal static class ServerConfigApplier
+{
+    public static void Apply(ProxyServer proxy, ServerConfig? server)
+    {
+        if (server is null)
+        {
+            return;
+        }
+
+        if (!string.IsNullOrWhiteSpace(server.Profile) &&
+            Enum.TryParse<ProxyProfile>(server.Profile, ignoreCase: true, out var profile))
+        {
+            proxy.Profile = profile;
+        }
+
+        ApplyProtocolFlags(proxy, server);
+        ApplyTimeouts(proxy, server.Timeouts);
+        ApplyPooling(proxy, server.Pooling);
+        ApplyLimits(proxy, server.Limits);
+        ApplyPolicyModes(proxy, server.PolicyModes);
+        ApplyTls(proxy, server.Tls);
+        ApplyUpstream(proxy, server.Upstream);
+        ApplyCertificateManager(proxy, server.CertificateManager);
+        ApplyDecryptExclusions(proxy, server);
+        ApplyDecryptFailureBypass(proxy, server);
+        if (!string.IsNullOrWhiteSpace(server.ProxyAuthenticationRealm))
+            proxy.ProxyAuthenticationRealm = server.ProxyAuthenticationRealm;
+    }
+
+    private static void ApplyDecryptFailureBypass(ProxyServer proxy, ServerConfig server)
+    {
+        if (server.EnableDecryptFailureBypass is bool enabled)
+            proxy.EnableDecryptFailureBypass = enabled;
+        if (server.DecryptFailureBypassTtlMinutes is int minutes && minutes > 0)
+            proxy.DecryptFailureBypassTtl = TimeSpan.FromMinutes(minutes);
+        if (server.DecryptFailureBypassMaxEntries is int entries && entries > 0)
+            proxy.DecryptFailureBypassMaxEntries = entries;
+        if (server.DecryptFailureBypassThreshold is int threshold && threshold > 0)
+            proxy.DecryptFailureBypassThreshold = threshold;
+    }
+
+    /// <summary>
+    ///     After listeners exist: honor config, else default ignore-upstream-cert for explicit MITM.
+    ///     macOS denies CurrentUser\Root writes (Keychain UI); without this, decryptSsl cannot
+    ///     complete HTTPS to loopback/self-signed origins.
+    /// </summary>
+    public static void ApplyIgnoreServerCertificateErrorsAfterListeners(ProxyServer proxy, ServerConfig? server)
+    {
+        if (server?.IgnoreServerCertificateErrors is bool configured)
+        {
+            proxy.IgnoreServerCertificateErrors = configured;
+            return;
+        }
+
+        if (proxy.ProxyEndPoints.OfType<ExplicitProxyEndPoint>().Any(endPoint => endPoint.DecryptSsl))
+        {
+            proxy.IgnoreServerCertificateErrors = true;
+        }
+    }
+
+    /// <summary>
+    ///     Builds system-proxy settings from config. Null <see cref="ServerConfig.SystemProxyBypassHosts"/>
+    ///     merges factory identity hosts; a present list (including empty) is authoritative (Replace).
+    /// </summary>
+    public static SystemProxySettings CreateSystemProxySettings(ServerConfig? server)
+    {
+        var loopback = server?.ProxyLoopback ?? true;
+        if (server?.SystemProxyBypassHosts is null)
+        {
+            return MitmExclusionDefaults.CreateSystemProxySettings(loopback);
+        }
+
+        return MitmExclusionDefaults.CreateSystemProxySettings(
+            loopback,
+            server.SystemProxyBypassHosts,
+            MitmExclusionMode.Replace);
+    }
+
+    private static void ApplyDecryptExclusions(ProxyServer proxy, ServerConfig server)
+    {
+        if (server.DecryptSkipHosts is null && server.DecryptOnlyHosts is null)
+        {
+            return;
+        }
+
+        var skip = server.DecryptSkipHosts ?? [];
+        var only = server.DecryptOnlyHosts ?? [];
+        foreach (var endPoint in proxy.ProxyEndPoints)
+        {
+            if (endPoint is not ExplicitProxyEndPoint explicitEp)
+            {
+                continue;
+            }
+
+            // Present lists are authoritative — do not re-inject factory SSO/pinning hosts.
+            MitmExclusionDefaults.ApplyDecryptExclusions(
+                explicitEp,
+                () => explicitEp.DecryptSsl,
+                skip,
+                only,
+                MitmExclusionMode.Replace);
+        }
+    }
+
+    private static void ApplyProtocolFlags(ProxyServer proxy, ServerConfig server)
+    {
+        ApplyBool(server.EnableHttp2, v => proxy.EnableHttp2 = v);
+
+        if (server.EnableHttp3 is bool http3)
+        {
+            if (http3)
+            {
+                proxy.TryEnableHttp3IfSupported();
+            }
+            else
+            {
+                proxy.SetHttp3Enabled(false);
+            }
+        }
+
+        ApplyBool(server.EnableRfc8441, v => proxy.EnableRfc8441 = v);
+        ApplyBool(server.EnableQpackDynamicTable, v => proxy.EnableQpackDynamicTable = v);
+        ApplyBool(server.EnableHttpsSvcbDnsDiscovery, v => proxy.EnableHttpsSvcbDnsDiscovery = v);
+        ApplyBool(server.Enable100ContinueBehaviour, v => proxy.Enable100ContinueBehaviour = v);
+        ApplyBool(server.CompatibilityMode100Continue, v => proxy.CompatibilityMode100Continue = v);
+        ApplyBool(server.EnableWinAuth, v => proxy.EnableWinAuth = v);
+
+        if (!string.IsNullOrWhiteSpace(server.OriginHttpVersionPolicy) &&
+            Enum.TryParse<OriginHttpVersionPolicy>(server.OriginHttpVersionPolicy, ignoreCase: true, out var originPolicy))
+        {
+            proxy.OriginHttpVersionPolicy = originPolicy;
+        }
+
+        if (server.ViaHeaderPseudonym is not null)
+        {
+            proxy.ViaHeaderPseudonym = server.ViaHeaderPseudonym;
+        }
+
+        ApplyBool(server.BlockPrivateNetworkDestinations, v => proxy.BlockPrivateNetworkDestinations = v);
+        ApplyBool(server.BlockLoopbackDestinations, v => proxy.BlockLoopbackDestinations = v);
+
+        if (!string.IsNullOrWhiteSpace(server.CheckCertificateRevocation) &&
+            Enum.TryParse<X509RevocationMode>(server.CheckCertificateRevocation, ignoreCase: true, out var revocation))
+        {
+            proxy.CheckCertificateRevocation = revocation;
+        }
+
+        ApplyBool(server.IgnoreServerCertificateErrors, v => proxy.IgnoreServerCertificateErrors = v);
+
+        if (!string.IsNullOrWhiteSpace(server.DnsServerEndPoint) &&
+            TryParseEndPoint(server.DnsServerEndPoint, out var dns))
+        {
+            proxy.DnsServerEndPoint = dns;
+        }
+    }
+
+    private static void ApplyBool(bool? value, Action<bool> apply)
+    {
+        if (value is bool b)
+        {
+            apply(b);
+        }
+    }
+
+    private static void ApplyTimeouts(ProxyServer proxy, TimeoutsConfig? timeouts)
+    {
+        if (timeouts is null)
+        {
+            return;
+        }
+
+        if (timeouts.ConnectionTimeOutSeconds is int connection)
+        {
+            proxy.ConnectionTimeOutSeconds = connection;
+        }
+
+        if (timeouts.ConnectTimeOutSeconds is int connect)
+        {
+            proxy.ConnectTimeOutSeconds = connect;
+        }
+
+        if (timeouts.ClientHeaderTimeoutSeconds is int clientHeader)
+        {
+            proxy.ClientHeaderTimeoutSeconds = clientHeader;
+        }
+
+        if (timeouts.ResponseHeaderTimeoutSeconds is int responseHeader)
+        {
+            proxy.ResponseHeaderTimeoutSeconds = responseHeader;
+        }
+
+        if (timeouts.IdleReadTimeoutSeconds is int idleRead)
+        {
+            proxy.IdleReadTimeoutSeconds = idleRead;
+        }
+
+        if (timeouts.IdleWriteTimeoutSeconds is int idleWrite)
+        {
+            proxy.IdleWriteTimeoutSeconds = idleWrite;
+        }
+
+        if (timeouts.RequestTimeoutSeconds is int request)
+        {
+            proxy.RequestTimeoutSeconds = request;
+        }
+
+        if (timeouts.NetworkFailureRetryAttempts is int retries)
+        {
+            proxy.NetworkFailureRetryAttempts = retries;
+        }
+    }
+
+    private static void ApplyPooling(ProxyServer proxy, PoolingConfig? pooling)
+    {
+        if (pooling is null)
+        {
+            return;
+        }
+
+        if (pooling.EnableConnectionPool is bool pool)
+        {
+            proxy.EnableConnectionPool = pool;
+        }
+
+        if (pooling.EnableTcpServerConnectionPrefetch is bool prefetch)
+        {
+            proxy.EnableTcpServerConnectionPrefetch = prefetch;
+        }
+
+        if (pooling.EnableIpv6UnreachableSoftSkip is bool ipv6)
+        {
+            proxy.EnableIpv6UnreachableSoftSkip = ipv6;
+        }
+
+        if (pooling.MaxCachedConnections is int maxCached)
+        {
+            proxy.MaxCachedConnections = maxCached;
+        }
+
+        if (pooling.MaxConcurrentHttp11HttpsOriginCreates is int maxCreates)
+        {
+            proxy.MaxConcurrentHttp11HttpsOriginCreates = maxCreates;
+        }
+
+        if (pooling.MaxConcurrentClientConnections is int maxClients)
+        {
+            proxy.MaxConcurrentClientConnections = maxClients;
+        }
+
+        if (pooling.NoDelay is bool noDelay)
+        {
+            proxy.NoDelay = noDelay;
+        }
+
+        if (pooling.EnableTcpKeepAlive is bool keepAlive)
+        {
+            proxy.EnableTcpKeepAlive = keepAlive;
+        }
+
+        if (pooling.TcpTimeWaitSeconds is int timeWait)
+        {
+            proxy.TcpTimeWaitSeconds = timeWait;
+        }
+
+        if (pooling.ListenerBackLog is int backLog)
+        {
+            proxy.ListenerBackLog = backLog;
+        }
+
+        if (pooling.ReuseSocket is bool reuse)
+        {
+            proxy.ReuseSocket = reuse;
+        }
+
+        if (pooling.ThreadPoolWorkerThread is int workers)
+        {
+            proxy.ThreadPoolWorkerThread = workers;
+        }
+    }
+
+    private static void ApplyLimits(ProxyServer proxy, LimitsConfig? limits)
+    {
+        if (limits is null)
+        {
+            return;
+        }
+
+        var current = proxy.ResourceLimits;
+        var duration = limits.MaxOpenHeaderBlockDurationSeconds is int seconds
+            ? TimeSpan.FromSeconds(seconds)
+            : current.MaxOpenHeaderBlockDuration;
+
+        var built = ProxyResourceLimits.Create(
+            limits.MaxHeaderLineBytes ?? current.MaxHeaderLineBytes,
+            limits.MaxHeaderCount ?? current.MaxHeaderCount,
+            limits.MaxHeaderAggregateBytes ?? current.MaxHeaderAggregateBytes,
+            limits.MaxEncodedBodyBytes ?? current.MaxEncodedBodyBytes,
+            limits.MaxDecodedBodyBytes ?? current.MaxDecodedBodyBytes,
+            limits.MaxDecompressionRatio ?? current.MaxDecompressionRatio,
+            limits.MaxConcurrentClients ?? current.MaxConcurrentClients,
+            limits.MaxConcurrentStreamsPerConnection ?? current.MaxConcurrentStreamsPerConnection,
+            limits.MaxPeerInitiatedIncompleteStreamResets ?? current.MaxPeerInitiatedIncompleteStreamResets,
+            limits.MaxOpenHeaderBlockFrames ?? current.MaxOpenHeaderBlockFrames,
+            duration,
+            limits.ConnectionPoolingEnabled ?? current.ConnectionPoolingEnabled,
+            limits.MaxCachedConnectionsPerHost ?? current.MaxCachedConnectionsPerHost,
+            limits.MaxCertificateCacheEntries ?? current.MaxCertificateCacheEntries);
+
+        built = built.WithMaxOriginHttp2ConnectionsPerAuthority(
+            limits.MaxOriginHttp2ConnectionsPerAuthority ?? current.MaxOriginHttp2ConnectionsPerAuthority);
+        built = built.WithCertificateCacheBounds(
+            built.MaxCertificateCacheEntries,
+            limits.MaxCertificateDiskCacheEntries ?? current.MaxCertificateDiskCacheEntries);
+        built = built.WithMaxHttp3FramePayloadBytes(
+            limits.MaxHttp3FramePayloadBytes ?? current.MaxHttp3FramePayloadBytes);
+        built = built.WithMaxDeferredOutboundBytesPerStream(
+            limits.MaxDeferredOutboundBytesPerStream ?? current.MaxDeferredOutboundBytesPerStream);
+        built = built.WithTrailerHeaderBounds(
+            limits.MaxTrailerHeaderCount ?? current.MaxTrailerHeaderCount,
+            limits.MaxTrailerHeaderBlockBytes ?? current.MaxTrailerHeaderBlockBytes);
+        built = built.WithMaxHttp2CompressedHeaderBlockBytes(
+            limits.MaxHttp2CompressedHeaderBlockBytes ?? current.MaxHttp2CompressedHeaderBlockBytes);
+        built = built.WithMaxInterimResponses(limits.MaxInterimResponses ?? current.MaxInterimResponses);
+        built = built.WithAuthenticationBounds(
+            limits.MaxAuthChallengeRounds ?? current.MaxAuthChallengeRounds,
+            limits.MaxUpstreamProxyAuthenticationAttempts ?? current.MaxUpstreamProxyAuthenticationAttempts,
+            limits.MaxWinAuthTokenBytes ?? current.MaxWinAuthTokenBytes);
+        built = built.WithHttp2WindowUpdateTimeoutSeconds(
+            limits.Http2WindowUpdateTimeoutSeconds ?? current.Http2WindowUpdateTimeoutSeconds);
+
+        proxy.ResourceLimits = built;
+
+        if (limits.MaxBufferedBodyBytes is int buffered)
+        {
+            proxy.MaxBufferedBodyBytes = buffered;
+        }
+
+        if (limits.MaxDecodedHeaderListBytes is int headerList)
+        {
+            proxy.MaxDecodedHeaderListBytes = headerList;
+        }
+
+        if (limits.MaxWebSocketFramePayloadBytes is int wsFrame)
+        {
+            proxy.MaxWebSocketFramePayloadBytes = wsFrame;
+        }
+    }
+
+    private static void ApplyPolicyModes(ProxyServer proxy, PolicyModesConfig? policy)
+    {
+        if (policy is null)
+        {
+            return;
+        }
+
+        var modes = proxy.PolicyModes;
+        if (!string.IsNullOrWhiteSpace(policy.BodyBudget))
+            modes = modes.With(PolicyFamily.BodyBudget, ParsePolicyMode(policy.BodyBudget, modes[PolicyFamily.BodyBudget]));
+        if (!string.IsNullOrWhiteSpace(policy.DecompressionRatio))
+            modes = modes.With(PolicyFamily.DecompressionRatio, ParsePolicyMode(policy.DecompressionRatio, modes[PolicyFamily.DecompressionRatio]));
+        if (!string.IsNullOrWhiteSpace(policy.HeaderLimits))
+            modes = modes.With(PolicyFamily.HeaderLimits, ParsePolicyMode(policy.HeaderLimits, modes[PolicyFamily.HeaderLimits]));
+        if (!string.IsNullOrWhiteSpace(policy.AdmissionControl))
+            modes = modes.With(PolicyFamily.AdmissionControl, ParsePolicyMode(policy.AdmissionControl, modes[PolicyFamily.AdmissionControl]));
+        if (!string.IsNullOrWhiteSpace(policy.Http2AbuseBudget))
+            modes = modes.With(PolicyFamily.Http2AbuseBudget, ParsePolicyMode(policy.Http2AbuseBudget, modes[PolicyFamily.Http2AbuseBudget]));
+        if (!string.IsNullOrWhiteSpace(policy.Http2RelayValidation))
+            modes = modes.With(PolicyFamily.Http2RelayValidation, ParsePolicyMode(policy.Http2RelayValidation, modes[PolicyFamily.Http2RelayValidation]));
+        if (!string.IsNullOrWhiteSpace(policy.WebSocketFrameBudget))
+            modes = modes.With(PolicyFamily.WebSocketFrameBudget, ParsePolicyMode(policy.WebSocketFrameBudget, modes[PolicyFamily.WebSocketFrameBudget]));
+        if (!string.IsNullOrWhiteSpace(policy.Http1ReplaySafety))
+            modes = modes.With(PolicyFamily.Http1ReplaySafety, ParsePolicyMode(policy.Http1ReplaySafety, modes[PolicyFamily.Http1ReplaySafety]));
+        if (policy.AllowAmbiguousFraming is bool framing)
+            modes = modes.WithAllowAmbiguousFraming(framing);
+
+        proxy.PolicyModes = modes;
+    }
+
+    private static PolicyMode ParsePolicyMode(string? value, PolicyMode fallback) =>
+        !string.IsNullOrWhiteSpace(value) && Enum.TryParse<PolicyMode>(value, ignoreCase: true, out var mode)
+            ? mode
+            : fallback;
+
+    private static void ApplyTls(ProxyServer proxy, TlsConfig? tls)
+    {
+        if (tls is null)
+        {
+            return;
+        }
+
+        if (tls.SupportedSslProtocols is { Count: > 0 } clientProtocols &&
+            TryParseSslProtocols(clientProtocols, out var client))
+        {
+            proxy.SupportedSslProtocols = client;
+        }
+
+        if (tls.SupportedServerSslProtocols is { Count: > 0 } serverProtocols &&
+            TryParseSslProtocols(serverProtocols, out var server))
+        {
+            proxy.SupportedServerSslProtocols = server;
+        }
+    }
+
+    private static void ApplyUpstream(ProxyServer proxy, UpstreamConfig? upstream)
+    {
+        if (upstream is null)
+        {
+            return;
+        }
+
+        if (upstream.ForwardToUpstreamGateway is bool forward)
+        {
+            proxy.ForwardToUpstreamGateway = forward;
+        }
+
+        if (!string.IsNullOrWhiteSpace(upstream.UpstreamProxyConfigurationScript) &&
+            Uri.TryCreate(upstream.UpstreamProxyConfigurationScript, UriKind.Absolute, out var pac))
+        {
+            proxy.UpstreamProxyConfigurationScript = pac;
+        }
+
+        if (upstream.HttpProxy is not null)
+        {
+            proxy.UpStreamHttpProxy = ToExternalProxy(upstream.HttpProxy);
+        }
+
+        if (upstream.HttpsProxy is not null)
+        {
+            proxy.UpStreamHttpsProxy = ToExternalProxy(upstream.HttpsProxy);
+        }
+
+        if (!string.IsNullOrWhiteSpace(upstream.UpStreamEndPoint) &&
+            TryParseEndPoint(upstream.UpStreamEndPoint, out var ep))
+        {
+            proxy.UpStreamEndPoint = ep;
+        }
+
+        if (!string.IsNullOrWhiteSpace(upstream.UpStreamEndPointIPv4) &&
+            TryParseEndPoint(upstream.UpStreamEndPointIPv4, out var ep4))
+        {
+            proxy.UpStreamEndPointIPv4 = ep4;
+        }
+
+        if (!string.IsNullOrWhiteSpace(upstream.UpStreamEndPointIPv6) &&
+            TryParseEndPoint(upstream.UpStreamEndPointIPv6, out var ep6))
+        {
+            proxy.UpStreamEndPointIPv6 = ep6;
+        }
+    }
+
+    private static ExternalProxy? ToExternalProxy(ExternalProxyConfig config)
+    {
+        if (string.IsNullOrWhiteSpace(config.HostName) || config.Port is < 1 or > 65535)
+        {
+            return null;
+        }
+
+        var proxy = new ExternalProxy(config.HostName, config.Port)
+        {
+            UserName = config.UserName,
+            Password = config.Password,
+            UseDefaultCredentials = config.UseDefaultCredentials,
+            BypassLocalhost = config.BypassLocalhost,
+            ProxyDnsRequests = config.ProxyDnsRequests,
+        };
+
+        if (Enum.TryParse<ExternalProxyType>(config.ProxyType, ignoreCase: true, out var type))
+        {
+            proxy.ProxyType = type;
+        }
+
+        if (config.NextHop is not null)
+        {
+            proxy.NextHop = ToExternalProxy(config.NextHop);
+        }
+
+        return proxy;
+    }
+
+    private static void ApplyCertificateManager(ProxyServer proxy, CertificateManagerConfig? certs)
+    {
+        if (certs is null)
+        {
+            return;
+        }
+
+        var cm = proxy.CertificateManager;
+
+        if (!string.IsNullOrWhiteSpace(certs.CertificateEngine) &&
+            Enum.TryParse<CertificateEngine>(certs.CertificateEngine, ignoreCase: true, out var engine))
+        {
+            cm.CertificateEngine = engine;
+        }
+
+        if (!string.IsNullOrWhiteSpace(certs.LeafCertificateKeyAlgorithm) &&
+            Enum.TryParse<CertificateKeyAlgorithm>(certs.LeafCertificateKeyAlgorithm, ignoreCase: true, out var algo))
+        {
+            cm.LeafCertificateKeyAlgorithm = algo;
+        }
+
+        if (certs.PfxFilePath is not null)
+        {
+            cm.PfxFilePath = certs.PfxFilePath;
+        }
+
+        if (certs.PfxPassword is not null)
+        {
+            cm.PfxPassword = certs.PfxPassword;
+        }
+
+        if (certs.OverwritePfxFile is bool overwrite)
+        {
+            cm.OverwritePfxFile = overwrite;
+        }
+
+        if (certs.CertificateValidDays is int validDays)
+        {
+            cm.CertificateValidDays = validDays;
+        }
+
+        if (certs.CertificateGraceDays is int graceDays)
+        {
+            cm.CertificateGraceDays = graceDays;
+        }
+
+        if (certs.CertificateCacheTimeOutMinutes is int cacheMinutes)
+        {
+            cm.CertificateCacheTimeOutMinutes = cacheMinutes;
+        }
+
+        if (!string.IsNullOrWhiteSpace(certs.RootCertificateName))
+        {
+            cm.RootCertificateName = certs.RootCertificateName;
+        }
+
+        if (!string.IsNullOrWhiteSpace(certs.RootCertificateIssuerName))
+        {
+            cm.RootCertificateIssuerName = certs.RootCertificateIssuerName;
+        }
+
+        if (certs.SaveFakeCertificates is bool saveFakes)
+        {
+            cm.SaveFakeCertificates = saveFakes;
+        }
+
+        if (certs.DisableWildCardCertificates is bool disableWildcard)
+        {
+            cm.DisableWildCardCertificates = disableWildcard;
+        }
+    }
+
+    internal static bool TryParseSslProtocols(IEnumerable<string> names, out SslProtocols protocols)
+    {
+        protocols = SslProtocols.None;
+        var any = false;
+        foreach (var name in names)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                continue;
+            }
+
+            if (!Enum.TryParse<SslProtocols>(name.Trim(), ignoreCase: true, out var part))
+            {
+                protocols = SslProtocols.None;
+                return false;
+            }
+
+            protocols |= part;
+            any = true;
+        }
+
+        return any;
+    }
+
+    internal static bool TryParseEndPoint(string value, out IPEndPoint endPoint)
+    {
+        endPoint = null!;
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        // Prefer URI-style for IPv6: [2001:db8::1]:443
+        if (value.StartsWith('[') && value.Contains(']', StringComparison.Ordinal))
+        {
+            var close = value.IndexOf(']');
+            var hostPart = value[1..close];
+            var portPart = value[(close + 1)..].TrimStart(':');
+            if (IPAddress.TryParse(hostPart, out var ip6) &&
+                int.TryParse(portPart, NumberStyles.Integer, CultureInfo.InvariantCulture, out var port6) &&
+                port6 is >= 0 and <= 65535)
+            {
+                endPoint = new IPEndPoint(ip6, port6);
+                return true;
+            }
+
+            return false;
+        }
+
+        var lastColon = value.LastIndexOf(':');
+        if (lastColon <= 0 || lastColon == value.Length - 1)
+        {
+            return false;
+        }
+
+        var host = value[..lastColon];
+        var portText = value[(lastColon + 1)..];
+        if (!IPAddress.TryParse(host, out var ip) ||
+            !int.TryParse(portText, NumberStyles.Integer, CultureInfo.InvariantCulture, out var port) ||
+            port is < 0 or > 65535)
+        {
+            return false;
+        }
+
+        endPoint = new IPEndPoint(ip, port);
+        return true;
+    }
+}

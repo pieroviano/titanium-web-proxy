@@ -1,16 +1,18 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Net;
-using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
 using System.Text;
 using Titanium.Web.Proxy.Models;
 
 namespace Titanium.Web.Proxy.Helpers.WinHttp;
 
+[SupportedOSPlatform("windows")]
 internal sealed class WinHttpWebProxyFinder : IDisposable
 {
-    private readonly WinHttpHandle session;
+    private readonly WinHttpHandle? session;
     private bool autoDetectFailed;
 
     private bool disposed;
@@ -21,7 +23,7 @@ internal sealed class WinHttpWebProxyFinder : IDisposable
         session = NativeMethods.WinHttp.WinHttpOpen(null, NativeMethods.WinHttp.AccessType.NoProxy, null, null, 0);
         if (session == null || session.IsInvalid)
         {
-            var lastWin32Error = GetLastWin32Error();
+            _ = GetLastWin32Error();
         }
         else
         {
@@ -30,7 +32,7 @@ internal sealed class WinHttpWebProxyFinder : IDisposable
                     downloadTimeout))
                 return;
 
-            var lastWin32Error = GetLastWin32Error();
+            _ = GetLastWin32Error();
         }
     }
 
@@ -52,11 +54,11 @@ internal sealed class WinHttpWebProxyFinder : IDisposable
     {
         if (disposed) return;
 
+        disposed = true;
+
         if (session == null || session.IsInvalid) return;
 
         session.Close();
-
-        disposed = true;
     }
 
     public bool GetAutoProxies(Uri destination, out IList<string>? proxyList)
@@ -86,7 +88,7 @@ internal sealed class WinHttpWebProxyFinder : IDisposable
 
         if (!string.IsNullOrEmpty(proxyListString))
         {
-            proxyListString = RemoveWhitespaces(proxyListString!);
+            proxyListString = RemoveWhitespaces(proxyListString);
             proxyList = proxyListString.Split(';');
         }
 
@@ -95,23 +97,23 @@ internal sealed class WinHttpWebProxyFinder : IDisposable
 
     public IExternalProxy? GetProxy(Uri destination)
     {
+        // PAC/static-bypass precedence (matches WinHTTP's own division of responsibility, not a
+        // Titanium-specific choice): when auto-detect or an auto-config script resolves a proxy for
+        // this URL, that result is authoritative and the static bypass list is not re-applied to it -
+        // a PAC script is expected to return DIRECT itself for whatever it wants bypassed, and
+        // WinHttpGetProxyForUrl performs no bypass filtering of its own. The static bypass list
+        // (Proxy.IsBypassed / <-loopback>/<local>) governs only the static ProxyServer fallback below.
         if (GetAutoProxies(destination, out var proxies))
         {
             if (proxies == null) return null;
 
-            var proxyStr = proxies[0];
-            var port = 80;
-            if (proxyStr.Contains(":"))
-            {
-                var parts = proxyStr.Split(new[] { ':' }, 2);
-                proxyStr = parts[0];
-                port = int.Parse(parts[1]);
-            }
+            if (!TryPickFirstUsableProxy(proxies, out var host, out var port)) return null;
 
-            // TODO: Apply authorization
-            var systemProxy = new ExternalProxy(proxyStr, port);
-
-            return systemProxy;
+            // Authenticate to the system proxy with the current user's default credentials via
+            // integrated auth (NTLM/Negotiate). This only takes effect if the proxy issues a 407
+            // challenge, and mirrors how Windows authenticates to auto-detected proxies. Explicit
+            // Basic credentials cannot be recovered from WinHTTP auto-config, so they are not set.
+            return new ExternalProxy(host, port) { UseDefaultCredentials = true };
         }
 
         if (Proxy?.IsBypassed(destination) == true) return null;
@@ -122,12 +124,33 @@ internal sealed class WinHttpWebProxyFinder : IDisposable
             HttpSystemProxyValue? value = null;
             if (ProxyInfo?.Proxies?.TryGetValue(protocolType.Value, out value) == true)
             {
-                var systemProxy = new ExternalProxy(value!.HostName, value.Port);
+                var systemProxy = new ExternalProxy(value.HostName, value.Port);
                 return systemProxy;
             }
         }
 
         return null;
+    }
+
+    /// <summary>
+    ///     Picks the first usable "host:port" entry from an ordered PAC/auto-detect proxy candidate
+    ///     list. <c>WinHttpGetProxyForUrl</c> returns an ordered, semicolon-separated list of proxy
+    ///     servers (WinHTTP itself strips the "PROXY"/"SOCKS" access-type keyword before returning it),
+    ///     and a caller is expected to try them in order. This proxy has no failover-on-connect-failure
+    ///     path today, so the practical fix is to walk the list for the first entry that actually
+    ///     parses as a valid authority rather than blindly trusting index 0 - a PAC script can return
+    ///     garbage for one entry and a usable proxy for the next, and a hard <c>int.Parse</c> on index 0
+    ///     would crash proxy resolution for every request instead of falling back to a later entry.
+    /// </summary>
+    internal static bool TryPickFirstUsableProxy(IList<string> candidates, out string host, out int port)
+    {
+        foreach (var candidate in candidates)
+            if (AuthorityParser.TryParse(candidate, 80, out host, out port))
+                return true;
+
+        host = string.Empty;
+        port = 0;
+        return false;
     }
 
     public void LoadFromIe()
@@ -138,7 +161,7 @@ internal sealed class WinHttpWebProxyFinder : IDisposable
         AutomaticConfigurationScript = pi.AutoConfigUrl == null ? null : new Uri(pi.AutoConfigUrl);
         BypassLoopback = pi.BypassLoopback;
         BypassOnLocal = pi.BypassOnLocal;
-        Proxy = new WebProxy(new Uri("http://localhost"), BypassOnLocal, pi.BypassList);
+        Proxy = new WebProxy(new Uri("http://localhost"), BypassOnLocal, pi.BypassList); // NOSONAR S1075 -- WinHTTP fallback proxy fixture requires an absolute URI.
     }
 
     internal void UsePacFile(Uri upstreamProxyConfigurationScript)
@@ -147,13 +170,12 @@ internal sealed class WinHttpWebProxyFinder : IDisposable
         AutomaticConfigurationScript = upstreamProxyConfigurationScript;
         BypassLoopback = true;
         BypassOnLocal = false;
-        Proxy = new WebProxy(new Uri("http://localhost"), BypassOnLocal);
+        Proxy = new WebProxy(new Uri("http://localhost"), BypassOnLocal); // NOSONAR S1075 -- WinHTTP PAC fallback requires an absolute URI.
     }
 
-    private ProxyInfo GetProxyInfo()
+    private static ProxyInfo GetProxyInfo()
     {
         var proxyConfig = new NativeMethods.WinHttp.WinhttpCurrentUserIeProxyConfig();
-        RuntimeHelpers.PrepareConstrainedRegions();
         try
         {
             ProxyInfo result;
@@ -168,7 +190,8 @@ internal sealed class WinHttpWebProxyFinder : IDisposable
             }
             else
             {
-                if (Marshal.GetLastWin32Error() == 8) throw new OutOfMemoryException();
+                if (Marshal.GetLastWin32Error() == 8)
+                    throw new InvalidOperationException("WinHTTP could not allocate the proxy configuration.");
 
                 result = new ProxyInfo(true, null, null, null, null);
             }
@@ -227,12 +250,14 @@ internal sealed class WinHttpWebProxyFinder : IDisposable
         ref NativeMethods.WinHttp.WinhttpAutoproxyOptions autoProxyOptions, out string? proxyListString)
     {
         proxyListString = null;
+        var currentSession = session;
+        if (currentSession == null || currentSession.IsInvalid) return false;
+
         bool flag;
         var proxyInfo = new NativeMethods.WinHttp.WinhttpProxyInfo();
-        RuntimeHelpers.PrepareConstrainedRegions();
         try
         {
-            flag = NativeMethods.WinHttp.WinHttpGetProxyForUrl(session, destination, ref autoProxyOptions,
+            flag = NativeMethods.WinHttp.WinHttpGetProxyForUrl(currentSession, destination, ref autoProxyOptions,
                 out proxyInfo);
             if (flag) proxyListString = Marshal.PtrToStringUni(proxyInfo.Proxy);
         }
@@ -248,7 +273,8 @@ internal sealed class WinHttpWebProxyFinder : IDisposable
     private static int GetLastWin32Error()
     {
         var lastWin32Error = Marshal.GetLastWin32Error();
-        if (lastWin32Error == 8) throw new OutOfMemoryException();
+        if (lastWin32Error == 8)
+            throw new InvalidOperationException("WinHTTP could not allocate proxy discovery data.");
 
         return lastWin32Error;
     }
@@ -294,12 +320,7 @@ internal sealed class WinHttpWebProxyFinder : IDisposable
 
     private static string RemoveWhitespaces(string value)
     {
-        var stringBuilder = new StringBuilder();
-        foreach (var c in value)
-            if (!char.IsWhiteSpace(c))
-                stringBuilder.Append(c);
-
-        return stringBuilder.ToString();
+        return string.Concat(value.Where(c => !char.IsWhiteSpace(c)));
     }
 
     private static bool IsErrorFatalForAutoDetect(NativeMethods.WinHttp.ErrorCodes errorCode)

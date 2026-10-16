@@ -1,13 +1,18 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using Titanium.Web.Proxy.Diagnostics;
 using Titanium.Web.Proxy.Helpers;
+using Titanium.Web.Proxy.Logging;
 using Titanium.Web.Proxy.Network.Certificate;
 using Titanium.Web.Proxy.Shared;
 
@@ -19,19 +24,55 @@ namespace Titanium.Web.Proxy.Network;
 public enum CertificateEngine
 {
     /// <summary>
-    ///     Uses BouncyCastle 3rd party library.
-    ///     Default.
+    ///     Uses BouncyCastle 3rd party library. Default. Issues a distinct key pair per leaf
+    ///     (RSA-2048 or ECDSA P-256 per <see cref="CertificateKeyAlgorithm" /> /
+    ///     <see cref="CertificateManager.LeafCertificateKeyAlgorithm" />). RSA-2048 keys are normally
+    ///     taken from a process-wide background buffer (see
+    ///     <see cref="CertificateManager.LeafRsaKeyPairBufferSize" />).
     /// </summary>
     BouncyCastle = 0,
 
+    /// <summary>
+    ///     Faster BouncyCastle variant.
+    ///     Note: for performance it reuses a single pre-generated key pair (RSA or ECDSA, matching
+    ///     <see cref="CertificateManager.LeafCertificateKeyAlgorithm" />) across ALL generated leaf
+    ///     certificates. This means every intercepted host's certificate shares the same public key.
+    ///     Prefer <see cref="BouncyCastle" /> if per-host key isolation matters for your threat model.
+    /// </summary>
     BouncyCastleFast = 2,
 
     /// <summary>
-    ///     Uses Windows Certification Generation API and only valid in Windows OS.
+    ///     Uses Windows Certification Generation API and is only valid on Windows.
     ///     Observed to be faster than BouncyCastle.
-    ///     Bug #468 Reported.
+    ///     Note: this engine also reuses a shared private key across generated leaf certificates
+    ///     (Windows-only; non-Windows runtimes coerce the engine to <see cref="BouncyCastle" />).
     /// </summary>
     DefaultWindows = 1
+}
+
+/// <summary>
+///     Key algorithm used for the leaf ("fake") certificates the proxy generates per intercepted host.
+/// </summary>
+public enum CertificateKeyAlgorithm
+{
+    /// <summary>
+    ///     RSA 2048. The default, and what every TLS client in existence accepts - including legacy
+    ///     stacks with no elliptic-curve support, which is often exactly what a debugging proxy is
+    ///     pointed at. Key generation is expensive, but
+    ///     <see cref="CertificateManager.LeafRsaKeyPairBufferSize" /> (default 8) pre-generates RSA-2048
+    ///     pairs so many first visits avoid paying that cost on the CONNECT path. Certificate caching
+    ///     can also avoid regeneration entirely.
+    /// </summary>
+    Rsa2048 = 0,
+
+    /// <summary>
+    ///     ECDSA over NIST P-256. Roughly fifty times cheaper to generate than
+    ///     <see cref="Rsa2048" /> while still giving every host its own key, which effectively removes
+    ///     certificate generation from first-visit latency. Requires clients that accept ECDSA server
+    ///     certificates - universal among current browsers and TLS libraries, but not in very old ones.
+    ///     The root certificate is unaffected and stays RSA, so it continues to sign these leaves.
+    /// </summary>
+    EcdsaP256 = 1
 }
 
 /// <summary>
@@ -39,6 +80,7 @@ public enum CertificateEngine
 /// </summary>
 public sealed class CertificateManager : IDisposable
 {
+    private const string RunAsAdministrator = "runas";
     private const string DefaultRootCertificateIssuer = "Titanium";
 
     private const string DefaultRootRootCertificateName = "Titanium Root Certificate Authority";
@@ -46,9 +88,55 @@ public sealed class CertificateManager : IDisposable
     private static readonly ConcurrentDictionary<string, object> _saveCertificateLocks = new();
 
     /// <summary>
+    ///     When <see langword="true"/>, skip <see cref="StoreName.Root"/> Add/Remove that trigger Windows
+    ///     CryptUI "Root Certificate Store" Yes/No dialogs (which hang headless CI and unattended
+    ///     <c>dotnet test</c>). Personal (<see cref="StoreName.My"/>) mutations still run.
+    ///     Also treated as true when <c>CI</c>, <c>GITHUB_ACTIONS</c>, <c>TF_BUILD</c>, or
+    ///     <c>TITANIUM_SKIP_ROOT_STORE_UI=1</c> is set. Opt back in for intentional interactive Install CA
+    ///     (e.g. local E2E-Slow Chrome) by setting this to <see langword="false"/> in a process that
+    ///     does not set those env vars.
+    /// </summary>
+    public static bool SuppressInteractiveRootStoreMutations { get; set; }
+
+    /// <summary>
+    ///     True when Root-store Add/Remove should be skipped to avoid modal CryptUI prompts
+    ///     (static flag, CI env, or <c>TITANIUM_SKIP_ROOT_STORE_UI=1</c>).
+    /// </summary>
+    public static bool AreInteractiveRootStoreMutationsSuppressed =>
+        ShouldSuppressInteractiveRootStoreMutations;
+
+    /// <summary>
+    ///     True when Root-store Add/Remove should be skipped to avoid modal CryptUI prompts.
+    /// </summary>
+    internal static bool ShouldSuppressInteractiveRootStoreMutations =>
+        SuppressInteractiveRootStoreMutations
+        || IsTruthyEnv("CI")
+        || IsTruthyEnv("GITHUB_ACTIONS")
+        || IsTruthyEnv("TF_BUILD")
+        || string.Equals(Environment.GetEnvironmentVariable("TITANIUM_SKIP_ROOT_STORE_UI"), "1",
+            StringComparison.Ordinal);
+
+    /// <summary>
     ///     Cache dictionary
     /// </summary>
     private readonly ConcurrentDictionary<string, CachedCertificate> cachedCertificates = new();
+
+    /// <summary>
+    ///     Reused <see cref="System.Net.Security.SslStreamCertificateContext"/> per leaf thumbprint.
+    ///     Building a context every handshake re-walks the chain (expensive on Linux/OpenSSL under load).
+    /// </summary>
+    private readonly ConcurrentDictionary<string, System.Net.Security.SslStreamCertificateContext>
+        sslCertificateContexts = new();
+
+    /// <summary>
+    ///     Certificates removed from <see cref="cachedCertificates" /> by <see cref="EnforceCertificateCacheBound" />
+    ///     or the idle sweep in <see cref="ClearIdleCertificates" />, awaiting disposal. Not disposed at
+    ///     eviction time because the certificate object may still be held by an in-flight TLS
+    ///     handshake; <see cref="DisposePendingEvictions" /> reclaims the native CAPI/OpenSSL key
+    ///     handle once at least one full sweep interval has passed, which is comfortably longer than
+    ///     any handshake, instead of waiting on GC finalization indefinitely.
+    /// </summary>
+    private readonly ConcurrentQueue<PendingCertificateDisposal> pendingDisposals = new();
 
     private readonly CancellationTokenSource clearCertificatesTokenSource = new();
 
@@ -57,6 +145,14 @@ public sealed class CertificateManager : IDisposable
     ///     when burst certificate generation requests happen for same certificate.
     /// </summary>
     private readonly SemaphoreSlim pendingCertificateCreationTaskLock = new(1);
+
+    /// <summary>
+    ///     Caps concurrent leaf crypto (MakeCertificate). Without this, a CONNECT stampede
+    ///     queues dozens of <see cref="Task.Run"/> RSA generations that starve unrelated hosts
+    ///     (and even disk-cache loads that used to share that same queue).
+    /// </summary>
+    private readonly SemaphoreSlim certificateCreationThrottle =
+        new(Math.Clamp(Environment.ProcessorCount, 2, 8));
 
     /// <summary>
     ///     A list of pending certificate creation tasks.
@@ -73,6 +169,8 @@ public sealed class CertificateManager : IDisposable
 
     private CertificateEngine engine;
 
+    private CertificateKeyAlgorithm leafKeyAlgorithm = CertificateKeyAlgorithm.Rsa2048;
+
     private string? issuer;
 
     private X509Certificate2? rootCertificate;
@@ -80,25 +178,40 @@ public sealed class CertificateManager : IDisposable
     private string? rootCertificateName;
 
     /// <summary>
+    ///     Absolute path to certutil.exe under <see cref="Environment.SystemDirectory" /> (S4036).
+    /// </summary>
+    private static string CertUtilExecutablePath =>
+        Path.Combine(Environment.SystemDirectory, "certutil.exe");
+
+    /// <summary>
     ///     Initializes a new instance of the <see cref="CertificateManager" /> class.
     /// </summary>
     /// <param name="rootCertificateName"></param>
     /// <param name="rootCertificateIssuerName"></param>
     /// <param name="userTrustRootCertificate">
-    ///     Should fake HTTPS certificate be trusted by this machine's user certificate
-    ///     store?
+    ///     Should the proxy root CA be trusted in the current-user Root store?
     /// </param>
-    /// <param name="machineTrustRootCertificate">Should fake HTTPS certificate be trusted by this machine's certificate store?</param>
+    /// <param name="machineTrustRootCertificate">Should the proxy root CA be trusted in the local-machine Root store?</param>
     /// <param name="trustRootCertificateAsAdmin">
     ///     Should we attempt to trust certificates with elevated permissions by
     ///     prompting for UAC if required?
     /// </param>
-    /// <param name="exceptionFunc"></param>
-    internal CertificateManager(string? rootCertificateName, string? rootCertificateIssuerName,
+    /// <param name="logger">The initial logger to report certificate operations through.</param>
+    /// <param name="maxCacheEntriesProvider">
+    ///     Read live (not snapshotted) on every cache insertion, so that assigning a new
+    ///     <see cref="ProxyServer.ResourceLimits" /> after construction is honored without recreating
+    ///     this <see cref="CertificateManager" />. Bounds the in-memory cache only. <see langword="null" />
+    ///     return value means unbounded.
+    /// </param>
+    /// <param name="maxDiskCacheEntriesProvider">
+    ///     Read live on every disk save, independently of <paramref name="maxCacheEntriesProvider" />.
+    ///     <see langword="null" /> return value means unbounded.
+    /// </param>
+    internal CertificateManager(string? rootCertificateName, string? rootCertificateIssuerName, // NOSONAR S107 -- Constructor preserves established configuration wiring.
         bool userTrustRootCertificate, bool machineTrustRootCertificate, bool trustRootCertificateAsAdmin,
-        ExceptionHandler? exceptionFunc)
+        ILogger logger, Func<int?>? maxCacheEntriesProvider = null, Func<int?>? maxDiskCacheEntriesProvider = null)
     {
-        ExceptionFunc = exceptionFunc;
+        Logger = logger;
 
         UserTrustRoot = userTrustRootCertificate || machineTrustRootCertificate;
 
@@ -110,6 +223,104 @@ public sealed class CertificateManager : IDisposable
         if (rootCertificateIssuerName != null) RootCertificateIssuerName = rootCertificateIssuerName;
 
         CertificateEngine = CertificateEngine.BouncyCastle;
+
+        this.maxCacheEntriesProvider = maxCacheEntriesProvider ?? NoMaxCacheEntries;
+        this.maxDiskCacheEntriesProvider = maxDiskCacheEntriesProvider ?? NoMaxCacheEntries;
+
+        ProxyMetrics.RegisterCertificateManager(this);
+    }
+
+    /// <summary>
+    ///     Current number of entries in the in-memory certificate cache, for the
+    ///     <c>twp.certificates.cached</c> observable gauge in <see cref="ProxyMetrics" />.
+    /// </summary>
+    internal int CachedCertificateCount => cachedCertificates.Count;
+
+    private static int? NoMaxCacheEntries() => null;
+
+    private readonly Func<int?> maxCacheEntriesProvider;
+
+    /// <summary>
+    ///     Read live on every disk save, independently of <see cref="maxCacheEntriesProvider" /> (the
+    ///     in-memory bound): disk is far cheaper than a live <see cref="X509Certificate2" /> handle, so
+    ///     the two are deliberately separate knobs rather than the memory bound also silently pruning
+    ///     <c>.pfx</c> files on disk. <see langword="null" /> return value means unbounded.
+    /// </summary>
+    private readonly Func<int?> maxDiskCacheEntriesProvider;
+
+    private readonly record struct PendingCertificateDisposal(X509Certificate2 Certificate, DateTime EvictedAtUtc);
+
+    /// <summary>
+    ///     Evicts the least-recently-used cached certificates until the count is at or below
+    ///     <see cref="ProxyResourceLimits.MaxCertificateCacheEntries" /> (via the provider passed to the
+    ///     constructor). Each entry holds a full <see cref="X509Certificate2" /> with a private key in
+    ///     memory, so - unlike <see cref="ClearIdleCertificates" />'s time-based sweep, which only bounds
+    ///     how long an entry can live - nothing previously bounded how large the cache could grow
+    ///     <em>within</em> that window; a client (or attacker) requesting many distinct hostnames in a
+    ///     burst could otherwise accumulate unbounded generated-certificate memory before the next sweep.
+    /// </summary>
+    private void EnforceCertificateCacheBound()
+    {
+        var max = maxCacheEntriesProvider();
+        if (max is not > 0) return;
+
+        var excess = cachedCertificates.Count - max.Value;
+        if (excess <= 0) return;
+
+        foreach (var pair in cachedCertificates.OrderBy(x => x.Value.LastAccess).Take(excess))
+            EvictCertificate(pair.Key);
+    }
+
+    /// <summary>
+    ///     Removes <paramref name="certificateName" /> from the in-memory cache without disposing it
+    ///     immediately, queuing it for <see cref="DisposePendingEvictions" /> instead. See
+    ///     <see cref="pendingDisposals" /> for why disposal is deferred.
+    /// </summary>
+    private void EvictCertificate(string certificateName)
+    {
+        if (!cachedCertificates.TryRemove(certificateName, out var removed))
+            return;
+
+        // Drop any SslStreamCertificateContext keyed by this leaf before the deferred dispose.
+        // With SaveFakeCertificates, the next visit reloads the same PKCS#12 (same thumbprint)
+        // leaving the context cached would hand SslStream a disposed SafeCertContext
+        // ("m_safeCertContext is an invalid handle") and permanently break MITM for that host.
+        InvalidateSslCertificateContext(removed.Certificate);
+        pendingDisposals.Enqueue(new PendingCertificateDisposal(removed.Certificate, DateTime.UtcNow));
+    }
+
+    /// <summary>
+    ///     Removes a cached <see cref="System.Net.Security.SslStreamCertificateContext" /> for
+    ///     <paramref name="leaf" /> so a later handshake cannot reuse a context whose underlying
+    ///     <see cref="X509Certificate2" /> has been (or is about to be) disposed.
+    /// </summary>
+    private void InvalidateSslCertificateContext(X509Certificate2 leaf)
+    {
+        var thumbprint = leaf.Thumbprint;
+        if (thumbprint != null)
+            sslCertificateContexts.TryRemove(thumbprint, out _);
+    }
+
+    /// <summary>
+    ///     Disposes certificates queued by <see cref="EvictCertificate" /> once at least one full sweep
+    ///     interval (<see cref="ClearIdleCertificates" />'s one-minute cadence) has elapsed since
+    ///     eviction, so native CAPI/OpenSSL key handles are released promptly instead of waiting on GC
+    ///     finalization, while still giving any in-flight TLS handshake that grabbed a reference just
+    ///     before eviction comfortably long enough to finish using it.
+    /// </summary>
+    private void DisposePendingEvictions()
+    {
+        var cutoff = DateTime.UtcNow.AddMinutes(-1);
+        while (pendingDisposals.TryPeek(out var pending) && pending.EvictedAtUtc <= cutoff)
+        {
+            if (!pendingDisposals.TryDequeue(out pending))
+                continue;
+
+            // Belt-and-suspenders: eviction already invalidated, but expired-cache and other
+            // paths may enqueue without going through EvictCertificate.
+            InvalidateSslCertificateContext(pending.Certificate);
+            try { pending.Certificate.Dispose(); } catch { /* best effort */ }
+        }
     }
 
     private ICertificateMaker CertEngine
@@ -120,17 +331,21 @@ public sealed class CertificateManager : IDisposable
                 switch (engine)
                 {
                     case CertificateEngine.BouncyCastle:
-                        certEngineValue = new BcCertificateMaker(ExceptionFunc, CertificateValidDays);
+                        certEngineValue = new BcCertificateMaker(CertificateValidDays, CertificateGraceDays,
+                            leafKeyAlgorithm);
                         break;
                     case CertificateEngine.BouncyCastleFast:
-                        certEngineValue = new BcCertificateMakerFast(ExceptionFunc, CertificateValidDays);
+                        certEngineValue = new BcCertificateMakerFast(CertificateValidDays, CertificateGraceDays,
+                            leafKeyAlgorithm);
                         break;
-                    case CertificateEngine.DefaultWindows:
                     default:
-                        certEngineValue = new WinCertificateMaker(ExceptionFunc, CertificateValidDays);
+                        if (!RunTime.IsWindows)
+                            throw new PlatformNotSupportedException("The Windows certificate engine requires Windows.");
+                        certEngineValue = new WinCertificateMaker(CertificateValidDays, CertificateGraceDays);
                         break;
                 }
 
+            // Every switch arm assigns certEngineValue or throws.
             return certEngineValue;
         }
     }
@@ -158,29 +373,83 @@ public sealed class CertificateManager : IDisposable
     internal bool TrustRootAsAdministrator { get; set; }
 
     /// <summary>
-    ///     Exception handler
+    ///     The logger used to report certificate operation failures. Kept as a live-swappable reference
+    ///     (rather than snapshotted once) so that changing <see cref="ProxyServer.Logging" /> is
+    ///     reflected here without recreating this <see cref="CertificateManager" />; resets the cached
+    ///     certificate engine so a lazily-created maker also picks up the new logger.
     /// </summary>
-    internal ExceptionHandler? ExceptionFunc { get; set; }
+    internal ILogger Logger
+    {
+        get => logger;
+        set
+        {
+            logger = value;
+            certEngineValue = null;
+        }
+    }
+
+    private ILogger logger = NullLogger.Instance;
 
     /// <summary>
-    ///     Select Certificate Engine.
-    ///     Optionally set to BouncyCastle.
-    ///     Mono only support BouncyCastle and it is the default.
+    ///     Selects the certificate generation engine. Default is <see cref="CertificateEngine.BouncyCastle" />
+    ///     on all platforms. On non-Windows runtimes, <see cref="CertificateEngine.DefaultWindows" /> is
+    ///     coerced to <see cref="CertificateEngine.BouncyCastle" />; both BouncyCastle engines are supported.
     /// </summary>
     public CertificateEngine CertificateEngine
     {
         get => engine;
         set
         {
-            // For Mono (or Non-Windows) only Bouncy Castle is supported
-            if (!RunTime.IsWindows) value = CertificateEngine.BouncyCastle;
+            // Non-Windows runtimes cannot use Windows X509Enrollment; Fast is fully managed BC.
+            value = CoerceEngineForPlatform(value, RunTime.IsWindows);
 
             if (value != engine)
             {
-                certEngineValue = null!;
+                certEngineValue = null;
                 engine = value;
             }
         }
+    }
+
+    /// <summary>
+    ///     Key algorithm for generated leaf certificates. Honoured by the BouncyCastle engines; the
+    ///     Windows engine always issues RSA. Defaults to <see cref="CertificateKeyAlgorithm.Rsa2048" />.
+    ///     <para>
+    ///         Switching to <see cref="CertificateKeyAlgorithm.EcdsaP256" /> makes generating a
+    ///         certificate for a not-yet-seen host roughly fifty times cheaper, which is the single
+    ///         largest cost the proxy adds to a first visit. Only clients that accept ECDSA server
+    ///         certificates can be intercepted afterwards.
+    ///     </para>
+    /// </summary>
+    public CertificateKeyAlgorithm LeafCertificateKeyAlgorithm
+    {
+        get => leafKeyAlgorithm;
+        set
+        {
+            if (value == leafKeyAlgorithm) return;
+
+            // The makers capture the algorithm when constructed (BouncyCastleFast generates its single
+            // shared key pair right there), so the cached instance has to go.
+            certEngineValue = null;
+            leafKeyAlgorithm = value;
+        }
+    }
+
+    /// <summary>
+    ///     How many RSA-2048 leaf private keys to keep ready in a background-refilled buffer so first
+    ///     visits do not pay key-generation cost on the CONNECT that needs the certificate.
+    ///     Defaults to 8. Set to 0 to disable buffering (keys are generated on demand).
+    ///     <para>
+    ///         Only applies when <see cref="LeafCertificateKeyAlgorithm" /> is
+    ///         <see cref="CertificateKeyAlgorithm.Rsa2048" />. ECDSA P-256 keys are cheap enough that
+    ///         they are always generated inline. The buffer is process-wide and shared by every
+    ///         <see cref="CertificateManager" /> instance.
+    ///     </para>
+    /// </summary>
+    public static int LeafRsaKeyPairBufferSize
+    {
+        get => LeafKeyPairSource.RsaBufferCapacity;
+        set => LeafKeyPairSource.RsaBufferCapacity = value;
     }
 
     /// <summary>
@@ -192,17 +461,36 @@ public sealed class CertificateManager : IDisposable
     /// <summary>
     ///     Name(path) of the Root certificate file.
     ///     <para>
-    ///         Set the name(path) of the .pfx file. If it is string.Empty Root certificate file will be named as
-    ///         "rootCert.pfx" (and will be saved in proxy dll directory)
+    ///         Set the name or path of the .pfx file. When empty, the file is named <c>rootCert.pfx</c>.
+    ///         Relative or empty values are resolved under the per-user Titanium.Web.Proxy directory
+    ///         (%LocalAppData% on Windows, ApplicationData on Linux/macOS). Absolute paths are honored as-is.
     ///     </para>
     /// </summary>
     public string PfxFilePath { get; set; } = string.Empty;
 
     /// <summary>
-    ///     Number of Days generated HTTPS certificates are valid for.
-    ///     Maximum allowed on iOS 13 is 825 days and it is the default.
+    ///     Number of days generated HTTPS leaf certificates are valid for, measured forward from the
+    ///     moment of creation.  The certificate's <c>NotBefore</c> is set to
+    ///     <c>UtcNow - <see cref="CertificateGraceDays" /></c>, so the effective total validity window
+    ///     (NotAfter − NotBefore) equals <c>CertificateValidDays + CertificateGraceDays</c>.
+    ///     <para>
+    ///         Chrome 70+ and iOS 14+ reject certificates whose total validity window exceeds 398 days.
+    ///         To stay within that limit, keep <c>CertificateValidDays + CertificateGraceDays &lt;= 398</c>.
+    ///         The default value of 396, combined with the default grace of 2, equals exactly 398 days total.
+    ///     </para>
     /// </summary>
-    public int CertificateValidDays { get; set; } = 825;
+    public int CertificateValidDays { get; set; } = 396;
+
+    /// <summary>
+    ///     Number of days by which the certificate's <c>NotBefore</c> timestamp is backdated relative to
+    ///     the current UTC time.  A small backdate (the default is 2 days) compensates for minor clock-skew
+    ///     between the proxy machine and clients; it is not necessary to backdate by a year.
+    ///     <para>
+    ///         The total certificate lifetime is <c>CertificateValidDays + CertificateGraceDays</c>.
+    ///         Chrome 70+ and iOS 14+ cap this at 398 days for TLS leaf certificates.
+    ///     </para>
+    /// </summary>
+    public int CertificateGraceDays { get; set; } = 2;
 
     /// <summary>
     ///     Name of the root certificate issuer.
@@ -215,11 +503,11 @@ public sealed class CertificateManager : IDisposable
     }
 
     /// <summary>
-    ///     Name of the root certificate.
-    ///     (This is valid only when RootCertificate property is not set.)
-    ///     If no certificate is provided then a default Root Certificate will be created and used.
-    ///     The provided root certificate will be stored in proxy exe directory with the private key.
-    ///     Root certificate file will be named as "rootCert.pfx".
+    ///     Subject/CN name used when generating a root certificate.
+    ///     (This is valid only when <see cref="RootCertificate" /> property is not set.)
+    ///     If no certificate is provided then a default root certificate will be created and used.
+    ///     Persistence uses <see cref="PfxFilePath" /> / <see cref="CertificateStorage" /> under the
+    ///     per-user Titanium.Web.Proxy directory (not the process executable directory).
     /// </summary>
     public string RootCertificateName
     {
@@ -235,22 +523,64 @@ public sealed class CertificateManager : IDisposable
         get => rootCertificate;
         set
         {
-            ClearRootCertificate();
+            // Only invalidate cached leaf certificates when the signing root's identity actually
+            // changes. Reloading the same persisted root on startup must NOT discard valid cached
+            // leaves. Critically: the first assignment (field still null → loaded rootCert.pfx) is
+            // not a root change — clearing here used to Directory.Delete("crts") on every process
+            // start, forcing full MakeCertificate stampede and multi-second CONNECT latency.
+            if (rootCertificate != null)
+            {
+                var rootChanged = value == null ||
+                                  !string.Equals(rootCertificate.Thumbprint, value.Thumbprint,
+                                      StringComparison.OrdinalIgnoreCase);
+                if (rootChanged)
+                    ClearRootCertificate();
+            }
+
             rootCertificate = value;
         }
     }
 
     /// <summary>
-    ///     Save all fake certificates using <seealso cref="CertificateStorage" />.
-    ///     <para>for can load the certificate and not make new certificate every time. </para>
+    ///     Additional certificates to send to clients as part of the TLS certificate chain.
+    ///     Use this when <see cref="RootCertificate" /> is an intermediate CA rather than the trust anchor:
+    ///     set this to the ordered list of intermediate certificates between the signing certificate
+    ///     and the client-trusted root so that clients can build a complete verified chain.
+    ///     When <see cref="RootCertificate" /> is not self-signed it is automatically included in the
+    ///     chain even if this collection is empty; any certificates in this collection are appended
+    ///     after it.
+    /// </summary>
+    public X509Certificate2Collection? IntermediateCertificates { get; set; }
+
+    /// <summary>
+    ///     When true, persist generated leaf certificates via <see cref="CertificateStorage" /> so
+    ///     subsequent runs can reload them instead of regenerating.
     /// </summary>
     public bool SaveFakeCertificates { get; set; } = false;
 
     /// <summary>
+    ///     Fast first-visit MITM for modern TLS clients (browsers, current HttpClient):
+    ///     <see cref="CertificateEngine.BouncyCastleFast" />, ECDSA P-256 leaves, and
+    ///     <see cref="SaveFakeCertificates" /> enabled. The root CA stays RSA.
+    ///     <para>
+    ///         Library <see cref="Options.ProxyProfile.Balanced" /> still defaults to RSA-2048 leaves for
+    ///         widest compatibility. Call this from Inspector, CLI, and desktop MITM hosts where clients
+    ///         are known to accept ECDSA server certificates — RSA leaf generation is the dominant
+    ///         cold-start cost when a page hits many not-yet-seen hosts (often ~1 s per host).
+    ///     </para>
+    /// </summary>
+    public void ApplyFastColdStartLeafSettings()
+    {
+        CertificateEngine = CertificateEngine.BouncyCastleFast;
+        LeafCertificateKeyAlgorithm = CertificateKeyAlgorithm.EcdsaP256;
+        SaveFakeCertificates = true;
+    }
+
+    /// <summary>
     ///     The fake certificate cache storage.
-    ///     The default cache storage implementation saves certificates in folder "crts" (will be created in proxy dll
-    ///     directory).
-    ///     Implement ICertificateCache interface and assign concrete class here to customize.
+    ///     The default implementation stores leaf certificates in a <c>crts</c> subdirectory of the
+    ///     per-user Titanium.Web.Proxy directory (%LocalAppData% on Windows, ApplicationData on
+    ///     Linux/macOS). Implement <see cref="ICertificateCache" /> and assign a concrete class here to customize.
     /// </summary>
     public ICertificateCache CertificateStorage
     {
@@ -275,14 +605,14 @@ public sealed class CertificateManager : IDisposable
     public X509KeyStorageFlags StorageFlag { get; set; } = X509KeyStorageFlags.Exportable;
 
     /// <summary>
-    ///     Disable wild card certificates. Disabled by default.
+    ///     When true, issue per-host certificates instead of <c>*.parent.tld</c> wildcards.
+    ///     Default false (wildcards enabled where applicable).
     /// </summary>
     public bool DisableWildCardCertificates { get; set; } = false;
 
     public void Dispose()
     {
         Dispose(true);
-        GC.SuppressFinalize(this);
     }
 
     /// <summary>
@@ -292,22 +622,29 @@ public sealed class CertificateManager : IDisposable
     /// <returns></returns>
     private bool RootCertificateInstalled(StoreLocation storeLocation)
     {
-        if (RootCertificate == null) throw new Exception("Root certificate is null.");
+        var certificate = RootCertificate;
+        if (certificate == null) throw new InvalidOperationException("Root certificate is null.");
 
-        var value = $"{RootCertificate.Issuer}";
-        return FindCertificates(StoreName.Root, storeLocation, value).Count > 0
+        var thumbprint = certificate.Thumbprint;
+        return FindCertificates(StoreName.Root, storeLocation, thumbprint).Count > 0
                && (CertificateEngine != CertificateEngine.DefaultWindows
-                   || FindCertificates(StoreName.My, storeLocation, value).Count > 0);
+                   || FindCertificates(StoreName.My, storeLocation, thumbprint).Count > 0);
     }
 
     private static X509Certificate2Collection FindCertificates(StoreName storeName, StoreLocation storeLocation,
-        string findValue)
+        string thumbprint)
     {
         var x509Store = new X509Store(storeName, storeLocation);
         try
         {
             x509Store.Open(OpenFlags.OpenExistingOnly);
-            return x509Store.Certificates.Find(X509FindType.FindBySubjectDistinguishedName, findValue, false);
+            return x509Store.Certificates.Find(X509FindType.FindByThumbprint, thumbprint, false);
+        }
+        catch (CryptographicException)
+        {
+            // Fresh Linux images often lack ~/.dotnet/corefx/cryptography/x509stores/{root,my}.
+            // Treat a missing store as empty so InstallCertificate can create it via ReadWrite.
+            return [];
         }
         finally
         {
@@ -316,22 +653,117 @@ public sealed class CertificateManager : IDisposable
     }
 
     /// <summary>
-    ///     Make current machine trust the Root Certificate used by this proxy
+    ///     Returns <see langword="true" /> when <paramref name="candidate" /> has the expected common name
+    ///     and, when <paramref name="keepThumbprint" /> is set, a different thumbprint (an orphan).
+    ///     When <paramref name="keepThumbprint" /> is <see langword="null" />, any matching CN is selected
+    ///     (used when removing all same-name roots).
     /// </summary>
-    /// <param name="storeName"></param>
-    /// <param name="storeLocation"></param>
-    private void InstallCertificate(StoreName storeName, StoreLocation storeLocation)
+    internal static bool IsSameCommonNameStoreCandidate(
+        X509Certificate2 candidate, string expectedCommonName, string? keepThumbprint)
     {
-        if (RootCertificate == null) throw new Exception("Could not install certificate as it is null or empty.");
+        if (string.IsNullOrEmpty(expectedCommonName) || candidate.Subject.Length == 0)
+            return false;
+
+        // Subject is typically "CN=Titanium Root Certificate Authority" (plus optional other RDNs).
+        var cnPrefix = "CN=" + expectedCommonName;
+        if (!candidate.Subject.Contains(cnPrefix, StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(candidate.GetNameInfo(X509NameType.SimpleName, false), expectedCommonName,
+                StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        if (keepThumbprint == null)
+            return true;
+
+        return !string.Equals(candidate.Thumbprint, keepThumbprint, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    ///     Removes Root/My store certificates that share <see cref="RootCertificateName" />.
+    ///     When <paramref name="keepCurrentThumbprint" /> is <see langword="true" />, the current
+    ///     <see cref="RootCertificate" /> thumbprint is preserved (orphan cleanup after a
+    ///     <em>new</em> Root install — not on re-trust of an already-present thumbprint).
+    ///     When <see langword="false" />, every matching CN is removed (Remove CA / Rotate).
+    /// </summary>
+    private void RemoveOrphanedSameCommonNameCertificates(StoreLocation storeLocation, bool keepCurrentThumbprint)
+    {
+        var expectedCn = RootCertificateName;
+        var keepThumb = keepCurrentThumbprint ? RootCertificate?.Thumbprint : null;
+        RemoveMatchingCertificates(StoreName.Root, storeLocation, expectedCn, keepThumb);
+        RemoveMatchingCertificates(StoreName.My, storeLocation, expectedCn, keepThumb);
+    }
+
+    private void RemoveMatchingCertificates(
+        StoreName storeName, StoreLocation storeLocation, string expectedCn, string? keepThumbprint)
+    {
+        // Root Remove shows a blocking "Do you want to DELETE ... from the Root Store?" dialog on Windows.
+        if (storeName == StoreName.Root && ShouldSuppressInteractiveRootStoreMutations)
+            return;
+
+        try
+        {
+            using var store = new X509Store(storeName, storeLocation);
+            store.Open(OpenFlags.ReadWrite);
+            // FindBySubjectName is indexed CryptoAPI — do NOT enumerate store.Certificates
+            // (that loads every Root CA and routinely stalls tens of seconds on enterprise machines).
+            var candidates = store.Certificates.Find(
+                X509FindType.FindBySubjectName, expectedCn, validOnly: false);
+            var toRemove = candidates
+                .Cast<X509Certificate2>()
+                .Where(cert => IsSameCommonNameStoreCandidate(cert, expectedCn, keepThumbprint))
+                .ToList();
+
+            foreach (var cert in toRemove)
+            {
+                try
+                {
+                    store.Remove(cert);
+                }
+                catch (Exception e)
+                {
+                    OnException(new Exception(
+                        $"Failed to remove same-CN certificate '{cert.Thumbprint}' from {storeName}\\{storeLocation}.",
+                        e));
+                }
+                finally
+                {
+                    cert.Dispose();
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            // macOS often denies opening CurrentUser\Root for write; Keychain untrust still runs.
+            OnException(new Exception(
+                $"Failed to open {storeName}\\{storeLocation} for same-CN root cleanup " +
+                "(continuing with OS trust helpers).", e));
+        }
+    }
+
+    /// <summary>
+    ///     Make current machine trust the Root Certificate used by this proxy.
+    /// </summary>
+    /// <returns>
+    ///     <see langword="true"/> when the certificate was newly added;
+    ///     <see langword="false"/> when it was already present or the install failed.
+    /// </returns>
+    private bool InstallCertificate(StoreName storeName, StoreLocation storeLocation)
+    {
+        var certificate = RootCertificate;
+        if (certificate == null) throw new InvalidOperationException("Could not install certificate as it is null or empty.");
+
+        if (FindCertificates(storeName, storeLocation, certificate.Thumbprint).Count > 0) return false;
+
+        // Root Add shows a blocking Trusted Root Yes/No security dialog on Windows.
+        if (storeName == StoreName.Root && ShouldSuppressInteractiveRootStoreMutations)
+            return false;
 
         var x509Store = new X509Store(storeName, storeLocation);
 
-        // todo
-        // also it should do not duplicate if certificate already exists
         try
         {
             x509Store.Open(OpenFlags.ReadWrite);
-            x509Store.Add(RootCertificate);
+            x509Store.Add(certificate);
+            return true;
         }
         catch (Exception e)
         {
@@ -339,6 +771,7 @@ public sealed class CertificateManager : IDisposable
                 new Exception("Failed to make system trust root certificate "
                               + $" for {storeName}\\{storeLocation} store location. You may need admin rights.",
                     e));
+            return false;
         }
         finally
         {
@@ -381,26 +814,26 @@ public sealed class CertificateManager : IDisposable
 
     private X509Certificate2 MakeCertificate(string certificateName, bool isRootCertificate)
     {
-        //if (isRoot != (null == signingCertificate))
-        //{
-        //    throw new ArgumentException(
-        //        "You must specify a Signing Certificate if and only if you are not creating a root.",
-        //        nameof(signingCertificate));
-        //}
-
-        if (!isRootCertificate && RootCertificate == null) CreateRootCertificate();
+        if (!isRootCertificate && RootCertificate == null)
+        {
+            CreateRootCertificate();
+            if (RootCertificate == null)
+                throw new InvalidOperationException(
+                    "A root certificate is required to create leaf certificates, but root creation failed.");
+        }
 
         var certificate = CertEngine.MakeCertificate(certificateName, isRootCertificate ? null : RootCertificate);
 
         if (CertificateEngine == CertificateEngine.DefaultWindows)
-            Task.Run(() => UninstallCertificate(StoreName.My, StoreLocation.CurrentUser, certificate));
+            Task.Run(() => UninstallCertificate(StoreName.My, StoreLocation.CurrentUser, certificate),
+                clearCertificatesTokenSource.Token);
 
         return certificate;
     }
 
     private void OnException(Exception exception)
     {
-        ExceptionFunc?.Invoke(exception);
+        ProxyDiagnostics.ReportException(Logger, "Certificate operation failed", exception);
     }
 
     /// <summary>
@@ -409,7 +842,7 @@ public sealed class CertificateManager : IDisposable
     /// <param name="certificateName"></param>
     /// <param name="isRootCertificate"></param>
     /// <returns></returns>
-    internal X509Certificate2? CreateCertificate(string certificateName, bool isRootCertificate)
+    internal X509Certificate2? CreateCertificate(string certificateName, bool isRootCertificate) // NOSONAR S3776 -- This protocol/state-machine path shares mutable parsing or transport state; splitting it further would create disproportionate regression risk.
     {
         X509Certificate2? certificate;
         try
@@ -427,6 +860,7 @@ public sealed class CertificateManager : IDisposable
                     if (certificate != null && certificate.NotAfter <= DateTime.Now)
                     {
                         OnException(new Exception($"Cached certificate for {subjectName} has expired."));
+                        certificate.Dispose();
                         certificate = null;
                     }
                 }
@@ -438,7 +872,8 @@ public sealed class CertificateManager : IDisposable
 
                 if (certificate == null)
                 {
-                    certificate = MakeCertificate(certificateName, false);
+                    var createdCertificate = MakeCertificate(certificateName, false);
+                    certificate = createdCertificate;
 
                     //Don't need to wait for save to complete
                     _ = Task.Run(() =>
@@ -453,7 +888,16 @@ public sealed class CertificateManager : IDisposable
                                 try
                                 {
                                     //no two tasks with same subject name should together enter here 
-                                    certificateCache.SaveCertificate(subjectName, certificate);
+                                    certificateCache.SaveCertificate(subjectName, createdCertificate);
+
+                                    // Unlike the in-memory dictionary, this on-disk cache has no
+                                    // process-lifetime sweep to ever remove old entries at all - every
+                                    // distinct hostname ever visited previously accumulated a permanent
+                                    // .pfx file. Prune it to the disk-specific bound, which is
+                                    // deliberately independent of the in-memory bound (see
+                                    // maxDiskCacheEntriesProvider).
+                                    if (certificateCache is DefaultCertificateDiskCache diskCache)
+                                        diskCache.PruneToMaxEntries(maxDiskCacheEntriesProvider());
                                 }
                                 finally
                                 {
@@ -466,7 +910,7 @@ public sealed class CertificateManager : IDisposable
                         {
                             OnException(new Exception("Failed to save fake certificate.", e));
                         }
-                    });
+                    }, clearCertificatesTokenSource.Token);
                 }
             }
             else
@@ -484,46 +928,105 @@ public sealed class CertificateManager : IDisposable
     }
 
     /// <summary>
+    ///     Tries to get a still-valid certificate from the in-memory cache.
+    ///     Expired cached certificates are evicted and disposed so that a fresh one is generated.
+    /// </summary>
+    private bool TryGetValidCachedCertificate(string certificateName, out X509Certificate2? certificate)
+    {
+        certificate = null;
+
+        if (!cachedCertificates.TryGetValue(certificateName, out var cached)) return false;
+
+        // do not serve an expired (or not-yet-valid) certificate from the cache
+        var now = DateTime.Now;
+        if (cached.Certificate.NotAfter <= now || cached.Certificate.NotBefore > now)
+        {
+            if (cachedCertificates.TryRemove(certificateName, out var removed))
+            {
+                InvalidateSslCertificateContext(removed.Certificate);
+                removed.Certificate.Dispose();
+            }
+
+            return false;
+        }
+
+        cached.LastAccess = DateTime.UtcNow;
+        certificate = cached.Certificate;
+        return true;
+    }
+
+    /// <summary>
     ///     Creates a server certificate signed by the root certificate.
     /// </summary>
     /// <param name="certificateName"></param>
     /// <returns></returns>
-    public async Task<X509Certificate2?> CreateServerCertificate(string certificateName)
+    public async Task<X509Certificate2?> CreateServerCertificate(string certificateName) // NOSONAR S3776 -- This protocol/state-machine path shares mutable parsing or transport state; splitting it further would create disproportionate regression risk.
     {
         // check in cache first
-        if (cachedCertificates.TryGetValue(certificateName, out var cached))
+        if (TryGetValidCachedCertificate(certificateName, out var cachedCertificate))
+            return cachedCertificate;
+
+        // Disk hit must not wait behind Task.Run(MakeCertificate) stampede — load synchronously.
+        if (SaveFakeCertificates)
         {
-            cached.LastAccess = DateTime.UtcNow;
-            return cached.Certificate;
+            var fromDisk = TryLoadFakeCertificateFromDisk(certificateName);
+            if (fromDisk != null)
+            {
+                if (cachedCertificates.TryAdd(certificateName,
+                        new CachedCertificate(fromDisk) { LastAccess = DateTime.UtcNow }))
+                {
+                    EnforceCertificateCacheBound();
+                    return fromDisk;
+                }
+
+                fromDisk.Dispose();
+                if (TryGetValidCachedCertificate(certificateName, out cachedCertificate))
+                    return cachedCertificate;
+            }
         }
 
         var createdTask = false;
         Task<X509Certificate2?> createCertificateTask;
-        await pendingCertificateCreationTaskLock.WaitAsync();
+        await pendingCertificateCreationTaskLock.WaitAsync(clearCertificatesTokenSource.Token);
         try
         {
             // check in cache first
-            if (cachedCertificates.TryGetValue(certificateName, out cached))
-            {
-                cached.LastAccess = DateTime.UtcNow;
-                return cached.Certificate;
-            }
+            if (TryGetValidCachedCertificate(certificateName, out cachedCertificate))
+                return cachedCertificate;
 
             // handle burst requests with same certificate name
             // by checking for existing task for same certificate name
-            if (!pendingCertificateCreationTasks.TryGetValue(certificateName, out createCertificateTask))
+            if (!pendingCertificateCreationTasks.TryGetValue(certificateName, out var existingTask)
+                || existingTask == null)
             {
                 // run certificate creation task & add it to pending tasks
                 createCertificateTask = Task.Run(() =>
                 {
-                    var result = CreateCertificate(certificateName, false);
-                    if (result != null) cachedCertificates.TryAdd(certificateName, new CachedCertificate(result));
+                    certificateCreationThrottle.Wait(clearCertificatesTokenSource.Token);
+                    try
+                    {
+                        var result = CreateCertificate(certificateName, false);
+                        if (result != null)
+                        {
+                            cachedCertificates.TryAdd(certificateName,
+                                new CachedCertificate(result) { LastAccess = DateTime.UtcNow });
+                            EnforceCertificateCacheBound();
+                        }
 
-                    return result;
-                });
+                        return result;
+                    }
+                    finally
+                    {
+                        certificateCreationThrottle.Release();
+                    }
+                }, clearCertificatesTokenSource.Token);
 
                 pendingCertificateCreationTasks[certificateName] = createCertificateTask;
                 createdTask = true;
+            }
+            else
+            {
+                createCertificateTask = existingTask;
             }
         }
         finally
@@ -536,7 +1039,7 @@ public sealed class CertificateManager : IDisposable
         if (createdTask)
         {
             // cleanup pending task
-            await pendingCertificateCreationTaskLock.WaitAsync();
+            await pendingCertificateCreationTaskLock.WaitAsync(clearCertificatesTokenSource.Token);
             try
             {
                 pendingCertificateCreationTasks.Remove(certificateName);
@@ -551,18 +1054,66 @@ public sealed class CertificateManager : IDisposable
     }
 
     /// <summary>
+    ///     Loads a previously saved leaf certificate from the disk cache (no crypto).
+    ///     Used as a fast path so CONNECT for known hosts is not queued behind unrelated keygen.
+    /// </summary>
+    private X509Certificate2? TryLoadFakeCertificateFromDisk(string certificateName)
+    {
+        try
+        {
+            var subjectName = ProxyConstants.CnRemoverRegex
+                .Replace(certificateName, string.Empty)
+                .Replace("*", "$x$");
+
+            var certificate = certificateCache.LoadCertificate(subjectName, StorageFlag);
+            if (certificate == null) return null;
+
+            if (certificate.NotAfter <= DateTime.Now)
+            {
+                OnException(new Exception($"Cached certificate for {subjectName} has expired."));
+                certificate.Dispose();
+                return null;
+            }
+
+            return certificate;
+        }
+        catch (Exception e)
+        {
+            OnException(new Exception("Failed to load fake certificate.", e));
+            return null;
+        }
+    }
+
+    /// <summary>
     ///     A method to clear outdated certificates
     /// </summary>
-    internal async void ClearIdleCertificates()
+    internal async Task ClearIdleCertificates()
     {
         var cancellationToken = clearCertificatesTokenSource.Token;
         while (!cancellationToken.IsCancellationRequested)
         {
-            var cutOff = DateTime.UtcNow.AddMinutes(-CertificateCacheTimeOutMinutes);
+            // Fire-and-forget from ProxyServer.Start; keep the sweep resilient to transient failures.
+            try
+            {
+                var cutOff = DateTime.UtcNow.AddMinutes(-CertificateCacheTimeOutMinutes);
 
-            var outdated = cachedCertificates.Where(x => x.Value.LastAccess < cutOff).ToList();
+                var outdated = cachedCertificates.Where(x => x.Value.LastAccess < cutOff).ToList();
 
-            foreach (var cache in outdated) cachedCertificates.TryRemove(cache.Key, out _);
+                foreach (var cache in outdated)
+                    EvictCertificate(cache.Key);
+
+                // A runtime change to ResourceLimits (e.g. lowering MaxCertificateCacheEntries) was
+                // previously only honored on the next cache insertion; enforcing it here too means a
+                // lowered bound - or a burst that grew the cache between sweeps - is corrected within
+                // one sweep interval even on an otherwise-idle proxy.
+                EnforceCertificateCacheBound();
+
+                DisposePendingEvictions();
+            }
+            catch (Exception e)
+            {
+                OnException(e);
+            }
 
             // after a minute come back to check for outdated certificates in cache
             try
@@ -585,13 +1136,136 @@ public sealed class CertificateManager : IDisposable
     }
 
     /// <summary>
+    ///     Creates an <see cref="System.Net.Security.SslStreamCertificateContext" /> for the given leaf certificate,
+    ///     including any intermediate CA certificates that the client needs to build a verified chain.
+    ///     <para>
+    ///         When <see cref="RootCertificate" /> is not self-signed (i.e. it is an intermediate CA), it is
+    ///         automatically added to the chain so that clients trust-anchored at the root CA can still verify
+    ///         generated leaf certificates. Additional certificates from <see cref="IntermediateCertificates" />
+    ///         are appended after it.
+    ///     </para>
+    ///     <para>
+    ///         Uses <c>offline: true</c> so chain building does not consult the Windows certificate stores or the
+    ///         network. Without that, Schannel can latch onto a different root that happens to share the same
+    ///         subject DN — for example the product default <c>Titanium Root Certificate Authority</c> that the
+    ///         Basic/WPF examples trust into CurrentUser\Root on <c>ProxyServer.Start()</c> — and then present a
+    ///         store-backed leaf instead of the one we just generated, breaking callers that validate against a
+    ///         different in-memory/session root (integration tests, or a second proxy instance).
+    ///     </para>
+    /// </summary>
+    internal System.Net.Security.SslStreamCertificateContext CreateSslCertificateContext(X509Certificate2 leaf)
+    {
+        var key = leaf.Thumbprint;
+        if (key != null && sslCertificateContexts.TryGetValue(key, out var cached))
+        {
+            // Same thumbprint can be a freshly loaded PKCS#12 after the previous X509Certificate2
+            // was disposed (idle/bound eviction + SaveFakeCertificates). SslStreamCertificateContext
+            // pins the original SafeCertContext — never reuse a context built for a different instance.
+            if (ReferenceEquals(cached.TargetCertificate, leaf))
+                return cached;
+
+            sslCertificateContexts.TryRemove(key, out _);
+        }
+
+        var created = BuildSslCertificateContext(leaf);
+
+        if (key == null)
+            return created;
+
+        return sslCertificateContexts.AddOrUpdate(key, created, (_, existing) =>
+            ReferenceEquals(existing.TargetCertificate, leaf) ? existing : created);
+    }
+
+    private System.Net.Security.SslStreamCertificateContext BuildSslCertificateContext(X509Certificate2 leaf)
+    {
+        var extras = new X509Certificate2Collection();
+        System.Net.Security.SslCertificateTrust? trust = null;
+
+        if (rootCertificate != null)
+        {
+            // Pin this signer. A self-signed root that shares a subject with a different
+            // certificate already in the Windows store (the product-default
+            // "Titanium Root Certificate Authority") makes X509Chain.Build throw
+            // "An unknown chain building error occurred" instead of returning a partial chain.
+            // Custom trust keeps the chain on the certificate we just loaded or created.
+            trust = System.Net.Security.SslCertificateTrust.CreateForX509Collection(
+                new X509Certificate2Collection(rootCertificate), sendTrustInHandshake: false);
+
+            if (!IsSelfSigned(rootCertificate))
+            {
+                extras.Add(rootCertificate);
+                // Offline Create has no path to a system trust anchor when the configured signer is
+                // an intermediate CA. Windows rebuilds the chain without ExtraStore; when that OS
+                // build throws, its own "add to Intermediate CA store" fallback never runs.
+                StageIntermediateForOsChainBuild(rootCertificate);
+            }
+        }
+
+        if (IntermediateCertificates != null)
+            foreach (X509Certificate2 cert in IntermediateCertificates)
+                extras.Add(cert);
+
+        try
+        {
+            return System.Net.Security.SslStreamCertificateContext.Create(
+                leaf, extras.Count > 0 ? extras : null, offline: true, trust);
+        }
+        catch (CryptographicException) when (trust != null)
+        {
+            return System.Net.Security.SslStreamCertificateContext.Create(
+                leaf, null, offline: true, trust);
+        }
+    }
+
+    /// <summary>
+    ///     Best-effort staging of an intermediate into the CurrentUser Intermediate CA store so
+    ///     Windows <see cref="System.Net.Security.SslStreamCertificateContext" /> construction can
+    ///     complete its OS chain build. Mirrors the store fallback inside that type's constructor.
+    /// </summary>
+    private static void StageIntermediateForOsChainBuild(X509Certificate2 intermediate)
+    {
+        try
+        {
+            using var store = new X509Store(StoreName.CertificateAuthority, StoreLocation.CurrentUser);
+            store.Open(OpenFlags.ReadWrite);
+            store.Add(intermediate);
+        }
+        catch (CryptographicException)
+        {
+            // Permission or store issues - Create may still succeed via custom trust alone.
+        }
+    }
+
+    /// <summary>
+    ///     Coerces an engine selection for the current platform. Extracted so unit tests can verify
+    ///     that only <see cref="CertificateEngine.DefaultWindows" /> is rewritten off Windows.
+    /// </summary>
+    internal static CertificateEngine CoerceEngineForPlatform(CertificateEngine value, bool isWindows)
+    {
+        if (!isWindows && value == CertificateEngine.DefaultWindows)
+            return CertificateEngine.BouncyCastle;
+        return value;
+    }
+
+    private static bool IsTruthyEnv(string name)
+    {
+        var v = Environment.GetEnvironmentVariable(name);
+        return string.Equals(v, "true", StringComparison.OrdinalIgnoreCase)
+               || string.Equals(v, "1", StringComparison.OrdinalIgnoreCase)
+               || string.Equals(v, "yes", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsSelfSigned(X509Certificate2 cert) =>
+        cert.SubjectName.RawData.SequenceEqual(cert.IssuerName.RawData);
+
+    /// <summary>
     ///     Attempts to create a RootCertificate.
     /// </summary>
     /// <param name="persistToFile">if set to <c>true</c> try to load/save the certificate from rootCert.pfx.</param>
     /// <returns>
     ///     true if succeeded, else false.
     /// </returns>
-    public bool CreateRootCertificate(bool persistToFile = true)
+    public bool CreateRootCertificate(bool persistToFile = true) // NOSONAR S3776 -- This protocol/state-machine path shares mutable parsing or transport state; splitting it further would create disproportionate regression risk.
     {
         lock (rootCertCreationLock)
         {
@@ -608,6 +1282,7 @@ public sealed class CertificateManager : IDisposable
                     if (rootCert != null && rootCert.NotAfter <= DateTime.Now)
                     {
                         OnException(new Exception("Loaded root certificate has expired."));
+                        rootCert.Dispose();
                         return false;
                     }
 
@@ -656,7 +1331,8 @@ public sealed class CertificateManager : IDisposable
     }
 
     /// <summary>
-    ///     Loads root certificate from current executing assembly location with expected name rootCert.pfx.
+    ///     Loads the root certificate via <see cref="CertificateStorage" /> (default: per-user
+    ///     Titanium.Web.Proxy directory, file name from <see cref="PfxFilePath" /> or <c>rootCert.pfx</c>).
     /// </summary>
     /// <returns></returns>
     public X509Certificate2? LoadRootCertificate()
@@ -669,6 +1345,7 @@ public sealed class CertificateManager : IDisposable
             if (rootCert != null && rootCert.NotAfter <= DateTime.Now)
             {
                 OnException(new ArgumentException("Loaded root certificate has expired."));
+                rootCert.Dispose();
                 return null;
             }
 
@@ -685,8 +1362,8 @@ public sealed class CertificateManager : IDisposable
     ///     Manually load a Root certificate file from give path (.pfx file).
     /// </summary>
     /// <param name="pfxFilePath">
-    ///     Set the name(path) of the .pfx file. If it is string.Empty Root certificate file will be
-    ///     named as "rootCert.pfx" (and will be saved in proxy dll directory).
+    ///     Set the name or path of the .pfx file. When empty, the file is named <c>rootCert.pfx</c>
+    ///     under the per-user Titanium.Web.Proxy directory. Absolute paths are honored as-is.
     /// </param>
     /// <param name="password">Set a password for the .pfx file.</param>
     /// <param name="overwritePfXFile">
@@ -710,73 +1387,383 @@ public sealed class CertificateManager : IDisposable
         return RootCertificate != null;
     }
 
+    /// <summary>Last OS/browser trust outcome from <see cref="TrustRootCertificate"/> / related helpers.</summary>
+    public CertificateOsTrustResult? LastOsTrustResult { get; private set; }
+
     /// <summary>
-    ///     Trusts the root certificate in user store, optionally also in machine store.
-    ///     Machine trust would require elevated permissions (will silently fail otherwise).
+    ///     Trusts the root certificate in the current-user Personal and Trusted Root stores,
+    ///     and optionally also in the local-machine Personal and Trusted Root stores.
     /// </summary>
+    /// <param name="machineTrusted">
+    ///     When <see langword="true"/>, also install machine-wide trust (LocalMachine on Windows;
+    ///     System.keychain / system CA store on macOS/Linux, with an admin prompt). Defaults to
+    ///     <see langword="false"/> — user-only trust is the recommended default. Check
+    ///     <see cref="LastOsTrustResult"/> and <see cref="VerifyOsUserSslTrust"/> after calling.
+    /// </param>
     public void TrustRootCertificate(bool machineTrusted = false)
     {
-        // currentUser\personal
+        var rootAdded = InstallRootIntoCertificateStores(machineTrusted);
+        // Orphan Remove also prompts; only prune when we just installed this thumbprint so
+        // re-trust / Install CA when already present does not open Root ReadWrite for cleanup.
+        if (rootAdded)
+            PruneOrphanedSameCommonNameCertificates(machineTrusted, keepCurrentThumbprint: true);
+
+        ApplyUnixSslTrustAfterStoreInstall(machineTrusted);
+    }
+
+    /// <summary>
+    ///     Installs the root into Personal + Trusted Root stores only (Windows CryptUI Yes/No on Root Add).
+    ///     Does not prune orphans or run Unix Keychain/NSS trust — UI callers should finish those
+    ///     off the dispatcher after CryptUI returns so Avalonia does not show Not Responding.
+    /// </summary>
+    /// <returns>True when the user Root store entry was newly added.</returns>
+    public bool InstallRootIntoCertificateStores(bool machineTrusted = false)
+    {
         InstallCertificate(StoreName.My, StoreLocation.CurrentUser);
+        var rootAdded = InstallCertificate(StoreName.Root, StoreLocation.CurrentUser);
 
-        if (!machineTrusted)
+        if (machineTrusted)
         {
-            // currentUser\Root
-            InstallCertificate(StoreName.Root, StoreLocation.CurrentUser);
-        }
-        else
-        {
-            // current system
             InstallCertificate(StoreName.My, StoreLocation.LocalMachine);
-
-            // this adds to both currentUser\Root & currentMachine\Root
             InstallCertificate(StoreName.Root, StoreLocation.LocalMachine);
+        }
+
+        if (rootAdded)
+        {
+            LastOsTrustResult = CertificateOsTrustResult.Ok("Root CA trusted in current-user store");
+            return true;
+        }
+
+        // CryptUI No / failure vs already present: presence check without treating cancel as Ok
+        // (Decrypt HTTPS used to leave the checkbox ticked and open a recovery dialog).
+        if (RootCertificate is not null &&
+            FindCertificates(StoreName.Root, StoreLocation.CurrentUser, RootCertificate.Thumbprint).Count > 0)
+        {
+            LastOsTrustResult = CertificateOsTrustResult.Ok("Root CA already trusted in current-user store");
+            return false;
+        }
+
+        LastOsTrustResult = CertificateOsTrustResult.Fail(
+            CertificateOsTrustKind.Cancelled,
+            "Root CA install cancelled");
+        return false;
+    }
+
+    /// <summary>
+    ///     Removes same-CN Root/My entries (may show Windows Root Delete CryptUI). Prefer a pumping
+    ///     UI thread when interactive.
+    /// </summary>
+    public void PruneOrphanedSameCommonNameCertificates(bool machineTrusted, bool keepCurrentThumbprint)
+    {
+        RemoveOrphanedSameCommonNameCertificates(StoreLocation.CurrentUser, keepCurrentThumbprint);
+        if (machineTrusted)
+            RemoveOrphanedSameCommonNameCertificates(StoreLocation.LocalMachine, keepCurrentThumbprint);
+    }
+
+    /// <summary>
+    ///     macOS/Linux SSL trust (Keychain / NSS). May show auth UI — keep on a pumping thread.
+    ///     No-op on Windows (Root store presence is trust).
+    /// </summary>
+    public void ApplyUnixSslTrustAfterStoreInstall(bool machineTrusted = false)
+    {
+        if (RunTime.IsWindows || RootCertificate == null)
+        {
+            LastOsTrustResult = CertificateOsTrustResult.Ok("Root CA trusted in current-user store");
+            return;
+        }
+
+        if (ShouldSuppressInteractiveRootStoreMutations)
+        {
+            LastOsTrustResult = CertificateOsTrustResult.Fail(
+                CertificateOsTrustKind.Cancelled,
+                "OS SSL trust skipped (interactive root-store UI suppressed)");
+            return;
+        }
+
+        LastOsTrustResult = Helpers.UnixCertificateTrust.TrustUserSsl(RootCertificate, RootCertificateName);
+        if (!machineTrusted)
+            return;
+
+        var machineOk = Helpers.UnixCertificateTrust.TrustMachineSsl(RootCertificate, RootCertificateName);
+        if (!machineOk)
+        {
+            LastOsTrustResult = CertificateOsTrustResult.Fail(
+                CertificateOsTrustKind.Failed,
+                "Machine-wide CA trust failed (user trust may already be applied)");
+        }
+        else if (LastOsTrustResult.Succeeded ||
+                 LastOsTrustResult.Kind == CertificateOsTrustKind.MacNeedsManualTrustConfirm)
+        {
+            LastOsTrustResult = CertificateOsTrustResult.Ok("Root CA trusted machine-wide");
         }
     }
 
     /// <summary>
-    ///     Puts the certificate to the user store, optionally also to machine store.
-    ///     Prompts with UAC if elevated permissions are required. Works only on Windows.
+    ///     Read-only: Root-store thumbprints matching <see cref="RootCertificateName"/>.
+    ///     Uses FindBySubjectName (not a full store enumeration) so interactive Clear/reinstall
+    ///     does not sit on Busy for tens of seconds on large Windows Root stores.
     /// </summary>
-    /// <returns>True if success.</returns>
-    public bool TrustRootCertificateAsAdmin(bool machineTrusted = false)
+    public System.Collections.Generic.IReadOnlyList<string> ListSameCommonNameRootThumbprints(
+        StoreLocation storeLocation, string? keepThumbprint = null)
     {
-        if (!RunTime.IsWindows) return false;
-
-        // currentUser\Personal
-        InstallCertificate(StoreName.My, StoreLocation.CurrentUser);
-
-        var pfxFileName = Path.GetTempFileName();
-        File.WriteAllBytes(pfxFileName, RootCertificate!.Export(X509ContentType.Pkcs12, PfxPassword));
-
-        // currentUser\Root, currentMachine\Personal &  currentMachine\Root
-        var info = new ProcessStartInfo
-        {
-            FileName = "certutil.exe",
-            CreateNoWindow = true,
-            UseShellExecute = true,
-            Verb = "runas",
-            ErrorDialog = false,
-            WindowStyle = ProcessWindowStyle.Hidden
-        };
-
-        if (!machineTrusted)
-            info.Arguments = "-f -user -p \"" + PfxPassword + "\" -importpfx root \"" + pfxFileName + "\"";
-        else
-            info.Arguments = "-importPFX -p \"" + PfxPassword + "\" -f \"" + pfxFileName + "\"";
-
+        var expectedCn = RootCertificateName;
+        var list = new System.Collections.Generic.List<string>();
         try
         {
-            var process = Process.Start(info);
-            if (process == null) return false;
-
-            process.WaitForExit();
-            File.Delete(pfxFileName);
+            using var store = new X509Store(StoreName.Root, storeLocation);
+            store.Open(OpenFlags.ReadOnly);
+            var candidates = store.Certificates.Find(
+                X509FindType.FindBySubjectName, expectedCn, validOnly: false);
+            foreach (var cert in candidates.Cast<X509Certificate2>())
+            {
+                try
+                {
+                    if (IsSameCommonNameStoreCandidate(cert, expectedCn, keepThumbprint))
+                        list.Add(cert.Thumbprint);
+                }
+                finally
+                {
+                    cert.Dispose();
+                }
+            }
         }
         catch (Exception e)
         {
-            OnException(e);
+            OnException(new Exception(
+                $"Failed to list same-CN roots in Root\\{storeLocation}.", e));
+        }
+
+        return list;
+    }
+
+    /// <summary>
+    ///     Removes one certificate by thumbprint. Root Remove may show Windows CryptUI — UI thread.
+    /// </summary>
+    public bool RemoveCertificateByThumbprint(
+        StoreName storeName, StoreLocation storeLocation, string thumbprint)
+    {
+        if (string.IsNullOrWhiteSpace(thumbprint))
             return false;
+
+        if (storeName == StoreName.Root && ShouldSuppressInteractiveRootStoreMutations)
+            return false;
+
+        try
+        {
+            using var store = new X509Store(storeName, storeLocation);
+            store.Open(OpenFlags.ReadWrite);
+            var found = store.Certificates.Find(X509FindType.FindByThumbprint, thumbprint, validOnly: false);
+            if (found.Count == 0)
+                return false;
+
+            foreach (var cert in found)
+            {
+                try { store.Remove(cert); }
+                finally { cert.Dispose(); }
+            }
+
+            return true;
+        }
+        catch (Exception e)
+        {
+            OnException(new Exception(
+                $"Failed to remove thumbprint '{thumbprint}' from {storeName}\\{storeLocation}.", e));
+            return false;
+        }
+    }
+
+    /// <summary>
+    ///     Personal (My) store same-CN cleanup only — typically no CryptUI. Safe off the UI thread.
+    /// </summary>
+    public void PruneOrphanedPersonalCertificates(StoreLocation storeLocation, bool keepCurrentThumbprint)
+    {
+        var expectedCn = RootCertificateName;
+        var keepThumb = keepCurrentThumbprint ? RootCertificate?.Thumbprint : null;
+        RemoveMatchingCertificates(StoreName.My, storeLocation, expectedCn, keepThumb);
+    }
+
+    /// <summary>
+    ///     macOS/Linux Keychain/NSS untrust. May show auth UI — keep on a pumping thread.
+    /// </summary>
+    public void ApplyUnixSslUntrust()
+    {
+        if (RunTime.IsWindows || RootCertificate == null)
+            return;
+        if (ShouldSuppressInteractiveRootStoreMutations)
+            return;
+
+        Helpers.UnixCertificateTrust.UntrustUserSsl(RootCertificate, RootCertificateName);
+    }
+
+    /// <summary>
+    ///     Installs NSS <c>certutil</c> (Linux package or macOS Homebrew) after user consent, then retries user SSL trust.
+    /// </summary>
+    public CertificateOsTrustResult InstallNssCertutilAndRetryUserTrust()
+    {
+        if (ShouldSuppressInteractiveRootStoreMutations)
+        {
+            LastOsTrustResult = CertificateOsTrustResult.Fail(
+                CertificateOsTrustKind.Cancelled,
+                "NSS certutil install skipped (interactive root-store UI suppressed)");
+            return LastOsTrustResult;
+        }
+
+        var install = Helpers.UnixCertificateTrust.TryInstallNssCertutil();
+        if (!install.Succeeded)
+        {
+            LastOsTrustResult = install;
+            return install;
+        }
+
+        if (RootCertificate == null)
+        {
+            LastOsTrustResult = CertificateOsTrustResult.Fail(
+                CertificateOsTrustKind.Failed, "Root certificate is not loaded");
+            return LastOsTrustResult;
+        }
+
+        LastOsTrustResult = Helpers.UnixCertificateTrust.TrustUserSsl(RootCertificate, RootCertificateName);
+        return LastOsTrustResult;
+    }
+
+    /// <summary>Re-checks macOS/Linux user SSL trust for the current root.</summary>
+    public bool VerifyOsUserSslTrust()
+    {
+        if (RootCertificate == null || RunTime.IsWindows) return IsRootCertificateUserTrusted();
+        return Helpers.UnixCertificateTrust.VerifyUserSslTrust(RootCertificate);
+    }
+
+    /// <summary>
+    ///     Best-effort: true when the current root appears in the macOS login keychain.
+    ///     Does not imply SSL Always Trust — use <see cref="VerifyOsUserSslTrust"/>.
+    /// </summary>
+    public bool IsRootInLoginKeychain()
+    {
+        if (RootCertificate == null || !RunTime.IsMac) return false;
+        return Helpers.UnixCertificateTrust.IsCertificateInLoginKeychain(RootCertificate);
+    }
+
+    /// <summary>
+    ///     True when a Titanium root (current hash or known CN) remains in login or System keychain.
+    /// </summary>
+    public bool IsOsRootStillPresent()
+    {
+        if (RootCertificate == null || !RunTime.IsMac) return false;
+        return Helpers.UnixCertificateTrust.IsMacRootStillPresent(
+            new Helpers.ProcessRunner(), RootCertificate, RootCertificateName);
+    }
+
+    /// <summary>Opens Keychain Access (and a temp .cer) for manual Always Trust on macOS.</summary>
+    public string? OpenMacKeychainGuidance()
+    {
+        if (RootCertificate == null || !RunTime.IsMac) return null;
+        if (ShouldSuppressInteractiveRootStoreMutations) return null;
+        return Helpers.UnixCertificateTrust.OpenMacKeychainGuidanceForCertificate(RootCertificate);
+    }
+
+    /// <summary>
+    ///     Puts the certificate to the user store, optionally also to the machine store, prompting
+    ///     with UAC when elevation is required. Works only on Windows.
+    /// </summary>
+    /// <param name="machineTrusted">
+    ///     When <see langword="true"/>, elevate to install into local-machine stores. Defaults to
+    ///     <see langword="false"/> (user store only).
+    /// </param>
+    /// <returns>True if success.</returns>
+    public bool TrustRootCertificateAsAdmin(bool machineTrusted = false) // NOSONAR S3776 -- User/machine store install shares Root-store mutation order.
+    {
+        var certificate = RootCertificate;
+        if (certificate == null) return false;
+
+        // currentUser\Personal + currentUser\Root (machine elevation is only needed for LocalMachine).
+        // Do not prune orphans here — full-store sweeps after CryptUI freeze Avalonia; Inspector
+        // finalizes My-store prune off the UI via FinalizeTrustAfterAdminInstall.
+        _ = InstallRootIntoCertificateStores(machineTrusted: false);
+
+        // UAC / Keychain auth / polkit — never in unit/CI (hangs unattended runs).
+        if (ShouldSuppressInteractiveRootStoreMutations)
+        {
+            LastOsTrustResult = CertificateOsTrustResult.Fail(
+                CertificateOsTrustKind.Cancelled,
+                "Elevated root trust skipped (interactive root-store UI suppressed)");
+            return false;
+        }
+
+        if (!RunTime.IsWindows)
+        {
+            LastOsTrustResult = Helpers.UnixCertificateTrust.TrustUserSsl(certificate, RootCertificateName);
+            // Explicit true when only user-store trust was requested (no machine step).
+            if (!machineTrusted)
+                return LastOsTrustResult.Succeeded ||
+                       LastOsTrustResult.Kind == CertificateOsTrustKind.MacNeedsManualTrustConfirm;
+
+            var machineOk = Helpers.UnixCertificateTrust.TrustMachineSsl(certificate, RootCertificateName);
+            if (!machineOk)
+            {
+                // User trust may already be applied; surface machine failure clearly.
+                LastOsTrustResult = CertificateOsTrustResult.Fail(
+                    CertificateOsTrustKind.Failed,
+                    "Machine-wide CA trust failed (user trust may already be applied)");
+                return false;
+            }
+
+            if (LastOsTrustResult.Succeeded ||
+                LastOsTrustResult.Kind == CertificateOsTrustKind.MacNeedsManualTrustConfirm)
+            {
+                LastOsTrustResult = CertificateOsTrustResult.Ok("Root CA trusted machine-wide");
+            }
+
+            return true;
+        }
+
+        // certutil.exe only accepts the PFX password via a plain "-p password" command-line argument -
+        // it has no file/stdin-based alternative (confirmed: no documented option to read it from a
+        // file). ProcessStartInfo.Arguments is visible to any other process/user that lists this
+        // process's command line (Task Manager, Get-Process, WMI, etc.) for as long as certutil runs.
+        // The configured PfxPassword protects the *long-lived* cached root PFX on disk (see
+        // SaveRootCertificate) and must never appear there. This temp file exists only for certutil to
+        // consume for the few moments before it's deleted below, so export it under a throwaway,
+        // single-use empty password instead of reusing the real secret on the command line.
+        const string transientPfxPassword = "";
+        var pfxFileName = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName() + ".pfx");
+        try
+        {
+            File.WriteAllBytes(pfxFileName, certificate.Export(X509ContentType.Pkcs12, transientPfxPassword));
+
+            // Elevated: currentUser\Root (when !machineTrusted) or localMachine Personal+Root.
+            var info = new ProcessStartInfo
+            {
+                FileName = CertUtilExecutablePath,
+                CreateNoWindow = true,
+                UseShellExecute = true,
+                Verb = RunAsAdministrator,
+                ErrorDialog = false,
+                WindowStyle = ProcessWindowStyle.Hidden
+            };
+
+            if (!machineTrusted)
+                info.Arguments = "-f -user -p \"" + transientPfxPassword + "\" -importpfx root \"" + pfxFileName + "\"";
+            else
+                info.Arguments = "-importPFX -p \"" + transientPfxPassword + "\" -f \"" + pfxFileName + "\"";
+
+            try
+            {
+                var process = Process.Start(info);
+                if (process == null) return false;
+
+                process.WaitForExit();
+            }
+            catch (Exception e)
+            {
+                OnException(e);
+                return false;
+            }
+        }
+        finally
+        {
+            // Guaranteed even if Export/WriteAllBytes/Process.Start/WaitForExit throws - otherwise a
+            // temporary file holding the exported root private key is left behind on disk indefinitely.
+            try { File.Delete(pfxFileName); } catch { /* best effort */ }
         }
 
         return true;
@@ -798,16 +1785,16 @@ public sealed class CertificateManager : IDisposable
     /// <summary>
     ///     Ensure certificates are setup (creates root if required).
     ///     Also makes root certificate trusted based on provided parameters.
-    ///     Note:setting machineTrustRootCertificate to true will force userTrustRootCertificate to true.
     /// </summary>
     /// <param name="userTrustRootCertificate">
-    ///     Should fake HTTPS certificate be trusted by this machine's user certificate
-    ///     store?
+    ///     Trust in the current-user stores. Prefer true for interactive MITM; false for fully opt-in trust.
     /// </param>
-    /// <param name="machineTrustRootCertificate">Should fake HTTPS certificate be trusted by this machine's certificate store?</param>
+    /// <param name="machineTrustRootCertificate">
+    ///     Also trust in local-machine stores (needs elevation). Implies user trust. Prefer false unless
+    ///     installing for a service / all users.
+    /// </param>
     /// <param name="trustRootCertificateAsAdmin">
-    ///     Should we attempt to trust certificates with elevated permissions by
-    ///     prompting for UAC if required?
+    ///     Elevate via UAC when installing (Windows only). Defaults to false.
     /// </param>
     public void EnsureRootCertificate(bool userTrustRootCertificate,
         bool machineTrustRootCertificate, bool trustRootCertificateAsAdmin = false)
@@ -836,28 +1823,28 @@ public sealed class CertificateManager : IDisposable
     }
 
     /// <summary>
-    ///     Removes the trusted certificates from user store, optionally also from machine store.
-    ///     To remove from machine store elevated permissions are required (will fail silently otherwise).
+    ///     Removes the trusted certificates from the current-user Personal and Trusted Root stores,
+    ///     and optionally also from the local-machine Personal and Trusted Root stores.
     /// </summary>
-    /// <param name="machineTrusted">Should also remove from machine store?</param>
+    /// <param name="machineTrusted">
+    ///     When <see langword="true"/>, also remove from local-machine stores (needs elevation;
+    ///     fails silently otherwise). Pass the same value used when trusting.
+    /// </param>
     public void RemoveTrustedRootCertificate(bool machineTrusted = false)
     {
-        // currentUser\personal
-        UninstallCertificate(StoreName.My, StoreLocation.CurrentUser, RootCertificate);
+        // Drop every same-CN Titanium root (current + orphans) so Remove CA leaves a clean store.
+        RemoveOrphanedSameCommonNameCertificates(StoreLocation.CurrentUser, keepCurrentThumbprint: false);
 
-        if (!machineTrusted)
-        {
-            // currentUser\Root
-            UninstallCertificate(StoreName.Root, StoreLocation.CurrentUser, RootCertificate);
-        }
-        else
-        {
-            // current system
-            UninstallCertificate(StoreName.My, StoreLocation.LocalMachine, RootCertificate);
+        if (machineTrusted)
+            RemoveOrphanedSameCommonNameCertificates(StoreLocation.LocalMachine, keepCurrentThumbprint: false);
 
-            // this adds to both currentUser\Root & currentMachine\Root
-            UninstallCertificate(StoreName.Root, StoreLocation.LocalMachine, RootCertificate);
-        }
+        if (!RunTime.IsWindows && RootCertificate != null &&
+            !ShouldSuppressInteractiveRootStoreMutations)
+            Helpers.UnixCertificateTrust.UntrustUserSsl(RootCertificate, RootCertificateName);
+
+        // Firefox prefs / certutil must not run on the CryptUI UI thread — prefs.js locks and
+        // certutil against a live profile hang Avalonia as "(Not Responding)". Callers schedule
+        // FirefoxCertificateTrust.ClearRootTrustBestEffort off the UI after store remove.
     }
 
     /// <summary>
@@ -866,20 +1853,34 @@ public sealed class CertificateManager : IDisposable
     /// <returns>Should also remove from machine store?</returns>
     public bool RemoveTrustedRootCertificateAsAdmin(bool machineTrusted = false)
     {
-        if (!RunTime.IsWindows) return false;
+        // Current-user: remove all same-CN entries (current + orphans) without elevation.
+        RemoveOrphanedSameCommonNameCertificates(StoreLocation.CurrentUser, keepCurrentThumbprint: false);
 
-        // currentUser\Personal
-        UninstallCertificate(StoreName.My, StoreLocation.CurrentUser, RootCertificate);
+        if (!RunTime.IsWindows)
+        {
+            if (RootCertificate == null) return false;
+            if (ShouldSuppressInteractiveRootStoreMutations)
+                return true;
+            Helpers.UnixCertificateTrust.UntrustUserSsl(RootCertificate, RootCertificateName);
+            // Explicit true when only user-store untrust was requested (no machine step).
+            return machineTrusted
+                ? Helpers.UnixCertificateTrust.UntrustMachineSsl(RootCertificate, RootCertificateName)
+                : true; // NOSONAR S1125
+        }
+
+        // Elevated certutil -delstore shows UAC; skip when Root UI is suppressed.
+        if (ShouldSuppressInteractiveRootStoreMutations)
+            return true;
 
         var infos = new List<ProcessStartInfo>();
         if (!machineTrusted)
             infos.Add(new ProcessStartInfo
             {
-                FileName = "certutil.exe",
+                FileName = CertUtilExecutablePath,
                 Arguments = "-delstore -user Root \"" + RootCertificateName + "\"",
                 CreateNoWindow = true,
                 UseShellExecute = true,
-                Verb = "runas",
+                Verb = RunAsAdministrator,
                 ErrorDialog = false,
                 WindowStyle = ProcessWindowStyle.Hidden
             });
@@ -887,26 +1888,26 @@ public sealed class CertificateManager : IDisposable
             infos.AddRange(
                 new List<ProcessStartInfo>
                 {
-                    // currentMachine\Personal
+                    // localMachine\Personal
                     new()
                     {
-                        FileName = "certutil.exe",
+                        FileName = CertUtilExecutablePath,
                         Arguments = "-delstore My \"" + RootCertificateName + "\"",
                         CreateNoWindow = true,
                         UseShellExecute = true,
-                        Verb = "runas",
+                        Verb = RunAsAdministrator,
                         ErrorDialog = false,
                         WindowStyle = ProcessWindowStyle.Hidden
                     },
 
-                    // currentUser\Personal & currentMachine\Personal
+                    // localMachine\Root
                     new()
                     {
-                        FileName = "certutil.exe",
+                        FileName = CertUtilExecutablePath,
                         Arguments = "-delstore Root \"" + RootCertificateName + "\"",
                         CreateNoWindow = true,
                         UseShellExecute = true,
-                        Verb = "runas",
+                        Verb = RunAsAdministrator,
                         ErrorDialog = false,
                         WindowStyle = ProcessWindowStyle.Hidden
                     }
@@ -938,21 +1939,66 @@ public sealed class CertificateManager : IDisposable
     public void ClearRootCertificate()
     {
         certificateCache.Clear();
-        cachedCertificates.Clear();
+
+        // Dispose every cached leaf cert before clearing so native CAPI/OpenSSL handles
+        // are released promptly rather than waiting for GC finalization.
+        foreach (var pair in cachedCertificates)
+            if (cachedCertificates.TryRemove(pair.Key, out var entry))
+                try { entry.Certificate.Dispose(); }
+                catch
+                {
+                    // Best-effort cleanup; continue disposing the remaining cached certificates.
+                }
+
+        sslCertificateContexts.Clear();
+
+        // Also dispose anything already evicted but still waiting out its grace period: the root is
+        // changing, so leaves signed by the old root are not worth holding onto even briefly.
+        while (pendingDisposals.TryDequeue(out var pending))
+            try { pending.Certificate.Dispose(); }
+            catch
+            {
+                // Best-effort cleanup; continue disposing the remaining pending certificates.
+            }
+
+        // Do not dispose rootCertificate: it may have been supplied by the caller and still
+        // referenced outside this manager (e.g. shared test CA / persisted root reload).
         rootCertificate = null;
     }
 
-    private void Dispose(bool disposing)
+    private void Dispose(bool disposing) // NOSONAR S3776 -- This protocol/state-machine path shares mutable parsing or transport state; splitting it further would create disproportionate regression risk.
     {
         if (disposed) return;
 
-        if (disposing) clearCertificatesTokenSource.Dispose();
+        if (disposing)
+        {
+            clearCertificatesTokenSource.Dispose();
+            pendingCertificateCreationTaskLock.Dispose();
+            certificateCreationThrottle.Dispose();
+
+            // Release native CAPI/OpenSSL handles on all cached leaf certificates (manager-owned).
+            foreach (var pair in cachedCertificates)
+                if (cachedCertificates.TryRemove(pair.Key, out var entry))
+                    try { entry.Certificate.Dispose(); }
+                    catch
+                    {
+                        // Best-effort cleanup; continue disposing the remaining cached certificates.
+                    }
+
+            // Also dispose anything already evicted but still waiting out its grace period.
+            while (pendingDisposals.TryDequeue(out var pending))
+                try { pending.Certificate.Dispose(); }
+                catch
+                {
+                    // Best-effort cleanup; continue disposing the remaining pending certificates.
+                }
+
+            sslCertificateContexts.Clear();
+
+            // Do not dispose rootCertificate: ownership may belong to the caller.
+            rootCertificate = null;
+        }
 
         disposed = true;
-    }
-
-    ~CertificateManager()
-    {
-        Dispose(false);
     }
 }

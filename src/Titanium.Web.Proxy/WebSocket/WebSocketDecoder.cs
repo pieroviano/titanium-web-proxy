@@ -5,40 +5,94 @@ using Titanium.Web.Proxy.StreamExtended.BufferPool;
 
 namespace Titanium.Web.Proxy;
 
+/// <summary>
+///     Reassembles raw bytes relayed after a WebSocket upgrade (see
+///     <c>SessionEventArgs.WebSocketDecoderSend</c>/<c>WebSocketDecoderReceive</c>, fed from the session's
+///     <c>DataSent</c>/<c>DataReceived</c> events) into individual <see cref="WebSocketFrame" />s, handling
+///     frames split across multiple reads and unmasking masked (client-to-server) payloads. Use one
+///     instance per direction of a single connection - frames may span calls, so state from one call feeds
+///     the next.
+/// </summary>
 public class WebSocketDecoder
 {
     private byte[] buffer;
 
     private long bufferLength;
 
-    internal WebSocketDecoder(IBufferPool bufferPool)
+    private readonly long maxFramePayloadBytes;
+    private readonly bool relayOversizeFrames;
+    private long rawForwardRemaining;
+    private WebsocketOpCode rawOpCode;
+    private bool rawIsFinal;
+    private long rawDeclaredLength;
+
+    /// <param name="bufferPool">Sizes the initial internal reassembly buffer.</param>
+    /// <param name="maxFramePayloadBytes">
+    ///     Upper bound on a single frame's declared payload length, validated before any of that frame's
+    ///     bytes are buffered. Defaults to <see cref="long.MaxValue" /> (no caller-configured limit; the
+    ///     structural <see cref="int.MaxValue" /> bound below still applies) so existing call sites that
+    ///     do not have a policy limit to enforce keep their previous behavior.
+    /// </param>
+    /// <param name="relayOversizeFrames">
+    ///     When <see langword="true"/> (Observe mode), a frame over the limit is yielded as raw wire
+    ///     slices instead of throwing. Enforce mode leaves this <see langword="false"/>.
+    /// </param>
+    internal WebSocketDecoder(IBufferPool bufferPool, long maxFramePayloadBytes = long.MaxValue,
+        bool relayOversizeFrames = false)
     {
         buffer = new byte[bufferPool.BufferSize];
+        this.maxFramePayloadBytes = maxFramePayloadBytes;
+        this.relayOversizeFrames = relayOversizeFrames;
     }
 
-    public IEnumerable<WebSocketFrame> Decode(byte[] data, int offset, int count)
+    /// <summary>
+    ///     Decodes as many complete frames as <paramref name="data" /> currently contains (0 or more - any
+    ///     trailing partial frame is buffered internally and completed by a later call).
+    /// </summary>
+    /// <remarks>
+    ///     Every yielded <see cref="WebSocketFrame" />'s <see cref="WebSocketFrame.Data" /> is an owned
+    ///     copy of the unmasked payload, safe to retain after this method returns. Remaining incomplete
+    ///     frame bytes stay in this decoder's internal reassembly buffer for a later call.
+    /// </remarks>
+    public IEnumerable<WebSocketFrame> Decode(byte[] data, int offset, int count) // NOSONAR S3776 -- This protocol/state-machine path shares mutable parsing or transport state; splitting it further would create disproportionate regression risk.
     {
-        var buffer = data.AsMemory(offset, count);
+        var decodeBuffer = data.AsMemory(offset, count);
 
         var copied = false;
         if (bufferLength > 0)
         {
             // already have remaining data
-            buffer = CopyToBuffer(buffer);
+            decodeBuffer = CopyToBuffer(decodeBuffer);
             copied = true;
         }
 
         while (true)
         {
-            var data1 = buffer.Span;
+            if (rawForwardRemaining > 0)
+            {
+                if (decodeBuffer.Length == 0) break;
+                var rawTake = (int)Math.Min(decodeBuffer.Length, rawForwardRemaining);
+                var rawSlice = decodeBuffer.Slice(0, rawTake).ToArray();
+                rawForwardRemaining -= rawTake;
+                decodeBuffer = decodeBuffer.Slice(rawTake);
+                yield return new WebSocketFrame
+                {
+                    RelayRaw = true,
+                    OpCode = rawOpCode,
+                    IsFinal = rawIsFinal,
+                    DeclaredPayloadLength = rawDeclaredLength,
+                    Data = rawSlice
+                };
+                continue;
+            }
+
+            var data1 = decodeBuffer.Span;
             if (!IsDataEnough(data1)) break;
 
             var opCode = (WebsocketOpCode)(data1[0] & 0xf);
             var isFinal = (data1[0] & 0x80) != 0;
             var b = data1[1];
             long size = b & 0x7f;
-
-            // todo: size > int.Max??
 
             var masked = (b & 0x80) != 0;
 
@@ -52,19 +106,82 @@ public class WebSocketDecoder
                 }
                 else
                 {
+                    // RFC 6455 section 5.2: "the most significant bit MUST be 0" for the 64-bit extended
+                    // payload length. Check the raw byte before doing arithmetic on it below - a set high
+                    // bit would otherwise just flip the sign of the shifted value rather than fail loudly.
+                    if ((data1[2] & 0x80) != 0)
+                        throw new WebSocketProtocolException(
+                            "WebSocket frame declared a 64-bit payload length with the reserved high bit set.",
+                            1002);
+
                     size = ((long)data1[2] << 56) + ((long)data1[3] << 48) + ((long)data1[4] << 40) +
                            ((long)data1[5] << 32) +
                            ((long)data1[6] << 24) + (data1[7] << 16) + (data1[8] << 8) + data1[9];
                     idx = 10;
+
+                    // WebSocketFrame.Data is ultimately sliced with a 32-bit length (below), so a
+                    // structurally valid but oversized 64-bit length can never be honored regardless of
+                    // any configured limit.
+                    if (size > int.MaxValue && !relayOversizeFrames)
+                        throw new WebSocketProtocolException(
+                            $"WebSocket frame declared a payload length of {size:N0} bytes, which exceeds " +
+                            $"the maximum of {int.MaxValue:N0} bytes this decoder can buffer.",
+                            1002);
                 }
             }
 
-            if (data1.Length < idx + size) break;
+            // Validate the declared length before buffering a single byte of payload (see the
+            // maxFramePayloadBytes remarks on the constructor): the completeness check just below waits
+            // for the full declared length to arrive, and CopyToBuffer grows the reassembly buffer
+            // without an upper bound to accumulate a frame that has not fully arrived yet. Checking here,
+            // rather than after the frame is fully reassembled, is what keeps an attacker who declares an
+            // oversized length and trickles bytes in slowly from forcing unbounded allocation.
+            if (size > maxFramePayloadBytes || size > int.MaxValue)
+            {
+                if (!relayOversizeFrames)
+                    throw new WebSocketProtocolException(
+                        $"WebSocket frame payload of {size:N0} bytes exceeds the configured limit of " +
+                        $"{maxFramePayloadBytes:N0} bytes.",
+                        size > int.MaxValue ? (ushort)1002 : (ushort)1009);
+
+                // Only data frames may skip buffering. A control frame (payload must be <= 125) or a
+                // reserved opcode with an oversize length is a protocol error in every mode, and raw
+                // relay would bypass the validation the buffered path applies.
+                if (opCode != WebsocketOpCode.Continuation && opCode != WebsocketOpCode.Text &&
+                    opCode != WebsocketOpCode.Binary)
+                    throw new WebSocketProtocolException(
+                        $"WebSocket frame with opcode {(int)opCode} declared a payload of {size:N0} bytes.",
+                        1002);
+
+                var frameWire = (long)idx + (masked ? 4 : 0) + size;
+                var takeNow = (int)Math.Min(data1.Length, frameWire);
+                var rawNow = decodeBuffer.Slice(0, takeNow).ToArray();
+                rawForwardRemaining = frameWire - takeNow;
+                rawOpCode = opCode;
+                rawIsFinal = isFinal;
+                rawDeclaredLength = size;
+                decodeBuffer = decodeBuffer.Slice(takeNow);
+                yield return new WebSocketFrame
+                {
+                    RelayRaw = true,
+                    IsOversizeNotice = true,
+                    OpCode = opCode,
+                    IsFinal = isFinal,
+                    DeclaredPayloadLength = size,
+                    Data = rawNow
+                };
+                continue;
+            }
+
+            // The completeness check must also account for the 4-byte masking key (present right before
+            // the payload whenever the mask bit is set) - otherwise, once just enough bytes have arrived
+            // to cover the header/extended-length/payload but not yet the mask key, the slice below would
+            // read past the end of the currently available data.
+            var maskKeyLength = masked ? 4 : 0;
+            if (data1.Length < idx + size + maskKeyLength) break;
 
             if (masked)
             {
-                //mask = (uint)(((long)data1[idx++] << 24) + (data1[idx++] << 16) + (data1[idx++] << 8) + data1[idx++]);
-                //mask = (uint)(data1[idx++] + (data1[idx++] << 8) + (data1[idx++] << 16) + ((long)data1[idx++] << 24));
                 var uData = MemoryMarshal.Cast<byte, uint>(data1.Slice(idx, (int)size + 4));
                 idx += 4;
 
@@ -89,25 +206,25 @@ public class WebSocketDecoder
                 }
             }
 
-            var frameData = buffer.Slice(idx, (int)size);
+            var frameData = decodeBuffer.Slice(idx, (int)size).ToArray();
             var frame = new WebSocketFrame { IsFinal = isFinal, Data = frameData, OpCode = opCode };
             yield return frame;
 
-            buffer = buffer.Slice((int)(idx + size));
+            decodeBuffer = decodeBuffer.Slice((int)(idx + size));
         }
 
-        if (!copied && buffer.Length > 0) CopyToBuffer(buffer);
+        if (!copied && decodeBuffer.Length > 0) CopyToBuffer(decodeBuffer);
 
         if (copied)
         {
-            if (buffer.Length == 0)
+            if (decodeBuffer.Length == 0)
             {
                 bufferLength = 0;
             }
             else
             {
-                buffer.CopyTo(this.buffer);
-                bufferLength = buffer.Length;
+                decodeBuffer.CopyTo(buffer);
+                bufferLength = decodeBuffer.Length;
             }
         }
     }
@@ -115,34 +232,43 @@ public class WebSocketDecoder
     private Memory<byte> CopyToBuffer(ReadOnlyMemory<byte> data)
     {
         var requiredLength = bufferLength + data.Length;
-        if (requiredLength > buffer.Length) Array.Resize(ref buffer, (int)Math.Min(requiredLength, buffer.Length * 2));
+        if (requiredLength > buffer.Length) Array.Resize(ref buffer, (int)Math.Max(requiredLength, buffer.Length * 2));
 
         data.CopyTo(buffer.AsMemory((int)bufferLength));
         bufferLength += data.Length;
         return buffer.AsMemory(0, (int)bufferLength);
     }
 
+    /// <summary>
+    ///     Reports whether enough bytes have arrived to parse the frame's length-encoding header (the
+    ///     base 2 bytes, plus a 2- or 8-byte extended length field, plus a 4-byte mask key when present) -
+    ///     not whether the payload itself has fully arrived. The payload-completeness check is separate
+    ///     (in <see cref="Decode" />, once the real declared length is known) so that this gate can run,
+    ///     and the declared-length validation immediately after it, using only the header bytes.
+    /// </summary>
+    /// <remarks>
+    ///     A previous version of this check compared the bytes available against the raw 126/127
+    ///     length-code marker byte instead of the actual number of header bytes needed (e.g. requiring
+    ///     127 total bytes to be available before even attempting to parse a 64-bit extended length,
+    ///     regardless of how small the header itself is). That accidentally left the declared-length
+    ///     validation in <see cref="Decode" /> unreachable for a header delivered with little or no
+    ///     payload alongside it - exactly the slow-trickle delivery pattern an attacker would use to
+    ///     force unbounded reassembly-buffer growth while "waiting for more data".
+    /// </remarks>
     private static bool IsDataEnough(ReadOnlySpan<byte> data)
     {
-        var length = data.Length;
-        if (length < 2)
+        if (data.Length < 2)
             return false;
 
-        var size = data[1];
-        if ((size & 0x80) != 0) // masked
-            length -= 4;
+        var masked = (data[1] & 0x80) != 0;
+        var sizeMarker = data[1] & 0x7f;
 
-        size &= 0x7f;
+        var headerLength = 2;
+        if (sizeMarker == 126) headerLength += 2;
+        else if (sizeMarker == 127) headerLength += 8;
 
-        if (size == 126)
-        {
-            if (length < 2) return false;
-        }
-        else if (size == 127)
-        {
-            if (length < 10) return false;
-        }
+        if (masked) headerLength += 4;
 
-        return length >= size;
+        return data.Length >= headerLength;
     }
 }

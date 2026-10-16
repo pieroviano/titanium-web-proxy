@@ -1,0 +1,37 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:loc="using:Titanium.Inspector.Localization"
+        x:Class="Titanium.Inspector.Views.MacSslTrustWaitDialog"
+        Title="{loc:Loc trust.macWindow}"
+        Width="520" Height="420"
+        MinHeight="380"
+        WindowStartupLocation="CenterOwner"
+        CanResize="False"
+        ShowInTaskbar="False"
+        Topmost="True"
+        AutomationProperties.AutomationId="MacSslTrustWaitDialog">
+  <DockPanel Margin="20">
+    <StackPanel DockPanel.Dock="Bottom" Spacing="12" Margin="0,16,0,0">
+      <StackPanel Orientation="Horizontal" Spacing="10">
+        <ProgressBar x:Name="WaitProgress" IsIndeterminate="True" Width="120" Height="4"
+                     VerticalAlignment="Center"
+                     AutomationProperties.AutomationId="MacSslTrustProgress" />
+        <TextBlock x:Name="StatusText" Text="{loc:Loc trust.macWaitPlaceholder}" VerticalAlignment="Center"
+                   TextWrapping="Wrap" Opacity="0.85"
+                   AutomationProperties.AutomationId="MacSslTrustStatus" />
+      </StackPanel>
+      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8">
+        <Button x:Name="ConfirmSavedButton" MinWidth="140" Content="{loc:Loc trust.macConfirmSaved}"
+                AutomationProperties.AutomationId="MacSslTrustConfirmSaved" />
+        <Button x:Name="OpenKeychainButton" MinWidth="88" Content="{loc:Loc trust.openKeychain}"
+                AutomationProperties.AutomationId="MacSslTrustOpenKeychain" />
+        <Button x:Name="CancelButton" MinWidth="88" IsCancel="True" Content="{loc:Loc common.cancel}"
+                AutomationProperties.AutomationId="MacSslTrustCancel" />
+      </StackPanel>
+    </StackPanel>
+    <ScrollViewer Classes="dialogBody">
+      <TextBlock x:Name="MessageText" TextWrapping="Wrap"
+                 AutomationProperties.AutomationId="MacSslTrustMessage" />
+    </ScrollViewer>
+  </DockPanel>
+</Window>

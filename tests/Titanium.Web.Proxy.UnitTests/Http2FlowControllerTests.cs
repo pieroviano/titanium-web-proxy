@@ -1,0 +1,355 @@
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+using Titanium.Web.Proxy.Http2;
+
+namespace Titanium.Web.Proxy.UnitTests;
+
+/// <summary>
+///     Unit coverage for <see cref="Http2FlowController" />, the SEND-side flow-control accounting used by
+///     <c>Http2Helper</c> for every outbound DATA frame on one leg of the HTTP/2 relay (RFC 7540 §6.9).
+/// </summary>
+[TestClass]
+public class Http2FlowControllerTests
+{
+    [TestMethod]
+    public async Task ReserveAsync_WithinWindow_ReturnsImmediatelyAndDecrementsBothWindows()
+    {
+        var flow = new Http2FlowController();
+        flow.RegisterStream(1);
+
+        await flow.ReserveAsync(1, 1000, CancellationToken.None);
+
+        // a second reservation up to the remaining window must still succeed without blocking.
+        var task = flow.ReserveAsync(1, Http2FlowController.InitialConnectionWindow - 1000, CancellationToken.None);
+        Assert.IsTrue(task.IsCompletedSuccessfully);
+    }
+
+    [TestMethod]
+    public async Task ReserveAsync_ExceedingStreamWindow_BlocksUntilWindowUpdate()
+    {
+        var flow = new Http2FlowController();
+        flow.RegisterStream(1);
+
+        // give the connection window plenty of extra headroom so only stream 1's own window is the
+        // constraint under test below.
+        flow.OnWindowUpdate(0, 1_000_000);
+
+        // exhaust stream 1's window entirely while the connection window still has ample credit.
+        await flow.ReserveAsync(1, Http2FlowController.InitialConnectionWindow, CancellationToken.None);
+
+        var reserveTask = flow.ReserveAsync(1, 10, CancellationToken.None).AsTask();
+        await AssertRemainsIncompleteAsync(reserveTask, "Reservation should block while the stream window is exhausted.");
+
+        flow.OnWindowUpdate(1, 20);
+
+        await reserveTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.IsTrue(reserveTask.IsCompletedSuccessfully);
+    }
+
+    [TestMethod]
+    public async Task ReserveAsync_ExceedingConnectionWindow_BlocksUntilConnectionWindowUpdate()
+    {
+        var flow = new Http2FlowController();
+        flow.RegisterStream(1);
+        flow.RegisterStream(2);
+
+        // drain the connection window using stream 1, leaving stream 2's window untouched.
+        await flow.ReserveAsync(1, Http2FlowController.InitialConnectionWindow, CancellationToken.None);
+
+        var reserveTask = flow.ReserveAsync(2, 10, CancellationToken.None).AsTask();
+        await AssertRemainsIncompleteAsync(reserveTask, "Reservation should block while the connection window is exhausted even though the stream window is untouched.");
+
+        flow.OnWindowUpdate(0, 20);
+
+        await reserveTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.IsTrue(reserveTask.IsCompletedSuccessfully);
+    }
+
+    [TestMethod]
+    public void OnWindowUpdate_ZeroForStream_IsIgnoredWithoutThrowing()
+    {
+        var flow = new Http2FlowController();
+        flow.RegisterStream(1);
+
+        var overflow = flow.OnWindowUpdate(1, 0);
+
+        Assert.IsFalse(overflow);
+    }
+
+    [TestMethod]
+    public void OnWindowUpdate_ForUntrackedStream_IsIgnored()
+    {
+        var flow = new Http2FlowController();
+
+        // stream 99 was never registered (e.g. already removed by RST_STREAM) - must not throw.
+        var overflow = flow.OnWindowUpdate(99, 100);
+
+        Assert.IsFalse(overflow);
+    }
+
+    [TestMethod]
+    public void OnWindowUpdate_DrivingConnectionWindowAboveMax_ReportsOverflow()
+    {
+        var flow = new Http2FlowController();
+
+        var overflow = flow.OnWindowUpdate(0, int.MaxValue);
+
+        Assert.IsTrue(overflow, "A WINDOW_UPDATE that would push the connection window above 2^31-1 must be reported as an overflow (FLOW_CONTROL_ERROR).");
+    }
+
+    [TestMethod]
+    public void OnWindowUpdate_DrivingStreamWindowAboveMax_ReportsOverflow()
+    {
+        var flow = new Http2FlowController();
+        flow.RegisterStream(1);
+
+        var overflow = flow.OnWindowUpdate(1, int.MaxValue);
+
+        Assert.IsTrue(overflow, "A WINDOW_UPDATE that would push a stream window above 2^31-1 must be reported as an overflow (FLOW_CONTROL_ERROR).");
+    }
+
+    [TestMethod]
+    public async Task OnInitialWindowSizeChanged_Decrease_CanDriveOpenStreamWindowNegative_AndReserveStillBlocks()
+    {
+        var flow = new Http2FlowController();
+        flow.RegisterStream(1);
+
+        // shrink the initial window well below what's already been implicitly "granted" to stream 1.
+        flow.OnInitialWindowSizeChanged(0);
+
+        var reserveTask = flow.ReserveAsync(1, 1, CancellationToken.None).AsTask();
+        await AssertRemainsIncompleteAsync(reserveTask, "A stream window driven to zero/negative by SETTINGS_INITIAL_WINDOW_SIZE must still block new reservations (RFC 7540 §6.9.2).");
+
+        flow.OnWindowUpdate(1, 10);
+        await reserveTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.IsTrue(reserveTask.IsCompletedSuccessfully);
+    }
+
+    [TestMethod]
+    public async Task OnInitialWindowSizeChanged_Increase_GrantsExistingStreamsMoreCredit()
+    {
+        var flow = new Http2FlowController();
+        flow.RegisterStream(1);
+
+        // consume the entire initial window for stream 1.
+        await flow.ReserveAsync(1, Http2FlowController.InitialConnectionWindow, CancellationToken.None);
+
+        // widen the connection window too so only the stream-level increase is under test.
+        flow.OnWindowUpdate(0, 100);
+        flow.OnInitialWindowSizeChanged(Http2FlowController.InitialConnectionWindow + 100);
+
+        // the +100 delta should now be available on stream 1 without any further WINDOW_UPDATE for it.
+        var reserveTask = flow.ReserveAsync(1, 100, CancellationToken.None);
+        await reserveTask.AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.IsTrue(reserveTask.IsCompletedSuccessfully);
+    }
+
+    [TestMethod]
+    public void RegisteringSameStreamTwice_DoesNotThrow_AndResetsItsWindow()
+    {
+        var flow = new Http2FlowController();
+        flow.RegisterStream(1);
+        flow.RegisterStream(1);
+        var reserveTask = flow.ReserveAsync(1, Http2FlowController.InitialConnectionWindow, CancellationToken.None);
+        Assert.IsTrue(reserveTask.IsCompletedSuccessfully,
+            "Re-registering a stream must reset its window to the current initial size.");
+    }
+
+    [TestMethod]
+    public void RemoveStream_ForUnknownStream_DoesNotThrow()
+    {
+        var flow = new Http2FlowController();
+        flow.RemoveStream(12345);
+        flow.RegisterStream(1);
+        var reserveTask = flow.ReserveAsync(1, 100, CancellationToken.None);
+        Assert.IsTrue(reserveTask.IsCompletedSuccessfully,
+            "Removing an unknown stream must not affect subsequent reservations.");
+    }
+
+    [TestMethod]
+    public async Task ReserveAsync_CancellationToken_CancelsPendingWaiterWithoutAffectingOthers()
+    {
+        var flow = new Http2FlowController();
+        flow.RegisterStream(1);
+        flow.RegisterStream(2);
+
+        await flow.ReserveAsync(1, Http2FlowController.InitialConnectionWindow, CancellationToken.None);
+
+        using var cts = new CancellationTokenSource();
+        var cancelledTask = flow.ReserveAsync(1, 10, cts.Token);
+
+        cts.Cancel();
+
+        await Assert.ThrowsExactlyAsync<TaskCanceledException>(async () => await cancelledTask);
+
+        // stream 2, whose window was untouched, must be unaffected by the other waiter's cancellation once
+        // the connection window is replenished.
+        flow.OnWindowUpdate(0, 10);
+        await flow.ReserveAsync(2, 10, CancellationToken.None).AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [TestMethod]
+    public async Task ReserveAsync_MultipleConcurrentWaiters_AllEventuallyComplete()
+    {
+        var flow = new Http2FlowController();
+        flow.RegisterStream(1);
+
+        // exhaust the window first.
+        await flow.ReserveAsync(1, Http2FlowController.InitialConnectionWindow, CancellationToken.None);
+
+        var waiters = new Task[5];
+        for (var i = 0; i < waiters.Length; i++)
+        {
+            waiters[i] = flow.ReserveAsync(1, 100, CancellationToken.None).AsTask();
+        }
+
+        foreach (var w in waiters)
+        {
+            Assert.IsFalse(w.IsCompleted);
+        }
+
+        // grant just enough credit, in several increments, on both the connection and the stream window,
+        // for all waiters to eventually drain - each waiter re-checks the window after every wake-up rather
+        // than assuming it will get served in order.
+        for (var i = 0; i < waiters.Length; i++)
+        {
+            flow.OnWindowUpdate(0, 100);
+            flow.OnWindowUpdate(1, 100);
+        }
+
+        await Task.WhenAll(waiters).WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [TestMethod]
+    public async Task ReserveAsync_ZeroOrNegativeBytes_IsNoOp()
+    {
+        var flow = new Http2FlowController();
+        flow.RegisterStream(1);
+
+        // must return immediately without consuming any window or requiring registration.
+        await flow.ReserveAsync(1, 0, CancellationToken.None);
+        await flow.ReserveAsync(42, 0, CancellationToken.None);
+        var reserveTask = flow.ReserveAsync(1, Http2FlowController.InitialConnectionWindow, CancellationToken.None);
+        Assert.IsTrue(reserveTask.IsCompletedSuccessfully,
+            "Zero-byte reservations must not consume flow-control window.");
+    }
+
+    [TestMethod]
+    public async Task ReserveAsync_UnregisteredStream_UsesCurrentInitialWindowDefensively()
+    {
+        var flow = new Http2FlowController();
+
+        // stream 7 was never explicitly registered - ReserveAsync must not throw, treating it as having
+        // the controller's current initial window rather than failing the write outright.
+        var reserveTask = flow.ReserveAsync(7, 100, CancellationToken.None);
+        await reserveTask.AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.IsTrue(reserveTask.IsCompletedSuccessfully);
+    }
+
+    /// <summary>
+    ///     Confirms <paramref name="task" /> stays incomplete across several yields (not a fixed wall-clock
+    ///     delay that can race under load).
+    /// </summary>
+    private static async Task AssertRemainsIncompleteAsync(Task task, string message)
+    {
+        for (var i = 0; i < 5; i++)
+        {
+            Assert.IsFalse(task.IsCompleted, message);
+            await Task.Yield();
+        }
+
+        Assert.IsFalse(task.IsCompleted, message);
+    }
+
+    [TestMethod]
+    public void TryReservePartial_ReturnsAvailableWhenShort()
+    {
+        var flow = new Http2FlowController();
+        flow.RegisterStream(1);
+        Assert.AreEqual(3 * 16384, flow.TryReservePartial(1, 3 * 16384));
+        Assert.AreEqual(16383, flow.TryReservePartial(1, 16384));
+        Assert.AreEqual(0, flow.TryReservePartial(1, 1));
+    }
+
+    [TestMethod]
+    public void TryReserve_FalseWhenPartialWouldSucceed()
+    {
+        var flow = new Http2FlowController();
+        flow.RegisterStream(1);
+        Assert.IsTrue(flow.TryReserve(1, 3 * 16384));
+        Assert.IsFalse(flow.TryReserve(1, 16384), "All-or-nothing TryReserve must fail when one byte short.");
+        Assert.AreEqual(16383, flow.TryReservePartial(1, 16384));
+    }
+
+    [TestMethod]
+    public void AvailableSendCredit_FreshStream_IsDefaultWindow()
+    {
+        var flow = new Http2FlowController();
+        flow.RegisterStream(1);
+        Assert.AreEqual(Http2FlowController.InitialConnectionWindow, flow.AvailableSendCredit(1));
+    }
+
+    [TestMethod]
+    public void AvailableSendCredit_UnknownStream_IsZero()
+    {
+        var flow = new Http2FlowController();
+        Assert.AreEqual(0, flow.AvailableSendCredit(7));
+    }
+
+    [TestMethod]
+    public void AvailableSendCredit_AfterReserve_IsRemainder()
+    {
+        var flow = new Http2FlowController();
+        flow.RegisterStream(1);
+        Assert.IsTrue(flow.TryReserve(1, 1000));
+        Assert.AreEqual(Http2FlowController.InitialConnectionWindow - 1000, flow.AvailableSendCredit(1));
+    }
+
+    [TestMethod]
+    public void AvailableSendCredit_ConnectionSmallerThanStream_ReturnsConnection()
+    {
+        var flow = new Http2FlowController();
+        flow.RegisterStream(1);
+        flow.RegisterStream(3);
+        Assert.IsTrue(flow.TryReserve(1, 50000));
+        Assert.AreEqual(Http2FlowController.InitialConnectionWindow - 50000, flow.AvailableSendCredit(3));
+    }
+
+    [TestMethod]
+    public void AvailableSendCredit_NegativeWindow_IsZero()
+    {
+        var flow = new Http2FlowController();
+        flow.RegisterStream(1);
+        Assert.IsTrue(flow.TryReserve(1, 1000));
+        flow.OnInitialWindowSizeChanged(0);
+        Assert.AreEqual(0, flow.AvailableSendCredit(1));
+    }
+
+    [TestMethod]
+    public void SelectDataPayloadCap_FullFrameWhenCreditCoversOrBelowFloor()
+    {
+        Assert.AreEqual(16384, Http2FlowController.SelectDataPayloadCap(16384, 256 * 1024, 0));
+        Assert.AreEqual(16384, Http2FlowController.SelectDataPayloadCap(16384, 256 * 1024, 100));
+        Assert.AreEqual(16384, Http2FlowController.SelectDataPayloadCap(16384, 256 * 1024, 4095));
+        Assert.AreEqual(16384, Http2FlowController.SelectDataPayloadCap(16384, 256 * 1024, 16384));
+        Assert.AreEqual(16384, Http2FlowController.SelectDataPayloadCap(16384, 256 * 1024, 1_000_000));
+        Assert.AreEqual(16384, Http2FlowController.SelectDataPayloadCap(0, 1024 * 1024, 65535));
+    }
+
+    [TestMethod]
+    public void SelectDataPayloadCap_TrimsToCreditAboveFloor()
+    {
+        Assert.AreEqual(4096, Http2FlowController.SelectDataPayloadCap(16384, 256 * 1024, 4096));
+        Assert.AreEqual(16383, Http2FlowController.SelectDataPayloadCap(16384, 256 * 1024, 16383));
+    }
+
+    [TestMethod]
+    public void SelectDataPayloadCap_RemainingSmallerThanCredit_UsesRemaining()
+    {
+        Assert.AreEqual(1000, Http2FlowController.SelectDataPayloadCap(16384, 1000, 16383));
+        Assert.AreEqual(8000, Http2FlowController.SelectDataPayloadCap(16384, 8000, 16383));
+        Assert.AreEqual(0, Http2FlowController.SelectDataPayloadCap(16384, 0, 16383));
+    }
+}

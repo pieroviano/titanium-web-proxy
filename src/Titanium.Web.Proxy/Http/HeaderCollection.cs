@@ -14,30 +14,210 @@ namespace Titanium.Web.Proxy.Http;
 [TypeConverter(typeof(ExpandableObjectConverter))]
 public class HeaderCollection : IEnumerable<HttpHeader>
 {
-    private readonly Dictionary<string, HttpHeader> headers;
+    private Dictionary<string, HttpHeader> headers;
 
-    private readonly Dictionary<string, List<HttpHeader>> nonUniqueHeaders;
+    /// <summary>
+    ///     Lazy: almost all GET/HEAD exchanges use only unique headers. Allocated on first
+    ///     Cookie/Set-Cookie-style duplicate name (see <see cref="EnsureNonUniqueMaps"/>).
+    /// </summary>
+    private Dictionary<string, List<HttpHeader>>? nonUniqueHeaders;
+
+    private Dictionary<string, IReadOnlyList<HttpHeader>>? nonUniqueHeadersReadOnly;
+
+    private static readonly ReadOnlyDictionary<string, IReadOnlyList<HttpHeader>> EmptyNonUniqueHeadersView =
+        new(new Dictionary<string, IReadOnlyList<HttpHeader>>(0, StringComparer.OrdinalIgnoreCase));
+
+    private void EnsureNonUniqueMaps()
+    {
+        if (nonUniqueHeaders is not null)
+            return;
+
+        nonUniqueHeaders = new Dictionary<string, List<HttpHeader>>(2, StringComparer.OrdinalIgnoreCase);
+        nonUniqueHeadersReadOnly =
+            new Dictionary<string, IReadOnlyList<HttpHeader>>(2, StringComparer.OrdinalIgnoreCase);
+        nonUniqueHeadersView = null;
+    }
+
+    /// <summary>
+    ///     Monotonic counter bumped on every mutating API (<see cref="AddHeader"/>, <see cref="RemoveHeader"/>,
+    ///     <see cref="Clear"/>, <see cref="SetOrAddHeaderValue"/>). Used by H2/H3/H1 intercept fast-finish to
+    ///     detect whether session handlers changed headers after the wire decode / lite seed.
+    /// </summary>
+    internal int MutationCount { get; private set; }
+
+    /// <summary>
+    ///     When armed, pure AddHeader of new unique names are logged without a full snapshot
+    ///     (Full MITM append-relay). Other mutations either snapshot (legacy COW) or mark dirty
+    ///     so Take falls back to re-encode.
+    /// </summary>
+    private bool _mitmRelayCowArmed;
+    private int _mitmRelayCowMutationCount;
+    private Dictionary<string, string>? _mitmRelayCowUnique;
+    private Dictionary<string, List<string>>? _mitmRelayCowNonUnique;
+    private int _mitmRelayCowNonUniqueNames;
+    private Helpers.MitmCompressedRelayHelper.AddedHeaderBuffer _mitmRelayAppends;
+    private bool _mitmRelayAppendDirty;
+
+    /// <summary>
+    ///     Arm copy-on-write baseline for MITM unchanged-lite. Call after wire decode, before handlers.
+    ///     Lite (no mutations) never allocates a header snapshot; Full append-only logs adds without
+    ///     cloning the wire header maps.
+    /// </summary>
+    internal void ArmMitmRelayBaseline()
+    {
+        _mitmRelayCowArmed = true;
+        _mitmRelayCowMutationCount = MutationCount;
+        _mitmRelayCowUnique = null;
+        _mitmRelayCowNonUnique = null;
+        _mitmRelayCowNonUniqueNames = 0;
+        _mitmRelayAppends = default;
+        _mitmRelayAppendDirty = false;
+    }
+
+    /// <summary>
+    ///     Build the relay baseline after handlers: MutationCount-only when unchanged, append-log when
+    ///     only new unique headers were added, else the pre-mutation snapshot taken on first complex mutate.
+    /// </summary>
+    internal Helpers.MitmCompressedRelayHelper.HeaderRelayBaseline TakeMitmRelayBaseline()
+    {
+        _mitmRelayCowArmed = false;
+        if (_mitmRelayCowUnique is null)
+        {
+            if (!_mitmRelayAppendDirty && _mitmRelayAppends.Count > 0)
+            {
+                var appendBaseline = Helpers.MitmCompressedRelayHelper.HeaderRelayBaseline.FromAppendLog(
+                    _mitmRelayCowMutationCount, _mitmRelayAppends);
+                _mitmRelayAppends = default;
+                return appendBaseline;
+            }
+
+            _mitmRelayAppends = default;
+            _mitmRelayAppendDirty = false;
+            return Helpers.MitmCompressedRelayHelper.HeaderRelayBaseline.CaptureMutationCountFromCount(
+                _mitmRelayCowMutationCount);
+        }
+
+        var baseline = new Helpers.MitmCompressedRelayHelper.HeaderRelayBaseline(
+            _mitmRelayCowMutationCount, _mitmRelayCowUnique, _mitmRelayCowNonUnique,
+            _mitmRelayCowNonUniqueNames);
+        _mitmRelayCowUnique = null;
+        _mitmRelayCowNonUnique = null;
+        _mitmRelayAppends = default;
+        _mitmRelayAppendDirty = false;
+        return baseline;
+    }
+
+    /// <summary>
+    ///     Move decoded headers from a scratch collection into this empty destination (H2 MITM).
+    ///     Swaps the dictionary instances when this bag is empty so the hot path avoids a second
+    ///     insert pass; scratch keeps the prior empty maps for the next decode.
+    /// </summary>
+    internal void TakeContentsFrom(HeaderCollection source)
+    {
+        if (ReferenceEquals(this, source))
+            return;
+
+        if (headers.Count != 0 || (nonUniqueHeaders is { Count: > 0 }))
+        {
+            foreach (var header in source)
+                AddHeader(header);
+            source.Clear();
+            return;
+        }
+
+        // Swap maps — O(1). Destination inherits MutationCount; scratch is left empty for Reset/reuse.
+        (headers, source.headers) = (source.headers, headers);
+        (nonUniqueHeaders, source.nonUniqueHeaders) = (source.nonUniqueHeaders, nonUniqueHeaders);
+        (nonUniqueHeadersReadOnly, source.nonUniqueHeadersReadOnly) =
+            (source.nonUniqueHeadersReadOnly, nonUniqueHeadersReadOnly);
+        MutationCount = source.MutationCount;
+        source.MutationCount = 0;
+        source._mitmRelayCowArmed = false;
+        source._mitmRelayCowUnique = null;
+        source._mitmRelayCowNonUnique = null;
+        source._mitmRelayCowNonUniqueNames = 0;
+        source._mitmRelayAppends = default;
+        source._mitmRelayAppendDirty = false;
+        headersView = null;
+        nonUniqueHeadersView = null;
+        source.headersView = null;
+        source.nonUniqueHeadersView = null;
+    }
+
+    private void InvalidateMitmRelayAppendLog()
+    {
+        _mitmRelayAppends = default;
+        _mitmRelayAppendDirty = true;
+    }
+
+    private void EnsureMitmRelayCowSnapshot()
+    {
+        if (!_mitmRelayCowArmed || _mitmRelayCowUnique is not null)
+            return;
+
+        // Append-log already committed adds into this collection; falling back to a snapshot of the
+        // *current* maps would treat those adds as baseline. Mark dirty so Take forces re-encode.
+        if (_mitmRelayAppends.Count > 0 || _mitmRelayAppendDirty)
+        {
+            InvalidateMitmRelayAppendLog();
+            return;
+        }
+
+        var unique = new Dictionary<string, string>(headers.Count, StringComparer.OrdinalIgnoreCase);
+        foreach (var kv in headers)
+            unique[kv.Key] = kv.Value.Value;
+
+        Dictionary<string, List<string>>? nonUnique = null;
+        var nonUniqueNames = 0;
+        if (nonUniqueHeaders is { Count: > 0 })
+        {
+            nonUnique = new Dictionary<string, List<string>>(nonUniqueHeaders.Count, StringComparer.OrdinalIgnoreCase);
+            foreach (var kv in nonUniqueHeaders)
+            {
+                var values = new List<string>(kv.Value.Count);
+                foreach (var h in kv.Value)
+                    values.Add(h.Value);
+                nonUnique[kv.Key] = values;
+            }
+
+            nonUniqueNames = nonUniqueHeaders.Count;
+        }
+
+        _mitmRelayCowUnique = unique;
+        _mitmRelayCowNonUnique = nonUnique;
+        _mitmRelayCowNonUniqueNames = nonUniqueNames;
+        _mitmRelayAppends = default;
+        _mitmRelayAppendDirty = false;
+    }
 
     /// <summary>
     ///     Initializes a new instance of the <see cref="HeaderCollection" /> class.
     /// </summary>
     public HeaderCollection()
     {
-        headers = new Dictionary<string, HttpHeader>(StringComparer.OrdinalIgnoreCase);
-        nonUniqueHeaders = new Dictionary<string, List<HttpHeader>>(StringComparer.OrdinalIgnoreCase);
-        Headers = new ReadOnlyDictionary<string, HttpHeader>(headers);
-        NonUniqueHeaders = new ReadOnlyDictionary<string, List<HttpHeader>>(nonUniqueHeaders);
+        // Probe GETs / H2 Lite carry a handful of unique headers; keep the unique map small.
+        // Non-unique maps stay null until a duplicate name is added (Cookie / Set-Cookie / …).
+        headers = new Dictionary<string, HttpHeader>(8, StringComparer.OrdinalIgnoreCase);
     }
+
+    private ReadOnlyDictionary<string, HttpHeader>? headersView;
+    private ReadOnlyDictionary<string, IReadOnlyList<HttpHeader>>? nonUniqueHeadersView;
 
     /// <summary>
     ///     Unique Request header collection.
     /// </summary>
-    public ReadOnlyDictionary<string, HttpHeader> Headers { get; }
+    public ReadOnlyDictionary<string, HttpHeader> Headers =>
+        headersView ??= new ReadOnlyDictionary<string, HttpHeader>(headers);
 
     /// <summary>
-    ///     Non Unique headers.
+    ///     Non-unique headers. Values are read-only views over the internal lists so callers cannot
+    ///     <c>Add</c>/<c>Clear</c> storage that still belongs to this collection.
     /// </summary>
-    public ReadOnlyDictionary<string, List<HttpHeader>> NonUniqueHeaders { get; }
+    public ReadOnlyDictionary<string, IReadOnlyList<HttpHeader>> NonUniqueHeaders =>
+        nonUniqueHeaders is null
+            ? EmptyNonUniqueHeadersView
+            : nonUniqueHeadersView ??=
+                new ReadOnlyDictionary<string, IReadOnlyList<HttpHeader>>(nonUniqueHeadersReadOnly!);
 
     /// <summary>
     ///     Returns an enumerator that iterates through the collection.
@@ -45,14 +225,119 @@ public class HeaderCollection : IEnumerable<HttpHeader>
     /// <returns>
     ///     An enumerator that can be used to iterate through the collection.
     /// </returns>
-    public IEnumerator<HttpHeader> GetEnumerator()
+    /// <remarks>
+    ///     Returns the concrete <see cref="Enumerator" /> struct rather than an interface type, matching
+    ///     the pattern used by <see cref="List{T}" />/<see cref="Dictionary{TKey, TValue}" /> in the BCL:
+    ///     a <c>foreach</c> over a variable statically typed as <see cref="HeaderCollection" /> binds to
+    ///     this overload directly and allocates nothing, whereas the previous implementation (chaining
+    ///     <see cref="Enumerable.Concat{TSource}" /> and <see cref="Enumerable.SelectMany{TSource, TResult}" />
+    ///     over the two backing dictionaries) allocated two LINQ iterator objects on every call. This
+    ///     matters here specifically because every outgoing request and response header block is
+    ///     enumerated at least once to serialize it onto the wire, making this one of the hottest paths
+    ///     in the proxy. Code that holds this collection through the <see cref="IEnumerable{T}" />
+    ///     interface (e.g. LINQ operators) still gets a correct enumerator via the explicit interface
+    ///     implementation below, at the cost of one boxing allocation - unavoidable through that surface,
+    ///     and unchanged from before this optimization.
+    /// </remarks>
+    public Enumerator GetEnumerator()
     {
-        return headers.Values.Concat(nonUniqueHeaders.Values.SelectMany(x => x)).GetEnumerator();
+        return new Enumerator(this);
+    }
+
+    IEnumerator<HttpHeader> IEnumerable<HttpHeader>.GetEnumerator()
+    {
+        return GetEnumerator();
     }
 
     IEnumerator IEnumerable.GetEnumerator()
     {
         return GetEnumerator();
+    }
+
+    /// <summary>
+    ///     Walks first the unique-header dictionary's values, then each list in the non-unique-header
+    ///     dictionary's values in turn - the same effective order as the previous
+    ///     <c>Concat(...SelectMany(...))</c> implementation - without allocating any LINQ iterator
+    ///     objects. See the remarks on <see cref="GetEnumerator" /> for why this is worth a hand-written
+    ///     enumerator instead of the equivalent LINQ expression.
+    /// </summary>
+    public struct Enumerator : IEnumerator<HttpHeader>
+    {
+        private Dictionary<string, HttpHeader>.ValueCollection.Enumerator uniqueEnumerator;
+        private Dictionary<string, List<HttpHeader>>.ValueCollection.Enumerator nonUniqueOuterEnumerator;
+        private List<HttpHeader>.Enumerator nonUniqueInnerEnumerator;
+        private bool doneWithUnique;
+        private bool hasInnerEnumerator;
+        private readonly bool hasNonUnique;
+
+        internal Enumerator(HeaderCollection collection)
+        {
+            uniqueEnumerator = collection.headers.Values.GetEnumerator();
+            hasNonUnique = collection.nonUniqueHeaders is { Count: > 0 };
+            nonUniqueOuterEnumerator = hasNonUnique
+                ? collection.nonUniqueHeaders!.Values.GetEnumerator()
+                : default;
+            nonUniqueInnerEnumerator = default;
+            doneWithUnique = false;
+            hasInnerEnumerator = false;
+            Current = null!;
+        }
+
+        public HttpHeader Current { get; private set; }
+
+        object IEnumerator.Current => Current;
+
+        public bool MoveNext()
+        {
+            if (!doneWithUnique)
+            {
+                if (uniqueEnumerator.MoveNext())
+                {
+                    Current = uniqueEnumerator.Current;
+                    return true;
+                }
+
+                doneWithUnique = true;
+            }
+
+            if (!hasNonUnique)
+            {
+                Current = null!;
+                return false;
+            }
+
+            while (true)
+            {
+                if (hasInnerEnumerator)
+                {
+                    if (nonUniqueInnerEnumerator.MoveNext())
+                    {
+                        Current = nonUniqueInnerEnumerator.Current;
+                        return true;
+                    }
+
+                    hasInnerEnumerator = false;
+                }
+
+                if (!nonUniqueOuterEnumerator.MoveNext())
+                {
+                    Current = null!;
+                    return false;
+                }
+
+                nonUniqueInnerEnumerator = nonUniqueOuterEnumerator.Current.GetEnumerator();
+                hasInnerEnumerator = true;
+            }
+        }
+
+        public void Reset()
+        {
+            throw new NotSupportedException();
+        }
+
+        public void Dispose()
+        {
+        }
     }
 
     /// <summary>
@@ -62,7 +347,8 @@ public class HeaderCollection : IEnumerable<HttpHeader>
     /// <returns></returns>
     public bool HeaderExists(string name)
     {
-        return headers.ContainsKey(name) || nonUniqueHeaders.ContainsKey(name);
+        return headers.ContainsKey(name) ||
+               (nonUniqueHeaders is not null && nonUniqueHeaders.ContainsKey(name));
     }
 
     /// <summary>
@@ -73,13 +359,14 @@ public class HeaderCollection : IEnumerable<HttpHeader>
     /// <returns></returns>
     public List<HttpHeader>? GetHeaders(string name)
     {
-        if (headers.ContainsKey(name))
+        if (headers.TryGetValue(name, out var header))
             return new List<HttpHeader>
             {
-                headers[name]
+                header
             };
 
-        if (nonUniqueHeaders.ContainsKey(name)) return new List<HttpHeader>(nonUniqueHeaders[name]);
+        if (nonUniqueHeaders is not null && nonUniqueHeaders.TryGetValue(name, out var nonUnique))
+            return new List<HttpHeader>(nonUnique);
 
         return null;
     }
@@ -88,7 +375,7 @@ public class HeaderCollection : IEnumerable<HttpHeader>
     {
         if (headers.TryGetValue(name, out var header)) return header;
 
-        if (nonUniqueHeaders.TryGetValue(name, out var h)) return h.FirstOrDefault();
+        if (nonUniqueHeaders is not null && nonUniqueHeaders.TryGetValue(name, out var h)) return h.FirstOrDefault();
 
         return null;
     }
@@ -97,9 +384,21 @@ public class HeaderCollection : IEnumerable<HttpHeader>
     {
         if (headers.TryGetValue(name.String, out var header)) return header;
 
-        if (nonUniqueHeaders.TryGetValue(name.String, out var h)) return h.FirstOrDefault();
+        if (nonUniqueHeaders is not null && nonUniqueHeaders.TryGetValue(name.String, out var h)) return h.FirstOrDefault();
 
         return null;
+    }
+
+    /// <summary>
+    ///     True when exactly one header of this name exists (not the duplicate/non-unique bag).
+    /// </summary>
+    internal bool TryGetUniqueHeader(KnownHeader name, out HttpHeader header)
+    {
+        if (headers.TryGetValue(name.String, out header!))
+            return true;
+
+        header = null!;
+        return false;
     }
 
     /// <summary>
@@ -108,10 +407,25 @@ public class HeaderCollection : IEnumerable<HttpHeader>
     /// <returns></returns>
     public List<HttpHeader> GetAllHeaders()
     {
-        var result = new List<HttpHeader>();
+        // Pre-sized and hand-iterated instead of `headers.Select(...)`/`nonUniqueHeaders.SelectMany(...)`:
+        // this is called once per HTTP/3 request/response (see Http3RequestStream/Http3OriginBridge), so
+        // the LINQ iterator allocations were a repeated per-message cost for no benefit over a plain loop.
+        // headers.Count + nonUniqueHeaders.Count undercounts when any non-unique entry has more than one
+        // value, but it is still a better starting capacity than the default (0), and List<T> grows from
+        // there exactly as it would have without this hint.
+        var nonUniqueCount = nonUniqueHeaders?.Count ?? 0;
+        var result = new List<HttpHeader>(headers.Count + nonUniqueCount);
 
-        result.AddRange(headers.Select(x => x.Value));
-        result.AddRange(nonUniqueHeaders.SelectMany(x => x.Value));
+        foreach (var header in headers.Values) result.Add(header);
+
+        if (nonUniqueHeaders is not null)
+        {
+            foreach (var list in nonUniqueHeaders.Values)
+            {
+                foreach (var header in list)
+                    result.Add(header);
+            }
+        }
 
         return result;
     }
@@ -142,8 +456,22 @@ public class HeaderCollection : IEnumerable<HttpHeader>
     /// <param name="newHeader"></param>
     public void AddHeader(HttpHeader newHeader)
     {
+        if (_mitmRelayCowArmed && _mitmRelayCowUnique is null && !_mitmRelayAppendDirty
+            && !headers.ContainsKey(newHeader.Name)
+            && (nonUniqueHeaders is null || !nonUniqueHeaders.ContainsKey(newHeader.Name))
+            && _mitmRelayAppends.Count < Helpers.MitmCompressedRelayHelper.DefaultMaxAppendHeaders)
+        {
+            // Pure append of a new unique name: log for compressed relay without cloning wire headers.
+            _mitmRelayAppends.Add(newHeader);
+            MutationCount++;
+            headers.Add(newHeader.Name, newHeader);
+            return;
+        }
+
+        EnsureMitmRelayCowSnapshot();
+        MutationCount++;
         // if header exist in non-unique header collection add it there
-        if (nonUniqueHeaders.TryGetValue(newHeader.Name, out var list))
+        if (nonUniqueHeaders is not null && nonUniqueHeaders.TryGetValue(newHeader.Name, out var list))
         {
             list.Add(newHeader);
             return;
@@ -154,11 +482,14 @@ public class HeaderCollection : IEnumerable<HttpHeader>
         {
             headers.Remove(newHeader.Name);
 
-            nonUniqueHeaders.Add(newHeader.Name, new List<HttpHeader>
+            var moved = new List<HttpHeader>
             {
                 existing,
                 newHeader
-            });
+            };
+            EnsureNonUniqueMaps();
+            nonUniqueHeaders!.Add(newHeader.Name, moved);
+            nonUniqueHeadersReadOnly!.Add(newHeader.Name, new ReadOnlyCollection<HttpHeader>(moved));
         }
         else
         {
@@ -182,7 +513,7 @@ public class HeaderCollection : IEnumerable<HttpHeader>
     ///     Adds the given header objects to Request
     /// </summary>
     /// <param name="newHeaders"></param>
-    public void AddHeaders(IEnumerable<KeyValuePair<string, string>> newHeaders)
+    public void AddHeaders(IEnumerable<KeyValuePair<string, string>>? newHeaders)
     {
         if (newHeaders == null) return;
 
@@ -200,7 +531,7 @@ public class HeaderCollection : IEnumerable<HttpHeader>
         foreach (var header in newHeaders)
         {
             if (header.Key != header.Value.Name)
-                throw new Exception(
+                throw new ArgumentException(
                     "Header name mismatch. Key and the name of the HttpHeader object should be the same.");
 
             AddHeader(header.Value);
@@ -217,11 +548,17 @@ public class HeaderCollection : IEnumerable<HttpHeader>
     /// </returns>
     public bool RemoveHeader(string headerName)
     {
+        EnsureMitmRelayCowSnapshot();
         var result = headers.Remove(headerName);
 
         // do not convert to '||' expression to avoid lazy evaluation
-        if (nonUniqueHeaders.Remove(headerName)) result = true;
+        if (nonUniqueHeaders is not null && nonUniqueHeaders.Remove(headerName))
+        {
+            nonUniqueHeadersReadOnly!.Remove(headerName);
+            result = true;
+        }
 
+        if (result) MutationCount++;
         return result;
     }
 
@@ -235,11 +572,17 @@ public class HeaderCollection : IEnumerable<HttpHeader>
     /// </returns>
     public bool RemoveHeader(KnownHeader headerName)
     {
+        EnsureMitmRelayCowSnapshot();
         var result = headers.Remove(headerName.String);
 
         // do not convert to '||' expression to avoid lazy evaluation
-        if (nonUniqueHeaders.Remove(headerName.String)) result = true;
+        if (nonUniqueHeaders is not null && nonUniqueHeaders.Remove(headerName.String))
+        {
+            nonUniqueHeadersReadOnly!.Remove(headerName.String);
+            result = true;
+        }
 
+        if (result) MutationCount++;
         return result;
     }
 
@@ -249,17 +592,25 @@ public class HeaderCollection : IEnumerable<HttpHeader>
     /// <param name="header">Returns true if header exists and was removed </param>
     public bool RemoveHeader(HttpHeader header)
     {
-        if (headers.ContainsKey(header.Name))
+        EnsureMitmRelayCowSnapshot();
+        if (headers.TryGetValue(header.Name, out var existing))
         {
-            if (headers[header.Name].Equals(header))
+            if (!existing.Equals(header)) return false;
+            if (headers.Remove(header.Name))
             {
-                headers.Remove(header.Name);
+                MutationCount++;
                 return true;
             }
+
+            return false;
         }
-        else if (nonUniqueHeaders.ContainsKey(header.Name))
+
+        if (nonUniqueHeaders is not null &&
+            nonUniqueHeaders.TryGetValue(header.Name, out var matchingHeaders) &&
+            matchingHeaders.RemoveAll(x => x.Equals(header)) > 0)
         {
-            if (nonUniqueHeaders[header.Name].RemoveAll(x => x.Equals(header)) > 0) return true;
+            MutationCount++;
+            return true;
         }
 
         return false;
@@ -270,8 +621,89 @@ public class HeaderCollection : IEnumerable<HttpHeader>
     /// </summary>
     public void Clear()
     {
+        EnsureMitmRelayCowSnapshot();
+        if (headers.Count > 0 || (nonUniqueHeaders is { Count: > 0 }))
+            MutationCount++;
         headers.Clear();
-        nonUniqueHeaders.Clear();
+        nonUniqueHeaders?.Clear();
+        nonUniqueHeadersReadOnly?.Clear();
+    }
+
+    /// <summary>
+    ///     Reset a connection-scoped HPACK decode scratch without MutationCount / COW side effects.
+    ///     Safe only when this collection is not a live Request/Response header bag.
+    /// </summary>
+    internal void ResetForDecodeScratch()
+    {
+        headers.Clear();
+        nonUniqueHeaders?.Clear();
+        nonUniqueHeadersReadOnly?.Clear();
+        MutationCount = 0;
+        _mitmRelayCowArmed = false;
+        _mitmRelayCowUnique = null;
+        _mitmRelayCowNonUnique = null;
+        _mitmRelayCowNonUniqueNames = 0;
+        _mitmRelayAppends = default;
+        _mitmRelayAppendDirty = false;
+    }
+
+    /// <summary>
+    ///     Rewrites Title-Case HTTP/1.1 field names to lowercase ASCII in place (RFC 9113 / 9114).
+    ///     Used before HPACK/QPACK encode so the hot path can skip per-field <c>ToLowerInvariant</c>.
+    ///     No-op when names are already lowercase (common for HTTP/2 origins and some H1 stacks).
+    /// </summary>
+    internal void NormalizeNamesToLowercaseAscii()
+    {
+        var needsRename = false;
+        foreach (var header in this) // NOSONAR S3267 -- Explicit loop avoids LINQ enumerator allocation on hot path.
+        {
+            if (HeaderNameDataHasUpperCaseAscii(header.NameData))
+            {
+                needsRename = true;
+                break;
+            }
+        }
+
+        if (!needsRename)
+            return;
+
+        var renamed = new List<HttpHeader>(headers.Count + (nonUniqueHeaders?.Count ?? 0));
+        foreach (var header in this)
+        {
+            var nameData = header.NameData;
+            if (HeaderNameDataHasUpperCaseAscii(nameData))
+                nameData = AsciiToLowerByteString(nameData);
+            renamed.Add(new HttpHeader(nameData, header.ValueData));
+        }
+
+        Clear();
+        foreach (var header in renamed)
+            AddHeader(header);
+    }
+
+    private static bool HeaderNameDataHasUpperCaseAscii(ByteString name)
+    {
+        var span = name.Span;
+        for (var i = 0; i < span.Length; i++)
+        {
+            if (span[i] is >= (byte)'A' and <= (byte)'Z')
+                return true;
+        }
+
+        return false;
+    }
+
+    private static ByteString AsciiToLowerByteString(ByteString name)
+    {
+        var span = name.Span;
+        var buf = new byte[span.Length];
+        for (var i = 0; i < span.Length; i++)
+        {
+            var c = span[i];
+            buf[i] = c is >= (byte)'A' and <= (byte)'Z' ? (byte)(c + 32) : c;
+        }
+
+        return new ByteString(buf);
     }
 
     internal string? GetHeaderValueOrNull(KnownHeader headerName)
@@ -290,17 +722,74 @@ public class HeaderCollection : IEnumerable<HttpHeader>
         }
 
         if (headers.TryGetValue(headerName.String, out var header))
-            header.SetValue(value);
+        {
+            EnsureMitmRelayCowSnapshot();
+            MutationCount++;
+            if (header.IsSharedStaticTableEntry)
+                headers[headerName.String] = new HttpHeader(headerName, value);
+            else
+                header.SetValue(value);
+        }
         else
-            headers.Add(headerName.String, new HttpHeader(headerName, value));
+        {
+            AddHeader(new HttpHeader(headerName, value));
+        }
     }
 
     internal void SetOrAddHeaderValue(KnownHeader headerName, KnownHeader value)
     {
         if (headers.TryGetValue(headerName.String, out var header))
-            header.SetValue(value);
+        {
+            EnsureMitmRelayCowSnapshot();
+            MutationCount++;
+            if (header.IsSharedStaticTableEntry)
+                headers[headerName.String] = new HttpHeader(headerName, value);
+            else
+                header.SetValue(value);
+        }
         else
-            headers.Add(headerName.String, new HttpHeader(headerName, value));
+        {
+            AddHeader(new HttpHeader(headerName, value));
+        }
+    }
+
+    /// <summary>
+    ///     RFC 9112 §6.3: a message MUST NOT carry both Transfer-Encoding and Content-Length.
+    ///     Recipients must either reject the message or remove Content-Length and honour TE.
+    ///     Stripping Content-Length closes the request-smuggling ambiguity while remaining
+    ///     interoperable with origins that incorrectly send both.
+    ///     Also validates that "chunked" is the final Transfer-Encoding coding when present.
+    /// </summary>
+    internal void NormalizeMessageFraming()
+    {
+        // RFC 9112 §6.3: CL + TE conflict → strip CL (request-smuggling defence).
+        if (HeaderExists(KnownHeaders.TransferEncoding.String) &&
+            HeaderExists(KnownHeaders.ContentLength.String))
+            RemoveHeader(KnownHeaders.ContentLength);
+
+        // Validate Transfer-Encoding chain: chunked must be the final coding if present.
+        var teHeader = GetHeaderValueOrNull(KnownHeaders.TransferEncoding.String);
+        if (teHeader != null)
+        {
+            var codings = teHeader.Split(',')
+                .Select(s => s.Trim().ToLowerInvariant())
+                .Where(s => s.Length > 0)
+                .ToList();
+
+            if (codings.Count > 1)
+            {
+                // If "chunked" appears in a non-final position, normalize to just "chunked"
+                // to remove the framing ambiguity.
+                for (var i = 0; i < codings.Count - 1; i++)
+                {
+                    if (codings[i] == "chunked")
+                    {
+                        SetOrAddHeaderValue(KnownHeaders.TransferEncoding.String, "chunked");
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     /// <summary>
@@ -313,5 +802,7 @@ public class HeaderCollection : IEnumerable<HttpHeader>
         RemoveHeader(KnownHeaders.ProxyConnection);
 
         if (proxyHeader != null) SetOrAddHeaderValue(KnownHeaders.Connection, proxyHeader);
+
+        NormalizeMessageFraming();
     }
 }

@@ -1,0 +1,638 @@
+using System;
+using System.IO;
+using System.Net;
+using System.Net.Security;
+using System.Net.Sockets;
+using System.Threading;
+using System.Threading.Tasks;
+using Titanium.Web.Proxy.Diagnostics;
+using Titanium.Web.Proxy.EventArguments;
+using Titanium.Web.Proxy.Exceptions;
+using Titanium.Web.Proxy.Extensions;
+using Titanium.Web.Proxy.Helpers;
+using Titanium.Web.Proxy.Http;
+using Titanium.Web.Proxy.Logging;
+using Titanium.Web.Proxy.Models;
+using Titanium.Web.Proxy.Options;
+using Titanium.Web.Proxy.Network.WinAuth.Security;
+using Titanium.Web.Proxy.Routing;
+
+namespace Titanium.Web.Proxy;
+
+/// <summary>
+///     Handle the response from server.
+/// </summary>
+public partial class ProxyServer
+{
+    /// <summary>
+    ///     Called asynchronously when a request was successful and we received the response.
+    /// </summary>
+    /// <param name="args">The session event arguments.</param>
+    /// <returns> The task.</returns>
+    private async Task HandleHttpSessionResponse(SessionEventArgs args) // NOSONAR S3776 -- This protocol/state-machine path shares mutable parsing or transport state; splitting it further would create disproportionate regression risk.
+    {
+        var cancellationToken = args.CancellationToken;
+
+        try
+        {
+            // read response & headers from server (response-header deadline / idle-read for exempt paths)
+            await ReceiveOriginResponseWithTimeout(args, cancellationToken);
+
+            // Relay/consume every interim (1xx) response that precedes the final response on this connection.
+            // 100 Continue is discarded exactly as before - per spec, "the client can simply discard this
+            // interim response" (the proxy itself already consumed/acted on it, if at all, while sending the
+            // request body in HttpWebClient.SendRequest). Any other 1xx (e.g. 103 Early Hints) has no dedicated
+            // event yet, so it is relayed to the client verbatim - interim responses never carry a body
+            // (RFC 9110 §15.2) - and the proxy loops back onto the same connection for the next message.
+            // 101 Switching Protocols is excluded: it *is* the final message of this exchange (the connection
+            // becomes a raw tunnel immediately afterwards), so it must fall through to the normal
+            // response-handling path below instead of looping. Interim responses are not exposed through
+            // BeforeResponse; only the final response is.
+            while (args.HttpClient.Response.StatusCode is >= 100 and <= 199
+                   and not (int)HttpStatusCode.SwitchingProtocols)
+            {
+                if (args.HttpClient.Response.StatusCode != (int)HttpStatusCode.Continue)
+                {
+                    await args.ClientStream.WriteResponseAsync(args.HttpClient.Response, cancellationToken);
+                    args.IsClientResponseCommitted = true;
+                }
+
+                await args.ClearResponse(cancellationToken);
+                await ReceiveOriginResponseWithTimeout(args, cancellationToken);
+            }
+
+            args.Timing?.MarkResponseHeadersReceived();
+        }
+        catch (ProxyTimeoutException ex)
+        {
+            await HandleProxyTimeoutAsync(args, ex, cancellationToken);
+            return;
+        }
+
+        var response = args.HttpClient.Response;
+        args.ReRequest = false;
+
+        // check for windows authentication
+        var serverWinAuthReRequest = false;
+        if (args.EnableWinAuth)
+        {
+            if (response.StatusCode == (int)HttpStatusCode.Unauthorized)
+            {
+                await Handle401UnAuthorized(args);
+
+                // A 401 that triggers a re-request is a connection-oriented NTLM/Negotiate
+                // handshake leg (ISC_REQ_CONNECTION); it must continue on the SAME server connection.
+                serverWinAuthReRequest = args.ReRequest;
+            }
+            // don't mark the connection as authenticated on a 407, otherwise the
+            // upstream proxy authentication state below would be corrupted.
+            else if (response.StatusCode != (int)HttpStatusCode.ProxyAuthenticationRequired)
+                WinAuthEndPoint.AuthenticatedResponse(args.HttpClient.Data);
+        }
+
+        if (response.StatusCode == (int)HttpStatusCode.ProxyAuthenticationRequired)
+            await Handle407ProxyAuthorization(args);
+
+        // Validate wire framing (Content-Length/Transfer-Encoding ambiguity) before anything -
+        // SetOriginalHeaders, BeforeResponse, body reads, forwarding, pooling - can observe
+        // pre-normalization values. The proxy is the recipient of this origin response, so a
+        // framing-ambiguous response can never be safely relayed or its server connection reused/
+        // pooled/retried: report it to our own client as a gateway failure (502), not as whatever
+        // status a compliant *origin* would have used for a malformed request.
+        try
+        {
+            Http1FramingValidator.Validate(response, ResolveHttp1WireFramingSource(args),
+                args.Server.PolicyModes.AllowAmbiguousFraming);
+        }
+        catch (Http1FramingException framingEx)
+        {
+            ProxyMetrics.ParserError("framing");
+            args.Exception = framingEx;
+            ProxyDiagnostics.ReportBenign(logger, "Origin response has ambiguous HTTP/1 framing", framingEx);
+            args.GenericResponse($"Bad Gateway. {framingEx.Message}", HttpStatusCode.BadGateway,
+                closeServerConnection: true);
+            await args.ClientStream.WriteResponseAsync(args.HttpClient.Response, cancellationToken);
+            args.IsClientResponseCommitted = true;
+            return;
+        }
+
+        // save original values so that if user changes them
+        // we can still use original values when syphoning out data from attached tcp connection.
+        response.SetOriginalHeaders();
+
+        MaybeInjectClientAltSvc(args);
+
+        // if user requested call back then do it
+        if (!response.Locked && !args.IsFastPath) await OnBeforeResponse(args);
+
+        // it may changed in the user event
+        response = args.HttpClient.Response;
+        await TryFillHttpResponseCacheAsync(args, cancellationToken);
+        ApplyResponseHeaderContributor(response);
+
+        var clientStream = args.ClientStream;
+
+        // user set custom response by ignoring original response from server.
+        if (response.Locked)
+        {
+            // write custom user response with body and return.
+            await clientStream.WriteResponseAsync(response, cancellationToken);
+            args.IsClientResponseCommitted = true;
+
+            // if the user requested a streamed body, produce it now without buffering.
+            if (response.StreamBodyWriter != null && !response.IsBodySent)
+            {
+                var bodyWriter = new BodyStreamWriter(clientStream, response.IsChunked);
+                await response.StreamBodyWriter(bodyWriter, cancellationToken);
+                await bodyWriter.CompleteAsync(response.HasTrailingHeaders ? response.TrailingHeaders : null,
+                    cancellationToken);
+                response.IsBodySent = true;
+            }
+
+            if (args.HttpClient.HasConnection && !args.HttpClient.CloseServerConnection)
+                // syphon out the original response body from server connection
+                // so that connection will be good to be reused.
+                await args.SyphonOutBodyAsync(false, cancellationToken);
+
+            return;
+        }
+
+        // if user requested to send request again
+        // likely after making modifications from User Response Handler
+        if (args.ReRequest)
+        {
+            var serverConnection = args.HttpClient.HasConnection ? args.HttpClient.Connection : null;
+
+            // Connection-oriented auth handshakes must reuse the SAME server connection for every leg:
+            //  - a 407 from an upstream proxy (proxy authentication), and
+            //  - a 401 from the origin server handled by NTLM/Negotiate (server authentication).
+            // Any other re-request (e.g. user-initiated from the response handler) may target a
+            // different destination, so it gets a fresh connection.
+            var keepConnectionForAuth = args.HttpClient.HasConnection &&
+                                        ShouldReuseConnectionForAuthReRequest(response.StatusCode,
+                                            serverWinAuthReRequest);
+
+            // Always drain the challenge response body from the current server connection first,
+            // so the connection is clean before it is reused or released.
+            // (Never release/pool a connection while its body is still on the wire.)
+            await args.ClearResponse(cancellationToken);
+
+            if (args.HttpClient.HasConnection && !keepConnectionForAuth)
+            {
+                serverConnection = null;
+                await TcpConnectionFactory.Release(args.HttpClient.Connection);
+            }
+
+            var result = await HandleHttpSessionRequest(args, serverConnection,
+                args.ClientConnection.NegotiatedApplicationProtocol,
+                cancellationToken, args.CancellationTokenSource);
+            if (result.LatestConnection != null) args.HttpClient.SetConnection(result.LatestConnection);
+
+            return;
+        }
+
+        response.Locked = true;
+
+        // FramingValidator already ran wire CL/TE rules above. Explicit proxy still needs
+        // Proxy-Connection rewriting; transparent/SOCKS skip a redundant NormalizeMessageFraming.
+        if (!args.IsTransparent && !args.IsSocks)
+        {
+            response.Headers.FixProxyHeaders();
+            // Via injection on outgoing response (RFC 9110 §7.6.3).
+            if (!args.IsFastPath && !string.IsNullOrEmpty(ViaHeaderPseudonym))
+                AddViaHeader(response.Headers, args.HttpClient.Response.HttpVersion, ViaHeaderPseudonym);
+        }
+
+        // HTTP/1.0 clients do not support chunked transfer encoding (RFC 7230 §4.1 / RFC 1945).
+        // Buffer the body so it can be reframed with a Content-Length header instead.
+        if (args.HttpClient.Request.HttpVersion == HttpHeader.Version10 && response.IsChunked)
+        {
+            await args.GetResponseBody(cancellationToken);
+            // ContentLength setter also removes Transfer-Encoding: chunked via IsChunked = false.
+            response.ContentLength = response.Body.Length;
+        }
+
+        await clientStream.WriteResponseAsync(response, cancellationToken);
+        args.IsClientResponseCommitted = true;
+
+        if (response.OriginalHasBody)
+        {
+            if (response.IsBodySent)
+            {
+                // syphon out body
+                await args.SyphonOutBodyAsync(false, cancellationToken);
+            }
+            else
+            {
+                // Copy body if exists (idle-read window on stalled transfers)
+                var serverStream = args.HttpClient.Connection.Stream;
+                try
+                {
+                    using var idleDeadline = args.Deadlines.Start(cancellationToken,
+                        ResolveIdleReadTimeout(args), ProxyTimeoutKind.IdleRead);
+                    try
+                    {
+                        await serverStream.CopyBodyAsync(response, false, clientStream, TransformationMode.None,
+                            false, args, idleDeadline.Token);
+                    }
+                    catch (OperationCanceledException ex)
+                    {
+                        idleDeadline.ThrowIfTimedOut(ex);
+                    }
+                }
+                catch (ProxyTimeoutException ex)
+                {
+                    // Response status already committed — terminate cleanly without injecting HTTP.
+                    await HandleProxyTimeoutAsync(args, ex, cancellationToken);
+                    return;
+                }
+            }
+
+            response.IsBodyReceived = true;
+        }
+    }
+
+    /// <summary>
+    ///     Waits for origin response status/headers under the effective response-header deadline,
+    ///     or under idle-read when the session is exempt from short header deadlines.
+    /// </summary>
+    private async Task ReceiveOriginResponseWithTimeout(SessionEventArgs args, CancellationToken cancellationToken)
+    {
+        var headerTimeout = ResolveResponseHeaderTimeout(args);
+        var kind = headerTimeout.HasValue ? ProxyTimeoutKind.ResponseHeader : ProxyTimeoutKind.IdleRead;
+        var timeout = headerTimeout ?? ResolveIdleReadTimeout(args);
+
+        using var deadline = args.Deadlines.Start(cancellationToken, timeout, kind);
+        try
+        {
+            await args.HttpClient.ReceiveResponse(deadline.Token);
+        }
+        catch (OperationCanceledException ex)
+        {
+            deadline.ThrowIfTimedOut(ex);
+        }
+    }
+
+    /// <summary>
+    ///     Surfaces a typed timeout through diagnostics. Before any client response bytes are committed,
+    ///     writes HTTP 504 Gateway Timeout; afterwards only terminates the session.
+    /// </summary>
+    private async Task HandleProxyTimeoutAsync(SessionEventArgs args, ProxyTimeoutException ex,
+        CancellationToken cancellationToken)
+    {
+        args.Exception = ex;
+        args.HttpClient.CloseServerConnection = true;
+        ProxyLog.LimitExceeded(logger, TimeoutLimitId(ex.Kind), PolicyMode.Enforce,
+            (long)(ex.ObservedElapsed?.TotalMilliseconds ?? 0), FormatConfiguredLimit(ex), "504",
+            args.HttpClient.Request.Host);
+        ProxyDiagnostics.ReportBenign(logger, $"Proxy {ex.Kind} timeout", ex);
+
+        // 504 only before any response bytes have been committed; afterward terminate without injecting HTTP.
+        if (!args.IsClientResponseCommitted && !args.HttpClient.Response.Locked)
+        {
+            try
+            {
+                args.GenericResponse("Gateway Timeout", HttpStatusCode.GatewayTimeout,
+                    closeServerConnection: true);
+                await args.ClientStream.WriteResponseAsync(args.HttpClient.Response, cancellationToken);
+                args.IsClientResponseCommitted = true;
+            }
+            catch (Exception writeEx)
+            {
+                ProxyDiagnostics.ReportBenign(logger, "Failed to write 504 Gateway Timeout after proxy timeout",
+                    writeEx);
+            }
+        }
+
+        if (!args.CancellationTokenSource.IsCancellationRequested)
+            await args.CancellationTokenSource.CancelAsync();
+    }
+
+    /// <summary>
+    ///     True when <paramref name="ex" /> is an origin-side transport failure that happened before any
+    ///     response byte was committed to the client, so a 502/504 can still be delivered. Never true once
+    ///     the client response is committed or locked (user-supplied), or when the client is already gone.
+    /// </summary>
+    internal static bool ShouldAnswerOriginFailure(SessionEventArgs args, Exception ex,
+        CancellationTokenSource cancellationTokenSource)
+    {
+        if (args.IsClientResponseCommitted || args.HttpClient.Response.Locked) return false;
+        if (cancellationTokenSource.IsCancellationRequested) return false;
+        return ex is SocketException
+            or RetryableServerConnectionException
+            or System.Security.Authentication.AuthenticationException
+            or IOException;
+    }
+
+    /// <summary>
+    ///     Best-effort 502 (or 504 for socket timeouts) with a short, non-sensitive explanation. Write
+    ///     failures (client already gone) are swallowed: the original exception still propagates.
+    /// </summary>
+    private async Task TryWriteOriginFailureResponseAsync(SessionEventArgs args, Exception ex,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var host = args.HttpClient.Request.Host ?? string.Empty;
+            var socketError = ex as SocketException;
+            var status = socketError?.SocketErrorCode == SocketError.TimedOut
+                ? HttpStatusCode.GatewayTimeout
+                : HttpStatusCode.BadGateway;
+            var reason = socketError?.SocketErrorCode switch
+            {
+                SocketError.HostNotFound or SocketError.NoData or SocketError.TryAgain =>
+                    "the host name could not be resolved",
+                SocketError.ConnectionRefused => "the connection was refused",
+                SocketError.TimedOut => "the connection timed out",
+                SocketError.NetworkUnreachable or SocketError.HostUnreachable => "the host is unreachable",
+                SocketError.ConnectionReset or SocketError.ConnectionAborted => "the connection was reset",
+                _ => ex is System.Security.Authentication.AuthenticationException
+                    ? "the TLS handshake with the origin failed"
+                    : "the origin closed the connection before sending a response"
+            };
+
+            args.GenericResponse(
+                $"{(int)status} {(status == HttpStatusCode.GatewayTimeout ? "Gateway Timeout" : "Bad Gateway")}: " +
+                $"could not get a response from '{WebUtility.HtmlEncode(host)}' ({reason}).",
+                status, closeServerConnection: true);
+            args.HttpClient.Response.Headers.AddHeader(KnownHeaders.Connection, KnownHeaders.ConnectionClose);
+            await args.ClientStream.WriteResponseAsync(args.HttpClient.Response, cancellationToken);
+            args.IsClientResponseCommitted = true;
+        }
+        catch (Exception writeEx)
+        {
+            ProxyDiagnostics.ReportBenign(logger, "Failed to write 502/504 after origin failure", writeEx);
+        }
+    }
+
+    /// <summary>
+    ///     Names the configured limit that elapsed (e.g. <c>20s</c>) so the log reads
+    ///     <c>ConnectTimeOutSeconds=20s; observed 20012</c> instead of echoing the timeout kind.
+    /// </summary>
+    internal static string FormatConfiguredLimit(ProxyTimeoutException ex)
+    {
+        if (ex.ConfiguredTimeout is not { } limit) return "unknown";
+        return limit.TotalSeconds >= 1
+            ? $"{limit.TotalSeconds.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)}s"
+            : $"{(int)limit.TotalMilliseconds}ms";
+    }
+
+    private static LimitId TimeoutLimitId(ProxyTimeoutKind kind) => kind switch
+    {
+        ProxyTimeoutKind.Connect => LimitId.TimeoutConnect,
+        ProxyTimeoutKind.ResponseHeader => LimitId.TimeoutResponseHeader,
+        ProxyTimeoutKind.IdleRead => LimitId.TimeoutIdleRead,
+        ProxyTimeoutKind.IdleWrite => LimitId.TimeoutIdleWrite,
+        ProxyTimeoutKind.Request => LimitId.TimeoutRequest,
+        ProxyTimeoutKind.ClientHeader => LimitId.TimeoutClientHeader,
+        _ => LimitId.TimeoutRequest
+    };
+
+    /// <summary>
+    ///     Decides whether a re-request must reuse the same server connection.
+    ///     Connection-oriented authentication handshakes (proxy 407, or a server 401 handled by
+    ///     NTLM/Negotiate) require every leg to travel over the same TCP connection.
+    /// </summary>
+    internal static bool ShouldReuseConnectionForAuthReRequest(int responseStatusCode, bool serverWinAuthReRequest)
+    {
+        return responseStatusCode == (int)HttpStatusCode.ProxyAuthenticationRequired || serverWinAuthReRequest;
+    }
+
+    /// <summary>
+    ///     Invoke before response if it is set.
+    /// </summary>
+    /// <param name="args"></param>
+    /// <returns></returns>
+    private async Task OnBeforeResponse(SessionEventArgs args)
+    {
+        if (args.IsFastPath)
+            return;
+
+        // Staged ResponseHeaderSet/Remove from route transforms (null when unused).
+        ReverseProxySessionDispatch.ApplyResponseTransforms(args);
+
+        // Rewrite gRPC → JSON before user handlers when the request was transcoded.
+        if (ReverseProxy?.GrpcJsonTranscoder is { } transcoder)
+            await transcoder.TryRewriteResponseAsync(args, args.CancellationToken).ConfigureAwait(false);
+
+        // Before user handlers: native H2 GetResponseBody (Inspector capture) signals
+        // ReadHttp2BeforeHandlerTaskCompletionSource and locks the origin response before
+        // BeforeResponse returns, which would block Respond()/Ok() for the meta-refresh.
+        TrySeamlessDecryptBypassRetry(args);
+
+        if (BeforeResponse != null)
+            await BeforeResponse.InvokeAsync(this, args, logger).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Buffer a small known-length 200 and store it when a cache filler is set.
+    /// No-op when cache is off, so the hot path does not read the body.
+    /// </summary>
+    private async Task TryFillHttpResponseCacheAsync(SessionEventArgs args, CancellationToken cancellationToken)
+    {
+        var fill = HttpResponseCacheFiller;
+        if (fill == null)
+            return;
+
+        var response = args.HttpClient.Response;
+        if (response.StatusCode != 200)
+            return;
+
+        if (!response.IsBodyRead
+            && response.HasBody
+            && !response.IsChunked
+            && !response.HasTrailingHeaders
+            && response.ContentLength is > 0 and <= Caching.HttpResponseCacheMiddleware.MaxCachedBodyBytes)
+        {
+            try
+            {
+                response.KeepBody = true;
+                await args.GetResponseBody(cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                return;
+            }
+        }
+
+        if (!response.IsBodyRead)
+            return;
+
+        try
+        {
+            fill(args);
+        }
+        catch
+        {
+            // Cache best-effort only.
+        }
+    }
+
+    /// <summary>
+    ///     Records learnable MITM HTTP blocks. For document navigations, activates bypass immediately and
+    ///     replaces the response with a meta-refresh so the browser opens a new CONNECT (opaque tunnel).
+    /// </summary>
+    /// <returns>True when a seamless retry interstitial was installed.</returns>
+    internal bool TrySeamlessDecryptBypassRetry(SessionEventArgs args)
+    {
+        if (!EnableDecryptFailureBypass || !Network.Tcp.DecryptFailureLearning.IsLearnableHttpBlock(args))
+            return false;
+
+        // User (or earlier handler) already replaced the response.
+        if (args.HttpClient.Response.Locked)
+            return false;
+
+        var host = Network.Tcp.DecryptFailureLearning.ResolveSessionHost(args);
+        var request = args.HttpClient.Request;
+        var isDocument = Network.Tcp.DecryptFailureLearning.IsDocumentNavigation(request);
+        var status = args.HttpClient.Response.StatusCode;
+
+        var isActive = TryRecordDecryptFailureFromHttpStatus(host, status, isSynthetic: false,
+            forceImmediate: isDocument);
+
+        if (!isDocument || !isActive)
+            return false;
+
+        var url = request.Url;
+        if (!Network.Tcp.DecryptFailureLearning.IsSafeMetaRefreshUrl(url))
+            return false;
+
+        var html = Network.Tcp.DecryptFailureLearning.BuildMetaRefreshHtml(url);
+        // Connection: close is H1-only. H2 queues a GOAWAY behind the meta-refresh
+        // (see EmitSyntheticResponseAsync) instead of shutting the socket down here.
+        HttpHeader[] headers = request.HttpVersion >= HttpHeader.Version20
+            ?
+            [
+                new HttpHeader("Cache-Control", "no-store")
+            ]
+            :
+            [
+                new HttpHeader("Cache-Control", "no-store"),
+                new HttpHeader(KnownHeaders.Connection, KnownHeaders.ConnectionClose)
+            ];
+        args.Ok(html, headers, closeServerConnection: true);
+        args.CloseClientConnectionAfterResponse = true;
+        return true;
+    }
+
+    /// <summary>
+    ///     How long an HTTP/2 client that ignores GOAWAY may keep the forged MITM connection.
+    ///     Idle-read is off by default (<see cref="IdleReadTimeoutSeconds" /> is 0), so it does not
+    ///     reclaim this socket. The delay starts after GOAWAY is already queued, so the FIN cannot
+    ///     truncate the meta-refresh.
+    /// </summary>
+    private static readonly TimeSpan Http2SeamlessGoAwayCloseFallback = TimeSpan.FromSeconds(2);
+
+    private async Task MaybeCloseClientAfterSeamlessRetryAsync(SessionEventArgs args)
+    {
+        if (!args.CloseClientConnectionAfterResponse)
+            return;
+
+        // HTTP/2: GOAWAY(NO_ERROR) is already queued behind the meta-refresh. Closing the socket
+        // here races the frame-writer drain and Chrome reports ERR_HTTP2_PROTOCOL_ERROR instead of
+        // following the refresh. The browser closes after GOAWAY; the fallback reclaims a client
+        // that never does.
+        if (ClientSpokeHttp2(args))
+        {
+            _ = CloseHttp2ClientAfterGoAwayAsync(args.ClientConnection);
+            return;
+        }
+
+        // HTTP/1.1 writes the meta-refresh before this runs, and the response carries Connection: close.
+        // Do not CancelAsync first — that races the just-completed body write and can surface as
+        // net::ERR_CONNECTION_RESET before the browser applies meta-refresh.
+        try
+        {
+            await Task.Yield();
+            args.ClientConnection.CloseGracefully();
+        }
+        catch (Exception ex)
+        {
+            ProxyDiagnostics.ReportBenign(logger,
+                "Seamless decrypt-bypass: closing client connection after meta-refresh", ex);
+        }
+    }
+
+    private static bool ClientSpokeHttp2(SessionEventArgs args)
+    {
+        var connection = args.ClientConnection;
+        return connection.Http2CleartextClient
+               || connection.NegotiatedApplicationProtocol == SslApplicationProtocol.Http2;
+    }
+
+    private async Task CloseHttp2ClientAfterGoAwayAsync(Network.Tcp.TcpClientConnection connection)
+    {
+        try
+        {
+            await Task.Delay(Http2SeamlessGoAwayCloseFallback).ConfigureAwait(false);
+            connection.CloseGracefully();
+        }
+        catch (Exception ex)
+        {
+            ProxyDiagnostics.ReportBenign(logger,
+                "Seamless decrypt-bypass: fallback close after HTTP/2 GOAWAY", ex);
+        }
+    }
+
+    /// <summary>
+    ///     Invoke after response if it is set. This is the single chokepoint every protocol path (HTTP/1.1,
+    ///     native HTTP/2, and both HTTP-version-translation bridges) funnels through exactly once per
+    ///     session - on the success path, on an early return (e.g. a denied/synthetic response), and on an
+    ///     unhandled exception alike - so it doubles as the one place that finalizes
+    ///     <see cref="SessionEventArgsBase.Timing" /> for every session, regardless of how it ended.
+    /// </summary>
+    /// <param name="args"></param>
+    /// <returns></returns>
+    private Task OnAfterResponse(SessionEventArgs args)
+    {
+        // Fast-path skips OnBeforeResponse; still learn HTTP blocks (no meta-refresh rewrite).
+        if (args.IsFastPath && EnableDecryptFailureBypass &&
+            Network.Tcp.DecryptFailureLearning.IsLearnableHttpBlock(args))
+        {
+            var host = Network.Tcp.DecryptFailureLearning.ResolveSessionHost(args);
+            var isDocument = Network.Tcp.DecryptFailureLearning.IsDocumentNavigation(args.HttpClient.Request);
+            TryRecordDecryptFailureFromHttpStatus(host, args.HttpClient.Response.StatusCode,
+                args.HttpClient.Response.IsSynthetic, forceImmediate: isDocument);
+        }
+
+        var success = args.Exception is null &&
+                      args.HttpClient.Response.StatusCode is >= 200 and < 500;
+        ReverseProxySessionDispatch.ReportUpstreamResult(this, args, success);
+
+        if (!args.IsFastPath && AfterResponse != null)
+            return OnAfterResponseWithHandlerAndClientCloseAsync(args);
+
+        TryUpdateHttp3CapabilityFromResponse(args);
+        args.Timing?.MarkComplete();
+        return MaybeCloseClientAfterSeamlessRetryAsync(args);
+    }
+
+    private async Task OnAfterResponseWithHandlerAndClientCloseAsync(SessionEventArgs args)
+    {
+        await OnAfterResponseWithHandlerAsync(args).ConfigureAwait(false);
+        await MaybeCloseClientAfterSeamlessRetryAsync(args).ConfigureAwait(false);
+    }
+
+    private async Task OnAfterResponseWithHandlerAsync(SessionEventArgs args)
+    {
+        await AfterResponse!.InvokeAsync(this, args, logger);
+
+        // Process Alt-Svc header to cache HTTP/3 capability for future requests.
+        TryUpdateHttp3CapabilityFromResponse(args);
+
+        // Marked after the user event (rather than before) so that TotalDuration/ResponseDeliveryDuration
+        // include any time spent in an AfterResponse handler, matching what a caller actually experienced.
+        args.Timing?.MarkComplete();
+    }
+    internal bool ShouldCallBeforeResponseBodyWrite()
+    {
+        return OnResponseBodyWrite != null;
+    }
+
+    internal Task OnBeforeResponseBodyWrite(BeforeBodyWriteEventArgs args)
+    {
+        return OnResponseBodyWrite != null
+            ? OnResponseBodyWrite.InvokeAsync(this, args, logger)
+            : Task.CompletedTask;
+    }
+}

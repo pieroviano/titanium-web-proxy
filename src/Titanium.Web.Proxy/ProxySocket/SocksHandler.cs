@@ -46,7 +46,7 @@ internal delegate void HandShakeComplete(Exception? error);
 internal abstract class SocksHandler
 {
     /// <summary>Holds the address of the method to call when the SOCKS protocol has been completed.</summary>
-    protected HandShakeComplete ProtocolComplete;
+    private HandShakeComplete? protocolComplete;
 
     // private variables
     /// <summary>Holds the value of the Server property.</summary>
@@ -55,16 +55,18 @@ internal abstract class SocksHandler
     /// <summary>Holds the value of the Username property.</summary>
     private string username = string.Empty;
 
+    private byte[]? buffer;
+
     /// <summary>
     ///     Initializes a new instance of the SocksHandler class.
     /// </summary>
     /// <param name="server">The socket connection with the proxy server.</param>
     /// <param name="user">The username to use when authenticating with the server.</param>
     /// <exception cref="ArgumentNullException"><c>server</c> -or- <c>user</c> is null.</exception>
-    public SocksHandler(Socket server, string user)
+    protected SocksHandler(Socket server, string user)
     {
-        Server = server;
-        Username = user;
+        this.server = server ?? throw new ArgumentNullException(nameof(server));
+        username = user ?? throw new ArgumentNullException(nameof(user));
     }
 
     /// <summary>
@@ -75,7 +77,7 @@ internal abstract class SocksHandler
     protected Socket Server
     {
         get => server;
-        set => server = value ?? throw new ArgumentNullException();
+        set => server = value ?? throw new ArgumentNullException(nameof(value));
     }
 
     /// <summary>
@@ -86,20 +88,28 @@ internal abstract class SocksHandler
     protected string Username
     {
         get => username;
-        set => username = value ?? throw new ArgumentNullException();
+        set => username = value ?? throw new ArgumentNullException(nameof(value));
     }
 
     /// <summary>
     ///     Gets or sets the return value of the BeginConnect call.
     /// </summary>
     /// <value>An IAsyncProxyResult object that is the return value of the BeginConnect call.</value>
-    protected AsyncProxyResult AsyncResult { get; set; }
+    protected HandShakeComplete ProtocolComplete
+    {
+        get => protocolComplete ?? throw new InvalidOperationException("Protocol callback has not been assigned.");
+        set => protocolComplete = value ?? throw new ArgumentNullException(nameof(value));
+    }
 
     /// <summary>
     ///     Gets or sets a byte buffer.
     /// </summary>
     /// <value>An array of bytes.</value>
-    protected byte[] Buffer { get; set; }
+    protected byte[] Buffer
+    {
+        get => buffer ?? throw new InvalidOperationException("Protocol buffer has not been assigned.");
+        set => buffer = value ?? throw new ArgumentNullException(nameof(value));
+    }
 
     /// <summary>
     ///     Gets or sets actual data count in the buffer.
@@ -118,7 +128,7 @@ internal abstract class SocksHandler
     /// <param name="port">The port to convert.</param>
     /// <param name="buffer">The buffer which contains the result data.</param>
     /// <returns>An array of two bytes that represents the specified port.</returns>
-    protected void PortToBytes(int port, Span<byte> buffer)
+    protected static void PortToBytes(int port, Span<byte> buffer)
     {
         buffer[0] = (byte)(port / 256);
         buffer[1] = (byte)(port % 256);
@@ -129,7 +139,7 @@ internal abstract class SocksHandler
     /// </summary>
     /// <param name="address">The IP address to convert.</param>
     /// <returns>An array of four bytes that represents the specified IP address.</returns>
-    protected byte[] AddressToBytes(long address)
+    protected static byte[] AddressToBytes(long address)
     {
         var ret = new byte[4];
         ret[0] = (byte)(address % 256);
@@ -137,30 +147,6 @@ internal abstract class SocksHandler
         ret[2] = (byte)(address / 65536 % 256);
         ret[3] = (byte)(address / 16777216);
         return ret;
-    }
-
-    /// <summary>
-    ///     Reads a specified number of bytes from the Server socket.
-    /// </summary>
-    /// <param name="buffer">The result buffer.</param>
-    /// <param name="count">The number of bytes to return.</param>
-    /// <returns>An array of bytes.</returns>
-    /// <exception cref="ArgumentException">The number of bytes to read is invalid.</exception>
-    /// <exception cref="SocketException">An operating system error occurs while accessing the Socket.</exception>
-    /// <exception cref="ObjectDisposedException">The Socket has been closed.</exception>
-    protected void ReadBytes(byte[] buffer, int count)
-    {
-        if (count <= 0)
-            throw new ArgumentException();
-
-        var received = 0;
-        while (received != count)
-        {
-            var recv = Server.Receive(buffer, received, count - received, SocketFlags.None);
-            if (recv == 0) throw new SocketException(10054);
-
-            received += recv;
-        }
     }
 
     /// <summary>
@@ -191,23 +177,20 @@ internal abstract class SocksHandler
 
     protected virtual void OnProtocolComplete(Exception? exception)
     {
-        if (Buffer != null) ArrayPool<byte>.Shared.Return(Buffer);
+        if (buffer != null)
+        {
+            // SOCKS4's CONNECT request embeds the USERID field directly in this buffer (see
+            // Socks4Handler.GetHostPortBytes/GetEndPointBytes), and Socks5Handler sizes this same
+            // buffer to already accommodate Username/Password. Clear before returning to the shared
+            // pool so no identity/credential-adjacent bytes are left for an unrelated caller to rent
+            // and potentially observe - matching the same treatment AuthUserPass.OnCallBack gives the
+            // actual RFC 1929 username/password subnegotiation buffer.
+            ArrayPool<byte>.Shared.Return(buffer, clearArray: true);
+            buffer = null;
+        }
 
         ProtocolComplete(exception);
     }
-
-    /// <summary>
-    ///     Starts negotiating with a SOCKS proxy server.
-    /// </summary>
-    /// <param name="host">The remote server to connect to.</param>
-    /// <param name="port">The remote port to connect to.</param>
-    public abstract void Negotiate(string host, int port);
-
-    /// <summary>
-    ///     Starts negotiating with a SOCKS proxy server.
-    /// </summary>
-    /// <param name="remoteEp">The remote endpoint to connect to.</param>
-    public abstract void Negotiate(IPEndPoint remoteEp);
 
     /// <summary>
     ///     Starts negotiating asynchronously with a SOCKS proxy server.
@@ -218,7 +201,7 @@ internal abstract class SocksHandler
     /// <param name="state">The state.</param>
     /// <returns>An IAsyncProxyResult that references the asynchronous connection.</returns>
     public abstract AsyncProxyResult BeginNegotiate(IPEndPoint remoteEp, HandShakeComplete callback,
-        IPEndPoint proxyEndPoint, object state);
+        IPEndPoint proxyEndPoint, AsyncProxyResult asyncResult);
 
     /// <summary>
     ///     Starts negotiating asynchronously with a SOCKS proxy server.
@@ -230,5 +213,5 @@ internal abstract class SocksHandler
     /// <param name="state">The state.</param>
     /// <returns>An IAsyncProxyResult that references the asynchronous connection.</returns>
     public abstract AsyncProxyResult BeginNegotiate(string host, int port, HandShakeComplete callback,
-        IPEndPoint proxyEndPoint, object state);
+        IPEndPoint proxyEndPoint, AsyncProxyResult asyncResult);
 }

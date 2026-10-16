@@ -1,5 +1,6 @@
-﻿using System;
+using System;
 using System.Buffers;
+using System.Buffers.Text;
 using System.IO;
 using System.Text;
 using Titanium.Web.Proxy.Models;
@@ -9,39 +10,117 @@ namespace Titanium.Web.Proxy.Http;
 
 internal class HeaderBuilder
 {
-    private readonly MemoryStream stream = new();
+    [ThreadStatic]
+    private static HeaderBuilder? cached;
+
+    private readonly MemoryStream stream = new(256);
+#if DEBUG
+    // Directly constructed builders (never pooled) are always live; only Return() clears this.
+    private bool inUse = true;
+#endif
+
+    /// <summary>Rents a thread-local builder (cleared). Caller must <see cref="Return"/> it.</summary>
+    public static HeaderBuilder Rent()
+    {
+        var builder = cached;
+        if (builder != null)
+        {
+            cached = null;
+            builder.stream.SetLength(0);
+#if DEBUG
+            builder.inUse = true;
+#endif
+            return builder;
+        }
+
+        var created = new HeaderBuilder();
+#if DEBUG
+        created.inUse = true;
+#endif
+        return created;
+    }
+
+    /// <summary>Returns a builder to the thread-local cache.</summary>
+    /// <remarks>
+    ///     Do not use <see cref="GetBuffer"/> (or any view into this builder) after <see cref="Return"/>;
+    ///     the rented instance may be reused on the same thread.
+    /// </remarks>
+    public static void Return(HeaderBuilder builder)
+    {
+#if DEBUG
+        builder.inUse = false;
+#endif
+        if (cached == null)
+            cached = builder;
+    }
 
     public void WriteRequestLine(string httpMethod, string httpUrl, Version version)
     {
-        // "{httpMethod} {httpUrl} HTTP/{version.Major}.{version.Minor}";
-
         Write(httpMethod);
-        Write(" ");
-        Write(httpUrl);
-        Write(" HTTP/");
-        Write(version.Major.ToString());
-        Write(".");
-        Write(version.Minor.ToString());
+        WriteAscii(" ");
+        if (httpUrl.Length == 0)
+            WriteAscii("/");
+        else
+            Write(httpUrl);
+        WriteHttpVersion(version);
         WriteLine();
+    }
+
+    /// <summary>
+    ///     Transparent reverse: write the origin-form target from the already-decoded request-line
+    ///     bytes instead of allocating <see cref="Request.RequestUriString" />.
+    /// </summary>
+    public void WriteRequestLine(string httpMethod, ByteString httpUrl, Version version)
+    {
+        Write(httpMethod);
+        WriteAscii(" ");
+        if (httpUrl.Length == 0)
+            WriteAscii("/");
+        else
+            Write(httpUrl);
+        WriteHttpVersion(version);
+        WriteLine();
+    }
+
+    private void WriteHttpVersion(Version version)
+    {
+        if (version.Major == 1 && version.Minor == 1)
+            WriteAscii(" HTTP/1.1");
+        else if (version.Major == 1 && version.Minor == 0)
+            WriteAscii(" HTTP/1.0");
+        else
+        {
+            WriteAscii(" HTTP/");
+            WriteDecimal(version.Major);
+            WriteAscii(".");
+            WriteDecimal(version.Minor);
+        }
     }
 
     public void WriteResponseLine(Version version, int statusCode, string statusDescription)
     {
-        // "HTTP/{version.Major}.{version.Minor} {statusCode} {statusDescription}";
+        if (version.Major == 1 && version.Minor == 1)
+            WriteAscii("HTTP/1.1 ");
+        else if (version.Major == 1 && version.Minor == 0)
+            WriteAscii("HTTP/1.0 ");
+        else
+        {
+            WriteAscii("HTTP/");
+            WriteDecimal(version.Major);
+            WriteAscii(".");
+            WriteDecimal(version.Minor);
+            WriteAscii(" ");
+        }
 
-        Write("HTTP/");
-        Write(version.Major.ToString());
-        Write(".");
-        Write(version.Minor.ToString());
-        Write(" ");
-        Write(statusCode.ToString());
-        Write(" ");
+        WriteDecimal(statusCode);
+        WriteAscii(" ");
         Write(statusDescription);
         WriteLine();
     }
 
     public void WriteHeaders(HeaderCollection headers, bool sendProxyAuthorization = true,
-        string? upstreamProxyUserName = null, string? upstreamProxyPassword = null)
+        string? upstreamProxyUserName = null, string? upstreamProxyPassword = null,
+        string? hostHeaderOverride = null)
     {
         if (upstreamProxyUserName != null && upstreamProxyPassword != null)
         {
@@ -49,18 +128,45 @@ internal class HeaderBuilder
             WriteHeader(HttpHeader.GetProxyAuthorizationHeader(upstreamProxyUserName, upstreamProxyPassword));
         }
 
-        foreach (var header in headers)
-            if (sendProxyAuthorization || !KnownHeaders.ProxyAuthorization.Equals(header.Name))
-                WriteHeader(header);
+        if (sendProxyAuthorization)
+        {
+            foreach (var header in headers)
+                WriteHeaderMaybeHostOverride(header, hostHeaderOverride);
+        }
+        else
+        {
+            foreach (var header in headers)
+            {
+                if (KnownHeaders.ProxyAuthorization.Equals(header.Name))
+                    continue;
+                WriteHeaderMaybeHostOverride(header, hostHeaderOverride);
+            }
+        }
 
         WriteLine();
     }
 
+    private void WriteHeaderMaybeHostOverride(HttpHeader header, string? hostHeaderOverride)
+    {
+        if (hostHeaderOverride != null && KnownHeaders.Host.Equals(header.Name))
+        {
+            Write(header.NameData);
+            WriteAscii(": ");
+            WriteAscii(hostHeaderOverride);
+            WriteLine();
+            return;
+        }
+
+        WriteHeader(header);
+    }
+
     public void WriteHeader(HttpHeader header)
     {
-        Write(header.Name);
-        Write(": ");
-        Write(header.Value);
+        HttpHeaderHygiene.ThrowIfForbidden(header.NameData, header.ValueData);
+        // NameData/ValueData are already ISO-8859-1 bytes — do not force string + GetBytes.
+        Write(header.NameData);
+        WriteAscii(": ");
+        Write(header.ValueData);
         WriteLine();
     }
 
@@ -72,39 +178,87 @@ internal class HeaderBuilder
 
     public void Write(string str)
     {
+        if (str.Length == 0) return;
+
         var encoding = HttpHeader.Encoding;
+        var max = encoding.GetMaxByteCount(str.Length);
+        if (max <= 256)
+        {
+            Span<byte> stack = stackalloc byte[max];
+            var bytes = encoding.GetBytes(str.AsSpan(), stack);
+            stream.Write(stack.Slice(0, bytes));
+            return;
+        }
 
-#if NETSTANDARD2_1
-            var buf = ArrayPool<byte>.Shared.Rent(encoding.GetMaxByteCount(str.Length));
+        var buf = ArrayPool<byte>.Shared.Rent(max);
+        try
+        {
             var span = new Span<byte>(buf);
-
             int bytes = encoding.GetBytes(str.AsSpan(), span);
-
             stream.Write(span.Slice(0, bytes));
+        }
+        finally
+        {
             ArrayPool<byte>.Shared.Return(buf);
-#else
-        var data = encoding.GetBytes(str);
-        stream.Write(data, 0, data.Length);
-#endif
+        }
+    }
+
+    private void Write(ByteString data)
+    {
+        var span = data.Span;
+        if (span.Length == 0) return;
+        stream.Write(span);
+    }
+
+    /// <summary>Appends raw bytes (e.g. a tiny response body after the header block).</summary>
+    public void WriteRaw(ReadOnlySpan<byte> data)
+    {
+        if (data.Length == 0) return;
+        stream.Write(data);
+    }
+
+    /// <summary>Writes an ASCII literal without ArrayPool rent (status lines / separators).</summary>
+    private void WriteAscii(ReadOnlySpan<char> ascii)
+    {
+        Span<byte> buf = stackalloc byte[ascii.Length];
+        for (var i = 0; i < ascii.Length; i++)
+            buf[i] = (byte)ascii[i];
+        stream.Write(buf);
+    }
+
+    private void WriteAscii(string ascii) => WriteAscii(ascii.AsSpan());
+
+    private void WriteDecimal(int value)
+    {
+        Span<byte> buf = stackalloc byte[11];
+        if (!Utf8Formatter.TryFormat(value, buf, out var written))
+            throw new InvalidOperationException("Failed to format integer for HTTP header line.");
+        stream.Write(buf.Slice(0, written));
     }
 
     public ArraySegment<byte> GetBuffer()
     {
+#if DEBUG
+        if (!inUse)
+            throw new InvalidOperationException("HeaderBuilder.GetBuffer after Return; the instance may have been reused.");
+#endif
 #if NET451 || NET45
+        // MemoryStream.TryGetBuffer is .NET 4.6+; copy out instead.
         return new ArraySegment<byte>(stream.ToArray());
 #else
-            stream.TryGetBuffer(out var buffer);
-            return buffer;
+        if (!stream.TryGetBuffer(out var buffer))
+            throw new InvalidOperationException("The header buffer is unexpectedly unavailable.");
+
+        return buffer;
 #endif
     }
 
     public string GetString(Encoding encoding)
     {
-#if NET451 || NET45
-        return encoding.GetString(stream.ToArray());
-#else
-            stream.TryGetBuffer(out var buffer);
-            return encoding.GetString(buffer.Array, buffer.Offset, buffer.Count);
-#endif
+        var buffer = GetBuffer();
+        if (buffer.Array == null)
+            throw new InvalidOperationException("The header buffer has no backing array.");
+
+        return encoding.GetString(buffer.Array, buffer.Offset, buffer.Count);
     }
 }

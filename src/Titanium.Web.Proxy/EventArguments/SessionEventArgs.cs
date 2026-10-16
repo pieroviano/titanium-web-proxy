@@ -4,19 +4,22 @@ using System.IO;
 using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
+using Titanium.Web.Proxy.Compression;
+using Titanium.Web.Proxy.Extensions;
 using Titanium.Web.Proxy.Helpers;
 using Titanium.Web.Proxy.Http;
 using Titanium.Web.Proxy.Http.Responses;
 using Titanium.Web.Proxy.Models;
+using Titanium.Web.Proxy.Network.Streams;
+using Titanium.Web.Proxy.Options;
 using Titanium.Web.Proxy.StreamExtended.Network;
 
 namespace Titanium.Web.Proxy.EventArguments;
 
 /// <summary>
-/// Holds info related to a single proxy session (single request/response sequence).
-/// A proxy session is bounded to a single connection from client.
-/// A proxy session ends when client terminates connection to proxy
-/// or when server terminates connection from proxy.
+/// Holds info related to a single proxy session (single request/response exchange).
+/// Under HTTP/2 and HTTP/3, many sessions share one client connection (one stream each);
+/// ending a session ends that request/response exchange, not necessarily the connection.
 /// </summary>
 public class SessionEventArgs : SessionEventArgsBase
 {
@@ -34,9 +37,59 @@ public class SessionEventArgs : SessionEventArgsBase
     /// <summary>
     /// Constructor to initialize the proxy
     /// </summary>
-    internal SessionEventArgs(ProxyServer server, ProxyEndPoint endPoint, HttpClientStream clientStream, ConnectRequest? connectRequest, CancellationTokenSource cancellationTokenSource)
+    internal SessionEventArgs(ProxyServer server, ProxyEndPoint endPoint, HttpClientStream clientStream,
+        ConnectRequest? connectRequest, CancellationTokenSource cancellationTokenSource)
         : base(server, endPoint, clientStream, connectRequest, new Request(), cancellationTokenSource)
     {
+    }
+
+    /// <summary>
+    ///     Session with a request that already has the request-line and headers populated
+    ///     (H1 terminate lite fall-through when the gate fails after header read).
+    /// </summary>
+    internal SessionEventArgs(ProxyServer server, ProxyEndPoint endPoint, HttpClientStream clientStream,
+        ConnectRequest? connectRequest, CancellationTokenSource cancellationTokenSource, Request request)
+        : base(server, endPoint, clientStream, connectRequest, request, cancellationTokenSource)
+    {
+    }
+
+    /// <summary>
+    ///     Recycles this session for the next keep-alive request on the same client connection.
+    ///     Call only after a successful fast-path exchange (no exception). Must not run after
+    ///     <see cref="Dispose"/>.
+    /// </summary>
+    internal void ResetForKeepAlive(TunnelConnectSessionEventArgs? connectArgs,
+        Models.UpstreamHttpProtocol? upstreamHttpProtocol)
+    {
+        ObjectDisposedException.ThrowIf(disposed, this);
+
+        OperationCancellationToken = null;
+        Exception = null;
+        IsClientResponseCommitted = false;
+        IsFastPath = false;
+        CloseClientConnectionAfterResponse = false;
+        IsPromise = false;
+        Http3BufferedBodyReader = null;
+        Http3RequestBodyPump = null;
+        ResponseHeaderTimeout = null;
+        IdleReadTimeout = null;
+        IdleWriteTimeout = null;
+        RequestTimeout = null;
+        MaxBufferedBodyBytes = null;
+        NetworkFailureRetryAttempts = null;
+        MaxWebSocketFramePayloadBytes = null;
+        OriginHttpVersionPolicy = null;
+        UpstreamHttpProtocol = upstreamHttpProtocol ?? connectArgs?.UpstreamHttpProtocol;
+        reRequest = false;
+        ConnectTimeout = null;
+        CustomUpStreamProxy = null;
+        CustomUpStreamProxyUsed = null;
+        UpstreamConnectHost = null;
+        UpstreamConnectPort = null;
+        UpstreamDestinationId = null;
+        Deadlines.Reset();
+        UserData = connectArgs?.UserData;
+        HttpClient.ResetForKeepAlive();
     }
 
     /// <summary>
@@ -44,7 +97,100 @@ public class SessionEventArgs : SessionEventArgsBase
     /// </summary>
     public bool IsPromise { get; internal set; }
 
-    private bool HasMulipartEventSubscribers => MultipartRequestPartSent != null;
+    /// <summary>
+    ///     When true, this session skips BeforeRequest/BeforeResponse/AfterResponse and Via
+    ///     injection because the interception gate/predicate selected the fast-forward path.
+    /// </summary>
+    internal bool IsFastPath { get; set; }
+
+    /// <summary>
+    ///     When true, tear down the client TCP after the response is committed (seamless decrypt-bypass
+    ///     meta-refresh must not keep an H2/MITM connection alive).
+    /// </summary>
+    internal bool CloseClientConnectionAfterResponse { get; set; }
+
+    /// <summary>
+    ///     Native HTTP/3 only: reads remaining client DATA frames into a bounded buffer (wire bytes).
+    ///     Set by <c>Http3RequestStream</c> before <c>BeforeRequest</c>; cleared once the body is
+    ///     buffered or streamed to the origin. Used by <see cref="GetRequestBody" /> and TCP fallback.
+    /// </summary>
+    internal Func<CancellationToken, Task<byte[]>>? Http3BufferedBodyReader { get; set; }
+
+    /// <summary>
+    ///     Native HTTP/3 only: pumps remaining client DATA payloads to <paramref name="writeData"/>
+    ///     without buffering the whole body. Set by <c>Http3RequestStream</c> when the body was not
+    ///     read during BeforeRequest; used by H3→H1 / H3→H2 bridges and the H3→H3 <c>copyRequestBody</c>.
+    /// </summary>
+    internal Func<Func<ReadOnlyMemory<byte>, CancellationToken, ValueTask>, CancellationToken, Task>?
+        Http3RequestBodyPump { get; set; }
+
+    /// <summary>
+    ///     Per-session override for <see cref="ProxyServer.ResponseHeaderTimeoutSeconds" />.
+    ///     <see langword="null" /> uses the server default; <see cref="TimeSpan.Zero" /> or negative disables.
+    /// </summary>
+    public TimeSpan? ResponseHeaderTimeout { get; set; }
+
+    /// <summary>
+    ///     Per-session override for <see cref="ProxyServer.IdleReadTimeoutSeconds" />.
+    ///     <see langword="null" /> uses the server default; <see cref="TimeSpan.Zero" /> or negative disables.
+    /// </summary>
+    public TimeSpan? IdleReadTimeout { get; set; }
+
+    /// <summary>
+    ///     Per-session override for <see cref="ProxyServer.IdleWriteTimeoutSeconds" />.
+    ///     <see langword="null" /> uses the server default; <see cref="TimeSpan.Zero" /> or negative disables.
+    /// </summary>
+    public TimeSpan? IdleWriteTimeout { get; set; }
+
+    /// <summary>
+    ///     Per-session override for <see cref="ProxyServer.RequestTimeoutSeconds" />.
+    ///     <see langword="null" /> uses the server default; <see cref="TimeSpan.Zero" /> or negative disables.
+    /// </summary>
+    public TimeSpan? RequestTimeout { get; set; }
+
+    /// <summary>
+    ///     Per-session override for <see cref="ProxyServer.MaxBufferedBodyBytes" />.
+    ///     <see langword="null" /> uses the server default. Set in <c>BeforeRequest</c> to increase the
+    ///     limit for large uploads/downloads without relaxing the global limit for all requests.
+    /// </summary>
+    public int? MaxBufferedBodyBytes { get; set; }
+
+    /// <summary>
+    ///     Per-session override for <see cref="ProxyServer.NetworkFailureRetryAttempts" />.
+    ///     <see langword="null" /> uses the server default. Set to 0 in <c>BeforeRequest</c> for
+    ///     non-idempotent methods (POST, PATCH) to prevent unsafe retries.
+    /// </summary>
+    public int? NetworkFailureRetryAttempts { get; set; }
+
+    /// <summary>
+    ///     Per-session override for <see cref="ProxyServer.MaxWebSocketFramePayloadBytes" />.
+    ///     <see langword="null" /> uses the server default. Set in <c>BeforeRequest</c> before the
+    ///     WebSocket upgrade completes.
+    /// </summary>
+    public int? MaxWebSocketFramePayloadBytes { get; set; }
+
+    /// <summary>
+    ///     Per-session override for <see cref="ProxyServer.OriginHttpVersionPolicy" />.
+    ///     <see langword="null" /> uses the server default (<see cref="Models.OriginHttpVersionPolicy.PreserveClientVersion" />
+    ///     unless the server property was changed). Set in <c>BeforeRequest</c>.
+    /// </summary>
+    public Models.OriginHttpVersionPolicy? OriginHttpVersionPolicy { get; set; }
+
+    /// <summary>
+    ///     Per-request outbound protocol version policy. Overrides the connection-level
+    ///     <see cref="Models.UpstreamHttpProtocol" /> value set during <c>BeforeSslAuthenticate</c> /
+    ///     <c>BeforeQuicAuthenticate</c> for this single request stream only.
+    ///     <see langword="null" /> uses the connection-level policy (or <see cref="Models.UpstreamHttpProtocol.Auto" />
+    ///     if none was set). Evaluated in <c>BeforeRequest</c>; changes after that have no effect.
+    ///     <para>
+    ///         On an H3 inbound connection (one client QUIC connection serving many concurrent streams),
+    ///         each stream resolves its outbound protocol independently after <c>BeforeRequest</c> fires,
+    ///         making per-stream protocol overrides possible even though the inbound leg is already QUIC.
+    ///     </para>
+    /// </summary>
+    public Models.UpstreamHttpProtocol? UpstreamHttpProtocol { get; set; }
+
+    internal bool HasMulipartEventSubscribers => MultipartRequestPartSent != null;
 
     /// <summary>
     /// Should we send the request again ?
@@ -54,18 +200,69 @@ public class SessionEventArgs : SessionEventArgsBase
         get => reRequest;
         set
         {
-            if (HttpClient.Response.StatusCode == 0) throw new Exception("Response status code is empty. Cannot request again a request " + "which was never send to server.");
+            if (HttpClient.Response.StatusCode == 0) throw new InvalidOperationException("Response status code is empty. Cannot request again a request " + "which was never send to server.");
 
             reRequest = value;
         }
     }
 
-    [Obsolete("Use [WebSocketDecoderReceive] instead")]
+    [Obsolete("Use [WebSocketDecoderReceive] instead")] // NOSONAR S1133 -- Binary-compatible public API.
     public WebSocketDecoder WebSocketDecoder => WebSocketDecoderReceive;
 
-    public WebSocketDecoder WebSocketDecoderSend => webSocketDecoderSend ??= new WebSocketDecoder(BufferPool);
+    public WebSocketDecoder WebSocketDecoderSend =>
+        webSocketDecoderSend ??= new WebSocketDecoder(BufferPool,
+            MaxWebSocketFramePayloadBytes ?? Server.MaxWebSocketFramePayloadBytes);
 
-    public WebSocketDecoder WebSocketDecoderReceive => webSocketDecoderReceive ??= new WebSocketDecoder(BufferPool);
+    public WebSocketDecoder WebSocketDecoderReceive =>
+        webSocketDecoderReceive ??= new WebSocketDecoder(BufferPool,
+            MaxWebSocketFramePayloadBytes ?? Server.MaxWebSocketFramePayloadBytes);
+
+    /// <summary>
+    ///     Fired for each WebSocket frame after upgrade when at least one handler is subscribed.
+    ///     Handlers may <see cref="WebSocketFrameInterceptAction.Forward" />,
+    ///     <see cref="WebSocketFrameInterceptAction.Drop" />, or
+    ///     <see cref="WebSocketFrameInterceptAction.Replace" /> the frame, optionally with a
+    ///     <see cref="WebSocketFrameInterceptEventArgs.Delay" />. Observational
+    ///     <see cref="SessionEventArgsBase.DataSent" /> / <see cref="SessionEventArgsBase.DataReceived" />
+    ///     still fire for bytes actually written to the peer.
+    /// </summary>
+    public event AsyncEventHandler<WebSocketFrameInterceptEventArgs>? BeforeWebSocketFrame; // NOSONAR S3264 -- Public extension event invoked by the WebSocket relay.
+
+    /// <summary>
+    ///     Fired when <see cref="Options.PolicyFamily.WebSocketFrameBudget"/> is
+    ///     <see cref="Options.PolicyMode.Observe"/> and a frame exceeds
+    ///     <c>MaxWebSocketFramePayloadBytes</c>. The payload is relayed unbuffered and is not passed
+    ///     to <see cref="BeforeWebSocketFrame"/>.
+    /// </summary>
+    public event AsyncEventHandler<WebSocketFrameElidedEventArgs>? WebSocketFrameElided; // NOSONAR S3264 -- Invoked by the WebSocket relay in Observe mode.
+
+    /// <summary>
+    ///     Inject frames toward the remote server (client→server direction, masked).
+    ///     Available only while an intercepted WebSocket relay is active.
+    /// </summary>
+    public WebSocketFrameWriter? WebSocketServerWriter { get; internal set; }
+
+    /// <summary>
+    ///     Inject frames toward the local client (server→client direction, unmasked).
+    ///     Available only while an intercepted WebSocket relay is active.
+    /// </summary>
+    public WebSocketFrameWriter? WebSocketClientWriter { get; internal set; }
+
+    internal bool HasWebSocketFrameInterceptHandler => BeforeWebSocketFrame != null;
+
+    internal bool HasWebSocketFrameElidedHandler => WebSocketFrameElided != null;
+
+    internal Task InvokeWebSocketFrameElided(WebSocketFrameElidedEventArgs args) =>
+        WebSocketFrameElided != null
+            ? WebSocketFrameElided.InvokeAsync(Server, args, Logger)
+            : Task.CompletedTask;
+
+    internal Task InvokeBeforeWebSocketFrame(WebSocketFrameInterceptEventArgs args)
+    {
+        return BeforeWebSocketFrame != null
+            ? BeforeWebSocketFrame.InvokeAsync(Server, args, Logger)
+            : Task.CompletedTask;
+    }
 
     /// <summary>
     /// Occurs when multipart request part sent.
@@ -77,46 +274,84 @@ public class SessionEventArgs : SessionEventArgsBase
     /// </summary>
     private async Task ReadRequestBodyAsync(CancellationToken cancellationToken)
     {
+        // RFC 8441: an extended CONNECT request opens an unbounded bidirectional tunnel;
+        // it has no finite HTTP body to accumulate. Calling GetRequestBody() on such a stream
+        // would deadlock waiting for END_STREAM that never arrives for a live tunnel.
+        if (HttpClient.Request.ExtendedConnectProtocol != null)
+            throw new InvalidOperationException(
+                "Cannot read the body of an HTTP/2 extended CONNECT request. " +
+                "The stream is a WebSocket tunnel; subscribe to OnDataSent/OnDataReceived instead.");
+
         HttpClient.Request.EnsureBodyAvailable(false);
 
         var request = HttpClient.Request;
+        if (request.IsBodyRead)
+            return;
 
-        // If not already read (not cached yet)
-        if (!request.IsBodyRead)
+        if (request.IsBodyReceived)
+            throw new InvalidOperationException("Request body was already received.");
+
+        if (request.HttpVersion == HttpHeader.Version20)
+            await ReadHttp2RequestBodyAsync(request);
+        else if (request.HttpVersion == HttpHeader.Version30)
+            await ReadHttp3RequestBodyAsync(request, cancellationToken);
+        else
+            await BufferHttp11RequestBodyAsync(request, cancellationToken);
+    }
+
+    private static async Task ReadHttp2RequestBodyAsync(Request request)
+    {
+        // do not send to the remote endpoint
+        request.Http2IgnoreBodyFrames = true;
+
+        request.Http2BodyData = new MemoryStream();
+
+        var tcs = new TaskCompletionSource<bool>();
+        request.ReadHttp2BodyTaskCompletionSource = tcs;
+
+        // signal to HTTP/2 copy frame method to continue
+        request.ReadHttp2BeforeHandlerTaskCompletionSource!.SetResult(true);
+
+        await tcs.Task;
+
+        request.IsBodyRead = true;
+        request.IsBodyReceived = true;
+    }
+
+    private async Task ReadHttp3RequestBodyAsync(Request request, CancellationToken cancellationToken)
+    {
+        // Native HTTP/3: ClientStream is Stream.Null; body bytes live on the inbound QuicStream
+        // until BeforeRequest either buffers them here or the origin bridge streams them.
+        // Returns wire bytes (no decompression) — same as the former pre-BeforeRequest buffer.
+        if (Http3BufferedBodyReader == null)
+            throw new InvalidOperationException(
+                "HTTP/3 request body is no longer available. It may already have been " +
+                "streamed to the origin; call GetRequestBody() during BeforeRequest.");
+
+        var body = await Http3BufferedBodyReader(cancellationToken);
+        Http3BufferedBodyReader = null;
+        if (!request.BodyAvailable)
         {
-            if (request.IsBodyReceived) throw new Exception("Request body was already received.");
-
-            if (request.HttpVersion == HttpHeader.Version20)
-            {
-                // do not send to the remote endpoint
-                request.Http2IgnoreBodyFrames = true;
-
-                request.Http2BodyData = new MemoryStream();
-
-                var tcs = new TaskCompletionSource<bool>();
-                request.ReadHttp2BodyTaskCompletionSource = tcs;
-
-                // signal to HTTP/2 copy frame method to continue
-                request.ReadHttp2BeforeHandlerTaskCompletionSource!.SetResult(true);
-
-                await tcs.Task;
-
-                // Now set the flag to true
-                // So that next time we can deliver body from cache
-                request.IsBodyRead = true;
-                request.IsBodyReceived = true;
-            }
-            else
-            {
-                var body = await ReadBodyAsync(true, cancellationToken);
-                if (!request.BodyAvailable) request.Body = body;
-
-                // Now set the flag to true
-                // So that next time we can deliver body from cache
-                request.IsBodyRead = true;
-                request.IsBodyReceived = true;
-            }
+            request.Body = body;
+            // Native H3 GetRequestBody stores wire bytes matching Content-Encoding.
+            request.BodyIsWireEncoded = true;
         }
+
+        request.IsBodyRead = true;
+        request.IsBodyReceived = true;
+    }
+
+    private async Task BufferHttp11RequestBodyAsync(Request request, CancellationToken cancellationToken)
+    {
+        var body = await ReadBodyAsync(true, cancellationToken);
+        if (!request.BodyAvailable)
+        {
+            request.Body = body;
+            request.BodyIsWireEncoded = false; // Uncompress transformation
+        }
+
+        request.IsBodyRead = true;
+        request.IsBodyReceived = true;
     }
 
     /// <summary>
@@ -146,53 +381,116 @@ public class SessionEventArgs : SessionEventArgsBase
     /// </summary>
     private async Task ReadResponseBodyAsync(CancellationToken cancellationToken)
     {
-        if (!HttpClient.Request.Locked) throw new Exception("You cannot read the response body before request is made to server.");
+        if (!HttpClient.Request.Locked) throw new InvalidOperationException("You cannot read the response body before request is made to server.");
+
+        // RFC 8441: a 2xx response to an extended CONNECT request establishes a tunnel; subsequent
+        // DATA frames are raw tunnel bytes, not an HTTP response body. Accumulating them would deadlock.
+        if (HttpClient.Request.ExtendedConnectProtocol != null
+            && HttpClient.Response.StatusCode is >= 200 and < 300)
+            throw new InvalidOperationException(
+                "Cannot read the body of a successful HTTP/2 extended CONNECT response. " +
+                "The stream is an established WebSocket tunnel; subscribe to OnDataReceived instead.");
 
         var response = HttpClient.Response;
-        if (!response.HasBody) return;
+        if (!response.HasBody || response.IsBodyRead)
+            return;
 
-        // If not already read (not cached yet)
-        if (!response.IsBodyRead)
+        // Synthetic Ok/Respond may already have Body bytes without going through the wire.
+        if (response.BodyAvailable)
         {
-            if (response.IsBodyReceived) throw new Exception("Response body was already received.");
-
-            if (response.HttpVersion == HttpHeader.Version20)
-            {
-                // do not send to the remote endpoint
-                response.Http2IgnoreBodyFrames = true;
-
-                response.Http2BodyData = new MemoryStream();
-
-                var tcs = new TaskCompletionSource<bool>();
-                response.ReadHttp2BodyTaskCompletionSource = tcs;
-
-                // signal to HTTP/2 copy frame method to continue
-                response.ReadHttp2BeforeHandlerTaskCompletionSource!.SetResult(true);
-
-                await tcs.Task;
-
-                // Now set the flag to true
-                // So that next time we can deliver body from cache
-                response.IsBodyRead = true;
-                response.IsBodyReceived = true;
-            }
-            else
-            {
-                var body = await ReadBodyAsync(false, cancellationToken);
-                if (!response.BodyAvailable) response.Body = body;
-
-                // Now set the flag to true
-                // So that next time we can deliver body from cache
-                response.IsBodyRead = true;
-                response.IsBodyReceived = true;
-            }
+            MarkResponseBodyRead(response);
+            return;
         }
+
+        if (response.IsBodyReceived) throw new InvalidOperationException("Response body was already received.");
+
+        if (response.HttpVersion == HttpHeader.Version20)
+            await ReadHttp2ResponseBodyAsync(response).ConfigureAwait(false);
+        else if (response.Http3RawBodyDrain != null)
+            await ReadHttp3ResponseBodyAsync(response, cancellationToken).ConfigureAwait(false);
+        else
+            await ReadHttp1ResponseBodyAsync(response, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    ///     Buffers a response whose body is still on the origin's QUIC stream (HTTP/3 origin). There is no
+    ///     <c>HttpClient.Connection</c> here, so the HTTP/1.x reader cannot be used. The body is kept as wire
+    ///     bytes (<see cref="RequestResponseBase.BodyIsWireEncoded"/>), matching the eager-buffer path in the
+    ///     HTTP/3 origin bridge; <see cref="GetResponseBody"/> then decompresses it. As with HTTP/1.x
+    ///     buffering, <c>OnResponseBodyWrite</c> is not applied to a body that BeforeResponse already read.
+    /// </summary>
+    private async Task ReadHttp3ResponseBodyAsync(Response response, CancellationToken cancellationToken)
+    {
+        var drain = response.Http3RawBodyDrain!;
+        response.Http3RawBodyDrain = null;
+
+        using var bodyStream = new MemoryStream();
+        var maxBufferedBodyBytes = MaxBufferedBodyBytes ?? Server.MaxBufferedBodyBytes;
+        Stream target = maxBufferedBodyBytes > 0
+            ? new BoundedWriteStream(bodyStream, maxBufferedBodyBytes, Server.PolicyModes[PolicyFamily.BodyBudget])
+            : bodyStream;
+
+        // On failure StreamBodyWriter stays set: the QUIC stream is already released, so a later emit
+        // fails loudly (stream reset) rather than sending a silently truncated body.
+        await drain(target, cancellationToken).ConfigureAwait(false);
+
+        var bodyBytes = bodyStream.ToArray();
+        response.Body = bodyBytes;
+        response.BodyIsWireEncoded = true;
+        response.ContentLength = bodyBytes.Length;
+        response.Headers.RemoveHeader(KnownHeaders.TransferEncoding);
+        response.StreamBodyWriter = null;
+        MarkResponseBodyRead(response);
+    }
+
+    private static void MarkResponseBodyRead(Response response)
+    {
+        response.IsBodyRead = true;
+        response.IsBodyReceived = true;
+    }
+
+    private static async Task ReadHttp2ResponseBodyAsync(Response response)
+    {
+        // do not send to the remote endpoint
+        response.Http2IgnoreBodyFrames = true;
+
+        response.Http2BodyData = new MemoryStream();
+
+        var tcs = new TaskCompletionSource<bool>();
+        response.ReadHttp2BodyTaskCompletionSource = tcs;
+
+        // signal to HTTP/2 copy frame method to continue
+        response.ReadHttp2BeforeHandlerTaskCompletionSource!.SetResult(true);
+
+        await tcs.Task.ConfigureAwait(false);
+        MarkResponseBodyRead(response);
+    }
+
+    private async Task ReadHttp1ResponseBodyAsync(Response response, CancellationToken cancellationToken)
+    {
+        var body = await ReadBodyAsync(false, cancellationToken).ConfigureAwait(false);
+        if (!response.BodyAvailable)
+        {
+            response.Body = body;
+            response.BodyIsWireEncoded = false; // Uncompress transformation
+        }
+
+        MarkResponseBodyRead(response);
     }
 
     private async Task<byte[]> ReadBodyAsync(bool isRequest, CancellationToken cancellationToken)
     {
         using var bodyStream = new MemoryStream();
-        using var writer = new HttpStream(Server, bodyStream, BufferPool, cancellationToken);
+
+        // Per-chunk/per-frame sizes are already bounded elsewhere; nothing upstream of this point
+        // caps the cumulative total this loop accumulates into memory, so a body assembled from many
+        // small pieces could otherwise grow unbounded. See BoundedWriteStream for why this needs to be
+        // the actual write target rather than a length check performed only after the fact.
+        var maxBufferedBodyBytes = MaxBufferedBodyBytes ?? Server.MaxBufferedBodyBytes;
+        Stream target = maxBufferedBodyBytes > 0
+            ? new BoundedWriteStream(bodyStream, maxBufferedBodyBytes, Server.PolicyModes[PolicyFamily.BodyBudget])
+            : bodyStream;
+        using var writer = new HttpStream(Server, target, BufferPool, cancellationToken);
 
         if (isRequest)
             await CopyRequestBodyAsync(writer, TransformationMode.Uncompress, cancellationToken);
@@ -232,6 +530,9 @@ public class SessionEventArgs : SessionEventArgsBase
         var contentLength = request.ContentLength;
 
         // send the request body bytes to server
+        // Integration point for MultipartStreamObserver: the observer can be created here and
+        // used alongside the existing CopyStream/ReadUntilBoundaryAsync pipeline for
+        // protocol-neutral, observational multipart streaming (e.g. HTTP/2 reuse).
         if (contentLength > 0 && HasMulipartEventSubscribers && request.IsMultipartFormData)
         {
             var boundary = HttpHelper.GetBoundaryFromContentType(request.ContentType);
@@ -246,7 +547,10 @@ public class SessionEventArgs : SessionEventArgsBase
                     if (contentLength > copyStream.ReadBytes)
                     {
                         var headers = new HeaderCollection();
-                        await HeaderParser.ReadHeaders(copyStream, headers, cancellationToken);
+                        await HeaderParser.ReadHeaders(copyStream, headers, cancellationToken,
+                            new HeaderBlockBudget(Server.ResourceLimits.MaxHeaderCount,
+                                Server.ResourceLimits.MaxHeaderAggregateBytes,
+                                Server.PolicyModes[PolicyFamily.HeaderLimits], isRequest: true));
                         OnMultipartRequestPartSent(boundary.Span, headers);
                     }
                 }
@@ -273,7 +577,7 @@ public class SessionEventArgs : SessionEventArgsBase
     /// Read a line from the byte stream
     /// </summary>
     /// <returns></returns>
-    private async Task<long> ReadUntilBoundaryAsync(ILineStream reader, long totalBytesToRead, ReadOnlyMemory<char> boundary, CancellationToken cancellationToken)
+    private async Task<long> ReadUntilBoundaryAsync(CopyStream reader, long totalBytesToRead, ReadOnlyMemory<char> boundary, CancellationToken cancellationToken) // NOSONAR S3776 -- This protocol/state-machine path shares mutable parsing or transport state; splitting it further would create disproportionate regression risk.
     {
         var bufferDataLength = 0;
 
@@ -327,14 +631,35 @@ public class SessionEventArgs : SessionEventArgsBase
     }
 
     /// <summary>
+    ///     Whether the proxy can buffer <paramref name="message"/> without exceeding the effective
+    ///     <see cref="MaxBufferedBodyBytes"/> budget. Unknown-length bodies (chunked, HTTP/2 or HTTP/3
+    ///     without Content-Length, server-sent events) return <see langword="false"/>: they must be
+    ///     relayed, not accumulated. A non-positive budget means unbounded and returns
+    ///     <see langword="true"/>. WebSocket upgrades are never buffered.
+    /// </summary>
+    public bool CanBufferBody(RequestResponseBase message)
+    {
+        if (HttpClient.Request.UpgradeToWebSocket)
+            return false;
+
+        var limit = MaxBufferedBodyBytes ?? Server.MaxBufferedBodyBytes;
+        if (limit <= 0)
+            return true;
+
+        var contentLength = message.ContentLength;
+        return contentLength >= 0 && contentLength <= limit;
+    }
+
+    /// <summary>
     /// Gets the request body as bytes.
     /// </summary>
     /// <param name="cancellationToken">Optional cancellation token for this async task.</param>
     /// <returns>The body as bytes.</returns>
     public async Task<byte[]> GetRequestBody(CancellationToken cancellationToken = default)
     {
-        if (!HttpClient.Request.IsBodyRead) await ReadRequestBodyAsync(cancellationToken);
-
+        if (!HttpClient.Request.IsBodyRead)
+            await ReadRequestBodyAsync(cancellationToken);
+        await EnsurePlainBodyAsync(HttpClient.Request, cancellationToken);
         return HttpClient.Request.Body;
     }
 
@@ -345,8 +670,7 @@ public class SessionEventArgs : SessionEventArgsBase
     /// <returns>The body as string.</returns>
     public async Task<string> GetRequestBodyAsString(CancellationToken cancellationToken = default)
     {
-        if (!HttpClient.Request.IsBodyRead) await ReadRequestBodyAsync(cancellationToken);
-
+        await GetRequestBody(cancellationToken);
         return HttpClient.Request.BodyString;
     }
 
@@ -357,9 +681,10 @@ public class SessionEventArgs : SessionEventArgsBase
     public void SetRequestBody(byte[] body)
     {
         var request = HttpClient.Request;
-        if (request.Locked) throw new Exception("You cannot call this function after request is made to server.");
+        if (request.Locked) throw new InvalidOperationException("You cannot call this function after request is made to server.");
 
         request.Body = body;
+        request.IsBodyRead = true;
     }
 
     /// <summary>
@@ -368,7 +693,7 @@ public class SessionEventArgs : SessionEventArgsBase
     /// <param name="body">The request body string to set.</param>
     public void SetRequestBodyString(string body)
     {
-        if (HttpClient.Request.Locked) throw new Exception("You cannot call this function after request is made to server.");
+        if (HttpClient.Request.Locked) throw new InvalidOperationException("You cannot call this function after request is made to server.");
 
         SetRequestBody(HttpClient.Request.Encoding.GetBytes(body));
     }
@@ -381,8 +706,9 @@ public class SessionEventArgs : SessionEventArgsBase
     /// <returns>The resulting bytes.</returns>
     public async Task<byte[]> GetResponseBody(CancellationToken cancellationToken = default)
     {
-        if (!HttpClient.Response.IsBodyRead) await ReadResponseBodyAsync(cancellationToken);
-
+        if (!HttpClient.Response.IsBodyRead)
+            await ReadResponseBodyAsync(cancellationToken);
+        await EnsurePlainBodyAsync(HttpClient.Response, cancellationToken);
         return HttpClient.Response.Body;
     }
 
@@ -393,9 +719,35 @@ public class SessionEventArgs : SessionEventArgsBase
     /// <returns>The string body.</returns>
     public async Task<string> GetResponseBodyAsString(CancellationToken cancellationToken = default)
     {
-        if (!HttpClient.Response.IsBodyRead) await ReadResponseBodyAsync(cancellationToken);
-
+        await GetResponseBody(cancellationToken);
         return HttpClient.Response.BodyString;
+    }
+
+    /// <summary>
+    ///     When eager-buffer left wire bytes in <see cref="RequestResponseBase.Body"/>, decompress once
+    ///     so handlers see the same plain body as H1/H2 Get*Body (and Set*Body can re-encode safely).
+    /// </summary>
+    private static async Task EnsurePlainBodyAsync(RequestResponseBase rr, CancellationToken cancellationToken)
+    {
+        if (!rr.BodyIsWireEncoded || rr.ContentEncoding == null || !rr.BodyAvailable)
+            return;
+
+        var (decompressStream, owned) =
+            CompressionUtil.CreateDecompressionChain(new MemoryStream(rr.Body), rr.ContentEncoding);
+        try
+        {
+            if (owned.Count == 0)
+                return; // unsupported (dcb/dcz/…) — leave wire bytes
+
+            using var ms = new MemoryStream();
+            await decompressStream.CopyToAsync(ms, cancellationToken);
+            rr.Body = ms.ToArray(); // clears BodyIsWireEncoded via setter
+        }
+        finally
+        {
+            for (var i = owned.Count - 1; i >= 0; i--)
+                await owned[i].DisposeAsync();
+        }
     }
 
     /// <summary>
@@ -404,10 +756,11 @@ public class SessionEventArgs : SessionEventArgsBase
     /// <param name="body">The body bytes to set.</param>
     public void SetResponseBody(byte[] body)
     {
-        if (!HttpClient.Request.Locked) throw new Exception("You cannot call this function before request is made to server.");
+        if (!HttpClient.Request.Locked) throw new InvalidOperationException("You cannot call this function before request is made to server.");
 
         var response = HttpClient.Response;
         response.Body = body;
+        response.IsBodyRead = true;
     }
 
     /// <summary>
@@ -416,7 +769,7 @@ public class SessionEventArgs : SessionEventArgsBase
     /// <param name="body">The body string to set.</param>
     public void SetResponseBodyString(string body)
     {
-        if (!HttpClient.Request.Locked) throw new Exception("You cannot call this function before request is made to server.");
+        if (!HttpClient.Request.Locked) throw new InvalidOperationException("You cannot call this function before request is made to server.");
 
         var bodyBytes = HttpClient.Response.Encoding.GetBytes(body);
 
@@ -446,11 +799,8 @@ public class SessionEventArgs : SessionEventArgsBase
     public void Ok(string html, IEnumerable<HttpHeader>? headers = null,
         bool closeServerConnection = false)
     {
-        var response = new OkResponse();
+        var response = ProxyResults.Html(html);
         if (headers != null) response.Headers.AddHeaders(headers);
-
-        response.HttpVersion = HttpClient.Request.HttpVersion;
-        response.Body = response.Encoding.GetBytes(html ?? string.Empty);
 
         Respond(response, closeServerConnection);
     }
@@ -567,7 +917,7 @@ public class SessionEventArgs : SessionEventArgsBase
 #if NET451 || NET45
         response.Body = Net45Compatibility.EmptyArray;
 #else
-            response.Body = Array.Empty<byte>();
+        response.Body = Array.Empty<byte>();
 #endif
 
         Respond(response, closeServerConnection);
@@ -576,15 +926,29 @@ public class SessionEventArgs : SessionEventArgsBase
     /// <summary>
     /// Respond with given response object to client.
     /// </summary>
+    /// <remarks>
+    /// If the server response was already received, the original server body (if any) is drained (syphoned) so the
+    /// server connection stays reusable. To avoid reading a large or endless server body, pass
+    /// <paramref name="closeServerConnection" /> = true (or call <see cref="TerminateServerConnection" />), which
+    /// closes the connection instead of draining. Note that an HTTP/1.1 connection cannot be both reused and have
+    /// its body skipped.
+    /// </remarks>
     /// <param name="response">The response object.</param>
     /// <param name="closeServerConnection">Close the server connection used by request if any?</param>
     public void Respond(Response response, bool closeServerConnection = false)
     {
+        ApplySyntheticResponseDefaults(response);
+
         // request already send/ready to be sent.
         if (HttpClient.Request.Locked)
         {
             // response already received from server and ready to be sent to client.
-            if (HttpClient.Response.Locked) throw new Exception("You cannot call this function after response is sent to the client.");
+            // A native HTTP/2 response is locked while its body is buffered for GetResponseBody, but nothing has
+            // reached the client yet, so the still-running handler may replace it once the whole origin body has
+            // arrived (see Http2ReplaceableUntilBodyEnd). Earlier, the frame loop is still routing DATA to the original.
+            if (HttpClient.Response.Locked
+                && !(HttpClient.Response.Http2ReplaceableUntilBodyEnd && HttpClient.Response.IsBodyReceived))
+                throw new InvalidOperationException("You cannot call this function after response is sent to the client.");
 
             // cleanup original response.
             if (closeServerConnection)
@@ -594,9 +958,14 @@ public class SessionEventArgs : SessionEventArgsBase
 
             response.SetOriginalHeaders(HttpClient.Response);
 
+            // Suppress origin DATA while synthetic emission is queued (H2 frame loop reads
+            // HttpClient.Response.Http2IgnoreBodyFrames on each DATA frame).
+            HttpClient.Response.Http2IgnoreBodyFrames = true;
+
             // response already received from server but not yet ready to sent to client.         
             HttpClient.Response = response;
             HttpClient.Response.Locked = true;
+            HttpClient.Response.Http2IgnoreBodyFrames = true;
         }
         // request not yet sent/not yet ready to be sent.
         else
@@ -608,6 +977,60 @@ public class SessionEventArgs : SessionEventArgsBase
             HttpClient.Response = response;
             HttpClient.Response.Locked = true;
         }
+
+        // Buffered synthetics already carry the body; mark read so H2 GetResponseBody does not
+        // wait on ReadHttp2BeforeHandlerTaskCompletionSource (null after replacement).
+        // Do not set IsBodyReceived when replacing an origin response — SyphonOutBodyAsync must
+        // still drain unread origin bytes so pooled H1 connections stay reusable.
+        if (HttpClient.Response.BodyAvailable)
+        {
+            HttpClient.Response.IsBodyRead = true;
+            if (HttpClient.Request.CancelRequest)
+                HttpClient.Response.IsBodyReceived = true;
+        }
+    }
+
+    /// <summary>
+    ///     Respond to the client with a streamed body produced by <see cref="ProxyResults.Stream" /> or
+    ///     <see cref="ProxyResults.File" />.
+    /// </summary>
+    /// <param name="result">Streaming response metadata and body writer.</param>
+    /// <param name="closeServerConnection">Close the server connection used by request if any?</param>
+    public void RespondStreaming(StreamingProxyResult result, bool closeServerConnection)
+    {
+        ArgumentNullException.ThrowIfNull(result.WriteBody);
+        ApplySyntheticResponseDefaults(result.Response);
+        RespondStreaming(result.Response, result.WriteBody, closeServerConnection);
+    }
+
+    /// <summary>
+    ///     Respond to the client with a streamed body produced on the fly, without buffering the whole body in
+    ///     memory. Use this to serve large or endless bodies (e.g. a multi-gigabyte file or a synthetic
+    ///     server-sent-events stream) from scratch.
+    /// </summary>
+    /// <remarks>
+    ///     Framing is chosen from the response headers: if a Content-Length is set on <paramref name="response" />
+    ///     the body is written raw (the delegate must write exactly that many bytes); otherwise HTTP/1.1 uses
+    ///     chunked transfer-encoding and HTTP/2/HTTP/3 emit DATA / stream frames. The delegate receives a
+    ///     write-only stream; only a single buffer is in flight at a time, so memory stays bounded regardless
+    ///     of the total size. See <see cref="Respond" /> for the server body syphon-vs-close trade-off controlled
+    ///     by <paramref name="closeServerConnection" />.
+    /// </remarks>
+    /// <param name="response">The response object (status and headers).</param>
+    /// <param name="writeBody">Delegate that writes the body to the provided stream.</param>
+    /// <param name="closeServerConnection">Close the server connection used by request if any?</param>
+    public void RespondStreaming(Response response, Func<Stream, CancellationToken, Task> writeBody,
+        bool closeServerConnection = false)
+    {
+        ArgumentNullException.ThrowIfNull(response);
+        ArgumentNullException.ThrowIfNull(writeBody);
+
+        // Choose framing: fixed-length when the caller declared a Content-Length, otherwise chunked.
+        if (response.ContentLength < 0 && !response.IsChunked) response.IsChunked = true;
+
+        response.StreamBodyWriter = writeBody;
+
+        Respond(response, closeServerConnection);
     }
 
     /// <summary>
@@ -618,23 +1041,66 @@ public class SessionEventArgs : SessionEventArgsBase
         HttpClient.CloseServerConnection = true;
     }
 
+    private void ApplySyntheticResponseDefaults(Response response)
+    {
+        if (response.HttpVersion == HttpHeader.VersionUnknown)
+            response.HttpVersion = HttpClient.Request.HttpVersion;
+        response.IsSynthetic = true;
+    }
+
+    /// <summary>
+    ///     Drains (reads and discards) any unread server response body from the underlying
+    ///     client/server stream or connection so it can be reused. This reads the bytes off the wire
+    ///     without buffering them in memory. It is a no-op if the body was already received or the
+    ///     response has no body.
+    /// </summary>
+    /// <remarks>
+    ///     Warning: for an endless chunked response (one that never sends its terminating zero chunk) this will
+    ///     block until the passed <paramref name="cancellationToken" /> is cancelled or the connection closes. In
+    ///     that case prefer closing the connection (e.g. <see cref="TerminateServerConnection" />) instead.
+    /// </remarks>
+    public Task DrainServerBodyAsync(CancellationToken cancellationToken = default)
+    {
+        return SyphonOutBodyAsync(false, cancellationToken);
+    }
+
+    /// <summary>
+    ///     Drains (reads and discards) any unread client request body from the underlying stream or
+    ///     connection so the client's keep-alive / multiplexed connection can be reused. This reads the
+    ///     bytes off the wire without buffering them in memory. It is a no-op if the body was already
+    ///     received or the request has no body.
+    /// </summary>
+    /// <remarks>
+    ///     Useful when short-circuiting a request (e.g. <see cref="Respond" />, <see cref="RespondStreaming" />, or
+    ///     blocking) while the client is uploading a body: draining leaves the client connection in a reusable
+    ///     state. Note the proxy already drains the client body automatically on the normal synthetic-response
+    ///     path, so this is only needed for advanced/manual control.
+    ///     Warning: for an endless chunked request (one that never sends its terminating zero chunk) this will
+    ///     block until the passed <paramref name="cancellationToken" /> is cancelled or the connection closes.
+    /// </remarks>
+    public Task DrainClientBodyAsync(CancellationToken cancellationToken = default)
+    {
+        return SyphonOutBodyAsync(true, cancellationToken);
+    }
+
     protected override void Dispose(bool disposing)
     {
         if (disposed) return;
 
-        MultipartRequestPartSent = null;
+        if (disposing)
+        {
+            MultipartRequestPartSent = null;
+
+            // Dispose any accumulated HTTP/2 body MemoryStreams so their backing arrays
+            // are returned to the LOH promptly rather than waiting for GC finalization.
+            HttpClient.Request.Http2BodyData?.Dispose();
+            HttpClient.Request.Http2BodyData = null;
+            HttpClient.Response.Http2BodyData?.Dispose();
+            HttpClient.Response.Http2BodyData = null;
+        }
+
         disposed = true;
 
         base.Dispose(disposing);
-    }
-
-    ~SessionEventArgs()
-    {
-#if DEBUG
-            // Finalizer should not be called
-            System.Diagnostics.Debugger.Break();
-#endif
-
-        Dispose(false);
     }
 }

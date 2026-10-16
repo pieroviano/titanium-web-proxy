@@ -1,0 +1,393 @@
+# Emit wiki markdown for compare-product Reverse + MITM tables (median of 3 GHA runs).
+# Pass every product shard run id: -RunIds 111,222,333 (union by arm name; same SHA only).
+# Lite÷Reverse stays same-job because comparison-group shards co-locate peers on one VM.
+param(
+    [Parameter(Mandatory)] [string[]] $RunIds,
+    [string] $ResultsRoot = 'tools/RpsLoadProbe/results/gha-dl',
+    [string] $HeadSha = 'df172718',
+    [string] $PrimaryRunId = '33041445371',
+    [string] $OutFile = ''
+)
+
+$ErrorActionPreference = 'Stop'
+if ($RunIds.Count -eq 1 -and $RunIds[0] -match ',') {
+    $RunIds = $RunIds[0].Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+}
+$Steps = 4
+$mul = [string][char]0x00D7          # ×
+$goldMedal = [char]::ConvertFromUtf32(0x1F947)  # 🥇
+
+function Median([double[]]$vals) {
+    if ($vals.Count -eq 0) { return $null }
+    $s = $vals | Sort-Object
+    return $s[[math]::Floor(($s.Count - 1) / 2)]
+}
+
+function Get-ArmMetrics([string]$CsvPath, [string]$Arm) {
+    $rows = @(Import-Csv $CsvPath | Where-Object { $_.arm -eq $Arm })
+    if ($rows.Count -eq 0) { return $null }
+    $sustains = @(); $peaks = @(); $rss = @(); $cpu = @(); $bytes = @()
+    $sawC64 = $false
+    for ($i = 0; $i + $Steps -le $rows.Count; $i += $Steps) {
+        $chunk = $rows[$i..($i + $Steps - 1)]
+        $c64Ok = $chunk | Where-Object { $_.concurrency -eq '64' -and $_.meets_slo -eq '1' } | Select-Object -Last 1
+        if ($c64Ok) {
+            $sustains += [double]$c64Ok.rps
+            $peaks += [double]$c64Ok.rps
+            $rss += [double]$c64Ok.proxy_rss_peak_bytes
+            $cpu += [double]$c64Ok.proxy_cpu_avg_pct
+            $bytes += (Get-PayloadBytes $c64Ok)
+            $sawC64 = $true
+            continue
+        }
+        # SLO miss: do not mix 0 into the sustain median (noisy Mac peer-fix arms).
+        $c64Any = $chunk | Where-Object { $_.concurrency -eq '64' } | Select-Object -Last 1
+        if ($c64Any) {
+            $sawC64 = $true
+            $peaks += [double]$c64Any.rps
+            $rss += [double]$c64Any.proxy_rss_peak_bytes
+            $cpu += [double]$c64Any.proxy_cpu_avg_pct
+            $bytes += (Get-PayloadBytes $c64Any)
+        }
+    }
+    if ($sustains.Count -gt 0) {
+        return @{
+            Sustain = Median $sustains
+            Peak = Median $peaks
+            Rss = Median $rss
+            Cpu = Median $cpu
+            Bytes = Median $bytes
+        }
+    }
+    # Misaligned repeats (missing c=64 in a pass): use any SLO-pass c=64 rows.
+    $okAny = @($rows | Where-Object { $_.concurrency -eq '64' -and $_.meets_slo -eq '1' })
+    if ($okAny.Count -gt 0) {
+        $s = @($okAny | ForEach-Object { [double]$_.rps })
+        $r = @($okAny | ForEach-Object { [double]$_.proxy_rss_peak_bytes })
+        $c = @($okAny | ForEach-Object { [double]$_.proxy_cpu_avg_pct })
+        $b = @($okAny | ForEach-Object { Get-PayloadBytes $_ })
+        return @{
+            Sustain = Median $s
+            Peak = Median $s
+            Rss = Median $r
+            Cpu = Median $c
+            Bytes = Median $b
+        }
+    }
+    if (-not $sawC64 -or $peaks.Count -eq 0) { return $null }
+    return @{
+        Sustain = 0
+        Peak = Median $peaks
+        Rss = Median $rss
+        Cpu = Median $cpu
+        Bytes = Median $bytes
+    }
+}
+
+function Get-PayloadBytes($row) {
+    $resp = 0.0; $req = 0.0
+    if ($row.PSObject.Properties.Name -contains 'response_bytes' -and $row.response_bytes) {
+        $resp = [double]$row.response_bytes
+    }
+    if ($row.PSObject.Properties.Name -contains 'request_bytes' -and $row.request_bytes) {
+        $req = [double]$row.request_bytes
+    }
+    return $resp + $req
+}
+
+function Get-LogicalCpus([string]$OsFolder) {
+    if ($OsFolder -eq 'macos-15') { return 3 }
+    return 4
+}
+
+function Format-CostSuffix($metrics, [int]$Cpus) {
+    if (-not $metrics -or -not $metrics.Sustain -or $metrics.Sustain -le 0) { return '' }
+    $parts = @()
+    $payload = 0.0
+    if ($metrics.ContainsKey('Bytes') -and $metrics.Bytes) { $payload = [double]$metrics.Bytes }
+    $inv = [cultureinfo]::InvariantCulture
+    if ($payload -ge 1024) {
+        $mib = $metrics.Sustain * $payload / 1MB
+        $parts += $mib.ToString('N0', $inv) + ' MiB/s'
+    }
+    if ($metrics.Cpu -ge 0.05) {
+        $us = $metrics.Cpu * $Cpus / 100.0 / $metrics.Sustain * 1000000
+        $parts += ($us.ToString('N1', $inv) + ' µs CPU/req')
+    }
+    if ($parts.Count -eq 0) { return '' }
+    return ' · ' + ($parts -join ' · ')
+}
+
+function Get-MedianMetrics([string]$OsFolder, [string]$Arm) {
+    # Across run IDs: take the best sustain/peak so peer-fix overlays beat older 0-RPS
+    # product rows for the same arm (median of [0, 50k] would publish 0).
+    $best = $null
+    foreach ($runId in $RunIds) {
+        $dir = Join-Path $ResultsRoot $runId
+        # Exact OS folder or shard-suffixed (rps-csv-ubuntu-latest-shard-1-3).
+        # Also accept flat artifact layouts (csv directly under runId).
+        # Never accept retired macos-15-intel paths when requesting macos-15.
+        $csvs = @(Get-ChildItem `
+            "$dir/rps-csv-$OsFolder/*.csv", `
+            "$dir/rps-csv-$OsFolder-*/*.csv", `
+            "$dir/$OsFolder/*.csv", `
+            "$dir/*.csv" `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+                if ($OsFolder -ne 'macos-15') { $true }
+                else {
+                    $p = $_.FullName.ToLowerInvariant().Replace('\', '/')
+                    $p -notmatch 'macos-15-intel'
+                }
+            })
+        foreach ($csv in $csvs) {
+            $m = Get-ArmMetrics $csv.FullName $Arm
+            if (-not $m) { continue }
+            if ($null -eq $best -or $m.Sustain -gt $best.Sustain -or
+                ($m.Sustain -eq $best.Sustain -and $m.Peak -gt $best.Peak)) {
+                $best = $m
+            }
+        }
+    }
+    return $best
+}
+
+function Format-RpsCell($metrics, [switch]$Medal, [int]$Cpus = 4) {
+    if (-not $metrics) { return '*Not measured*' }
+    $sustain = [int][math]::Round($metrics.Sustain, 0)
+    $peak = [int][math]::Round($metrics.Peak, 0)
+    $mb = [int][math]::Round($metrics.Rss / 1MB, 0)
+    $cpu = [math]::Round($metrics.Cpu, 1)
+    $prefix = if ($Medal) { "$goldMedal " } else { '' }
+    $inv = [cultureinfo]::InvariantCulture
+    $sustainText = $sustain.ToString('N0', $inv)
+    $cost = Format-CostSuffix $metrics $Cpus
+    if ($peak -gt $sustain) {
+        $peakText = $peak.ToString('N0', $inv)
+        $sub = "peak $peakText · $mb MiB / $cpu% CPU$cost"
+    } else {
+        $sub = "$mb MiB / $cpu% CPU$cost"
+    }
+    return ("{0}**{1}**<br><sub>({2})</sub>" -f $prefix, $sustainText, $sub)
+}
+
+function Format-Impossible([string]$Reason = 'Not possible') {
+    return "*$Reason*"
+}
+
+$wires = @(
+    @{ C='HTTP/1 · plain'; O='HTTP/1 · plain'; Rev='twp-reverse-http1'; Yarp='yarp-reverse-http1'; Nginx='nginx-reverse-http1'; Lite='twp-mitm-http1'; Full='twp-mitm-full-http1' },
+    @{ C='HTTP/1 · plain'; O='HTTP/1 · TLS'; Rev='twp-reverse-http1-to-https'; Yarp='yarp-reverse-http1-to-https'; Nginx='nginx-reverse-http1-to-https'; Lite='twp-mitm-http1-to-https'; Full='twp-mitm-full-http1-to-https' },
+    @{ C='HTTP/1 · plain'; O='HTTP/2 · plain'; Rev='twp-reverse-http1-plain-to-h2c'; Yarp='yarp-reverse-http1-plain-to-h2c'; Nginx=$null; Haproxy='haproxy-reverse-http1-plain-to-h2c'; Envoy='envoy-reverse-http1-plain-to-h2c'; NginxImpossible='Not possible (no H2 upstream)'; Lite='twp-mitm-http1-plain-to-h2c'; Full='twp-mitm-full-http1-plain-to-h2c' },
+    @{ C='HTTP/1 · plain'; O='HTTP/2 · TLS'; Rev='twp-reverse-http1-plain-to-http2'; Yarp='yarp-reverse-http1-plain-to-http2'; Nginx=$null; Haproxy='haproxy-reverse-http1-plain-to-http2'; Envoy='envoy-reverse-http1-plain-to-http2'; NginxImpossible='Not possible (no H2 upstream)'; Lite='twp-mitm-http1-plain-to-http2'; Full='twp-mitm-full-http1-plain-to-http2' },
+    @{ C='HTTP/1 · plain'; O='HTTP/3 · QUIC'; Rev='twp-reverse-http1-plain-to-http3'; Yarp='yarp-reverse-http1-plain-to-http3'; Nginx=$null; Haproxy=$null; Envoy='envoy-reverse-http1-plain-to-http3'; NginxImpossible='Not possible (no H3 upstream)'; HaproxyImpossible='Not possible (no H3 upstream)'; Lite='twp-mitm-http1-plain-to-http3'; Full='twp-mitm-full-http1-plain-to-http3' },
+    @{ C='HTTP/1 · TLS'; O='HTTP/1 · plain'; Rev='twp-reverse-http1-tls'; Yarp='yarp-reverse-http1-tls'; Nginx='nginx-reverse-http1-tls'; Lite='twp-mitm-http1-tls'; Full='twp-mitm-full-http1-tls' },
+    @{ C='HTTP/1 · TLS'; O='HTTP/1 · TLS'; Rev='twp-reverse-http1-mitm'; Yarp='yarp-reverse-http1-tls-to-https'; Nginx='nginx-reverse-http1-tls-to-https'; Lite='twp-mitm-http1-tls-to-https'; Full='twp-mitm-full-http1-tls-to-https' },
+    @{ C='HTTP/1 · TLS'; O='HTTP/2 · plain'; Rev='twp-reverse-http1-to-h2c'; Yarp='yarp-reverse-http1-to-h2c'; Nginx=$null; Haproxy='haproxy-reverse-http1-to-h2c'; Envoy='envoy-reverse-http1-to-h2c'; NginxImpossible='Not possible (no H2 upstream)'; Lite='twp-mitm-http1-to-h2c'; Full='twp-mitm-full-http1-to-h2c' },
+    @{ C='HTTP/1 · TLS'; O='HTTP/2 · TLS'; Rev='twp-reverse-http11-to-http2'; Yarp='yarp-reverse-http11-to-http2'; Nginx=$null; Haproxy='haproxy-reverse-http11-to-http2'; Envoy='envoy-reverse-http11-to-http2'; NginxImpossible='Not possible (no H2 upstream)'; Lite='twp-mitm-http11-to-http2'; Full='twp-mitm-full-http11-to-http2' },
+    @{ C='HTTP/1 · TLS'; O='HTTP/3 · QUIC'; Rev='twp-reverse-http1-to-http3'; Yarp='yarp-reverse-http1-to-http3'; Nginx=$null; Haproxy=$null; Envoy='envoy-reverse-http1-to-http3'; NginxImpossible='Not possible (no H3 upstream)'; HaproxyImpossible='Not possible (no H3 upstream)'; Lite='twp-mitm-http1-to-http3'; Full='twp-mitm-full-http1-to-http3' },
+    @{ C='HTTP/2 · plain'; O='HTTP/1 · plain'; Rev='twp-reverse-h2c-to-h1'; Yarp='yarp-reverse-h2c-to-h1'; Nginx='nginx-reverse-h2c-to-h1'; Lite='twp-mitm-h2c-to-h1'; Full='twp-mitm-full-h2c-to-h1' },
+    @{ C='HTTP/2 · plain'; O='HTTP/1 · TLS'; Rev='twp-reverse-h2c-to-https'; Yarp='yarp-reverse-h2c-to-https'; Nginx='nginx-reverse-h2c-to-https'; Lite='twp-mitm-h2c-to-https'; Full='twp-mitm-full-h2c-to-https' },
+    @{ C='HTTP/2 · plain'; O='HTTP/2 · plain'; Rev='twp-reverse-h2c-to-h2c'; Yarp='yarp-reverse-h2c-to-h2c'; Nginx=$null; Haproxy='haproxy-reverse-h2c-to-h2c'; Envoy='envoy-reverse-h2c-to-h2c'; NginxImpossible='Not possible (no H2 upstream)'; Lite='twp-mitm-h2c-to-h2c'; Full='twp-mitm-full-h2c-to-h2c' },
+    @{ C='HTTP/2 · plain'; O='HTTP/2 · TLS'; Rev='twp-reverse-h2c'; Yarp='yarp-reverse-h2c'; Nginx=$null; Haproxy='haproxy-reverse-h2c'; Envoy='envoy-reverse-h2c'; NginxImpossible='Not possible (no H2 upstream)'; Lite='twp-mitm-h2c'; Full='twp-mitm-full-h2c' },
+    @{ C='HTTP/2 · plain'; O='HTTP/3 · QUIC'; Rev='twp-reverse-h2c-to-h3'; Yarp='yarp-reverse-h2c-to-h3'; Nginx=$null; Haproxy=$null; Envoy='envoy-reverse-h2c-to-h3'; NginxImpossible='Not possible (no H3 upstream)'; HaproxyImpossible='Not possible (no H3 upstream)'; Lite='twp-mitm-h2c-to-h3'; Full='twp-mitm-full-h2c-to-h3' },
+    @{ C='HTTP/2 · TLS'; O='HTTP/1 · plain'; Rev='twp-reverse-http2-cleartext'; Yarp='yarp-reverse-http2'; Nginx='nginx-reverse-http2'; Lite='twp-mitm-http2-cleartext'; Full='twp-mitm-full-http2-cleartext' },
+    @{ C='HTTP/2 · TLS'; O='HTTP/1 · TLS'; Rev='twp-reverse-http2-to-https-http1'; Yarp='yarp-reverse-http2-to-https-http1'; Nginx='nginx-reverse-http2-to-https-http1'; Lite='twp-mitm-http2-to-http1'; Full='twp-mitm-full-http2-to-http1' },
+    @{ C='HTTP/2 · TLS'; O='HTTP/2 · plain'; Rev='twp-reverse-http2-to-h2c'; Yarp='yarp-reverse-http2-to-h2c'; Nginx=$null; Haproxy='haproxy-reverse-http2-to-h2c'; Envoy='envoy-reverse-http2-to-h2c'; NginxImpossible='Not possible (no H2 upstream)'; Lite='twp-mitm-http2-to-h2c'; Full='twp-mitm-full-http2-to-h2c' },
+    @{ C='HTTP/2 · TLS'; O='HTTP/2 · TLS'; Rev='twp-reverse-http2'; Yarp='yarp-reverse-http2-to-https'; Nginx=$null; Haproxy='haproxy-reverse-http2-to-https'; Envoy='envoy-reverse-http2-to-https'; NginxImpossible='Not possible (no H2 upstream)'; Lite='twp-mitm-http2'; Full='twp-mitm-full-http2' },
+    @{ C='HTTP/2 · TLS'; O='HTTP/3 · QUIC'; Rev='twp-reverse-http2-to-http3'; Yarp='yarp-reverse-http2-to-http3'; Nginx=$null; Haproxy=$null; Envoy='envoy-reverse-http2-to-http3'; NginxImpossible='Not possible (no H3 upstream)'; HaproxyImpossible='Not possible (no H3 upstream)'; Lite='twp-mitm-http2-to-http3'; Full='twp-mitm-full-http2-to-http3' },
+    @{ C='HTTP/3 · QUIC'; O='HTTP/1 · plain'; Rev='twp-reverse-http3-cleartext'; Yarp='yarp-reverse-http3-cleartext'; Nginx='nginx-reverse-http3-cleartext'; Lite='twp-mitm-http3-cleartext'; Full='twp-mitm-full-http3-cleartext' },
+    @{ C='HTTP/3 · QUIC'; O='HTTP/1 · TLS'; Rev='twp-reverse-http3-to-https-http1'; Yarp='yarp-reverse-http3-to-https-http1'; Nginx='nginx-reverse-http3-to-https-http1'; Lite='twp-mitm-http3-to-http1'; Full='twp-mitm-full-http3-to-http1' },
+    @{ C='HTTP/3 · QUIC'; O='HTTP/2 · plain'; Rev='twp-reverse-http3-to-h2c'; Yarp='yarp-reverse-http3-to-h2c'; Nginx=$null; Haproxy='haproxy-reverse-http3-to-h2c'; Envoy='envoy-reverse-http3-to-h2c'; NginxImpossible='Not possible (no H2 upstream)'; Lite='twp-mitm-http3-to-h2c'; Full='twp-mitm-full-http3-to-h2c' },
+    @{ C='HTTP/3 · QUIC'; O='HTTP/2 · TLS'; Rev='twp-reverse-http3-to-http2'; Yarp='yarp-reverse-http3-to-http2'; Nginx=$null; Haproxy='haproxy-reverse-http3-to-http2'; Envoy='envoy-reverse-http3-to-http2'; NginxImpossible='Not possible (no H2 upstream)'; Lite='twp-mitm-http3-to-http2'; Full='twp-mitm-full-http3-to-http2' },
+    @{ C='HTTP/3 · QUIC'; O='HTTP/3 · QUIC'; Rev='twp-reverse-http3'; Yarp='yarp-reverse-http3-to-http3'; Nginx=$null; Haproxy=$null; Envoy='envoy-reverse-http3-to-http3'; NginxImpossible='Not possible (no H3 upstream)'; HaproxyImpossible='Not possible (no H3 upstream)'; Lite='twp-mitm-http3'; Full='twp-mitm-full-http3' }
+)
+
+foreach ($w in $wires) {
+    # Derive HAProxy/Envoy from nginx when the terminate-to-H1 arm already exists.
+    # Product-possible / harness-absent cells set Haproxy/Envoy explicitly (see
+    # product-arm-matrix.py). Do not copy nginx=$null onto those two — that used
+    # to label H3→H2 as *Not possible (no H3 to H2)* for HAProxy/Envoy.
+    # HAProxy 3.2 has no QUIC backend — H3-origin wires keep Haproxy=$null + HaproxyImpossible.
+    if ($w.Nginx) {
+        if (-not $w.HaproxyImpossible -and -not $w.Haproxy) {
+            $w.Haproxy = $w.Nginx -replace '^nginx-', 'haproxy-'
+        }
+        if (-not $w.Envoy) { $w.Envoy = $w.Nginx -replace '^nginx-', 'envoy-' }
+    }
+}
+
+function Get-PeerImpossibleReason([hashtable]$w, [string]$PeerKey, [string]$Arm) {
+    if ($Arm) { return $null }
+    if ($PeerKey -eq 'Nginx' -and $w.NginxImpossible) { return $w.NginxImpossible }
+    if ($PeerKey -eq 'Haproxy' -and $w.HaproxyImpossible) { return $w.HaproxyImpossible }
+    if ($w.O -match 'QUIC') { return 'Not possible (no H3 upstream)' }
+    if ($w.O -match 'HTTP/2') { return 'Not possible (no H2 upstream)' }
+    return 'Not possible'
+}
+
+function Format-TerminatePeerCell(
+    [string]$OsFolder,
+    [hashtable]$w,
+    [string]$PeerKey,
+    $metrics,
+    [switch]$Medal
+) {
+    if ($PeerKey -in @('Haproxy', 'Envoy') -and $OsFolder -eq 'windows-latest') {
+        return Format-Impossible 'Not possible'
+    }
+    # Windows nginx has no http_v3_module / QUIC — H3 inbound is OS-impossible.
+    if ($PeerKey -eq 'Nginx' -and $OsFolder -eq 'windows-latest' -and $w.Nginx -and ($w.Nginx -match 'http3')) {
+        return Format-Impossible 'Not possible (no QUIC)'
+    }
+    $arm = $w[$PeerKey]
+    if ($arm) {
+        return Format-RpsCell $metrics -Medal:$Medal -Cpus:(Get-LogicalCpus $OsFolder)
+    }
+    $reason = Get-PeerImpossibleReason $w $PeerKey $arm
+    return Format-Impossible $reason
+}
+
+function Emit-ReverseTable([string]$OsFolder) {
+    $omitNative = ($OsFolder -eq 'windows-latest')
+    if ($omitNative) {
+        Write-Output '| Client | Origin | TWP | nginx | YARP |'
+        Write-Output '|---|---|---:|---:|---:|'
+    } else {
+        Write-Output '| Client | Origin | TWP | nginx | HAProxy | Envoy | YARP |'
+        Write-Output '|---|---|---:|---:|---:|---:|---:|'
+    }
+    foreach ($w in $wires) {
+        $twp = Get-MedianMetrics $OsFolder $w.Rev
+        $yarp = Get-MedianMetrics $OsFolder $w.Yarp
+        $nginx = if ($w.Nginx) { Get-MedianMetrics $OsFolder $w.Nginx } else { $null }
+        $haproxy = if (-not $omitNative -and $w.Haproxy) { Get-MedianMetrics $OsFolder $w.Haproxy } else { $null }
+        $envoy = if (-not $omitNative -and $w.Envoy) { Get-MedianMetrics $OsFolder $w.Envoy } else { $null }
+        $candidates = @(
+            @{ M = $twp; K = 'twp' },
+            @{ M = $yarp; K = 'yarp' },
+            @{ M = $nginx; K = 'nginx' }
+        )
+        if (-not $omitNative) {
+            $candidates += @(
+                @{ M = $haproxy; K = 'haproxy' },
+                @{ M = $envoy; K = 'envoy' }
+            )
+        }
+        $best = @(
+            $candidates |
+                Where-Object { $_.M -and $_.M.Sustain -gt 0 } |
+                Sort-Object `
+                    @{ Expression = { -$_.M.Sustain }; Ascending = $true }, `
+                    @{ Expression = { $_.M.Rss }; Ascending = $true }, `
+                    @{ Expression = { $_.M.Cpu }; Ascending = $true } |
+                Select-Object -First 1
+        ).K
+        $cpus = Get-LogicalCpus $OsFolder
+        if ($omitNative) {
+            Write-Output ("| {0} | {1} | {2} | {3} | {4} |" -f $w.C, $w.O,
+                (Format-RpsCell $twp -Medal:($best -eq 'twp') -Cpus:$cpus),
+                (Format-TerminatePeerCell $OsFolder $w 'Nginx' $nginx -Medal:($best -eq 'nginx')),
+                (Format-RpsCell $yarp -Medal:($best -eq 'yarp') -Cpus:$cpus))
+        } else {
+            Write-Output ("| {0} | {1} | {2} | {3} | {4} | {5} | {6} |" -f $w.C, $w.O,
+                (Format-RpsCell $twp -Medal:($best -eq 'twp') -Cpus:$cpus),
+                (Format-TerminatePeerCell $OsFolder $w 'Nginx' $nginx -Medal:($best -eq 'nginx')),
+                (Format-TerminatePeerCell $OsFolder $w 'Haproxy' $haproxy -Medal:($best -eq 'haproxy')),
+                (Format-TerminatePeerCell $OsFolder $w 'Envoy' $envoy -Medal:($best -eq 'envoy')),
+                (Format-RpsCell $yarp -Medal:($best -eq 'yarp') -Cpus:$cpus))
+        }
+    }
+}
+
+function Get-OsArmNames([string]$OsFolder) {
+    $names = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($runId in $RunIds) {
+        $dir = Join-Path $ResultsRoot $runId
+        $csvs = @(Get-ChildItem `
+            "$dir/rps-csv-$OsFolder/*.csv", `
+            "$dir/rps-csv-$OsFolder-*/*.csv", `
+            "$dir/$OsFolder/*.csv", `
+            "$dir/*.csv" `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+                if ($OsFolder -ne 'macos-15') { $true }
+                else {
+                    $p = $_.FullName.ToLowerInvariant().Replace('\', '/')
+                    $p -notmatch 'macos-15-intel'
+                }
+            })
+        foreach ($csv in $csvs) {
+            foreach ($row in @(Import-Csv $csv.FullName)) {
+                if ($row.arm) { [void]$names.Add([string]$row.arm) }
+            }
+        }
+    }
+    return $names
+}
+
+function Emit-MitmTable([string]$OsFolder) {
+    Write-Output '| Client | Origin | Lite sustain | Full sustain | Lite÷Reverse | Full÷Reverse |'
+    Write-Output '|---|---|---:|---:|---:|---:|'
+    foreach ($w in $wires) {
+        $rev = Get-MedianMetrics $OsFolder $w.Rev
+        $lite = Get-MedianMetrics $OsFolder $w.Lite
+        $full = Get-MedianMetrics $OsFolder $w.Full
+        if (-not $rev) { continue }
+        $lr = if ($lite) { [math]::Round($lite.Sustain / $rev.Sustain, 2) } else { 0 }
+        $fr = if ($full) { [math]::Round($full.Sustain / $rev.Sustain, 2) } else { 0 }
+        Write-Output ("| {0} | {1} | {2} | {3} | **{4}{5}** | **{6}{5}** |" -f $w.C, $w.O,
+            (Format-RpsCell $lite), (Format-RpsCell $full), $lr, $mul, $fr)
+    }
+}
+
+$lines = [System.Collections.Generic.List[string]]::new()
+function Out([string]$s) { [void]$lines.Add($s) }
+
+Out "HEAD_SHA=$HeadSha PRIMARY_RUN=$PrimaryRunId"
+Out '---WIN_REVERSE---'
+# Emit helpers still Write-Output — capture via scriptblock redirection below.
+$script:EmitSink = $lines
+function Emit-SinkRedirect {
+    param([scriptblock]$Block)
+    foreach ($line in (& $Block)) { [void]$script:EmitSink.Add([string]$line) }
+}
+
+function Emit-MitmOrKeep([string]$OsFolder) {
+    # Published MITM is Linux only. Windows and macOS product jobs never run twp-mitm-*.
+    if ($OsFolder -ne 'ubuntu-latest') {
+        Write-Output 'DROP'
+        return
+    }
+    $names = Get-OsArmNames $OsFolder
+    $hasReverse = @($names | Where-Object { $_ -like 'twp-reverse-*' -or $_ -like 'yarp-reverse-*' }).Count -gt 0
+    $hasMitm = @($names | Where-Object { $_.StartsWith('twp-mitm-') }).Count -gt 0
+    if ($hasReverse -and -not $hasMitm) {
+        Write-Output 'KEEP'
+        return
+    }
+    Emit-MitmTable $OsFolder
+}
+
+Emit-SinkRedirect { Emit-ReverseTable 'windows-latest' }
+Out '---WIN_MITM---'
+Emit-SinkRedirect { Emit-MitmOrKeep 'windows-latest' }
+Out '---LIN_REVERSE---'
+Emit-SinkRedirect { Emit-ReverseTable 'ubuntu-latest' }
+Out '---LIN_MITM---'
+Emit-SinkRedirect { Emit-MitmOrKeep 'ubuntu-latest' }
+Out '---MAC_REVERSE---'
+Emit-SinkRedirect { Emit-ReverseTable 'macos-15' }
+Out '---MAC_MITM---'
+Emit-SinkRedirect { Emit-MitmOrKeep 'macos-15' }
+
+$text = ($lines -join "`n") + "`n"
+if ($OutFile) {
+    $utf8 = New-Object System.Text.UTF8Encoding $false
+    $full = if ([IO.Path]::IsPathRooted($OutFile)) { $OutFile } else { Join-Path (Get-Location) $OutFile }
+    [IO.File]::WriteAllText($full, $text, $utf8)
+    Write-Host "Wrote $full"
+}
+else {
+    Write-Output $text
+}
