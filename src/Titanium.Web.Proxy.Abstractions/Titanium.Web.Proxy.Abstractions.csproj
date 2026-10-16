@@ -39,7 +39,7 @@
 		     older build there is a NU1605 downgrade). Only net45/net451, which are stuck on
 		     Logging.Abstractions 1.0.0, need it declared - and 4.5.4 is the last build with an asset
 		     they can consume. -->
-		<PackageReference Include="System.Threading.Tasks.Extensions" Version="4.5.4" Condition="'$(TargetFramework)' == 'net45' or '$(TargetFramework)' == 'net451'" />
+		<PackageReference Include="System.Threading.Tasks.Extensions" Version="4.5.4" Condition="'$(TargetFramework)' == 'net45' or '$(TargetFramework)' == 'net451' or '$(TargetFramework)' == 'net461'" />
 	</ItemGroup>
 	<ItemGroup>
 		<AdditionalFiles Include="PublicAPI.Shipped.txt" />
