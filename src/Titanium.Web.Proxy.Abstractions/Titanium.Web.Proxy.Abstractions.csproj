@@ -26,6 +26,10 @@
 			<IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
 		</PackageReference>
 	</ItemGroup>
+	<!-- init-only setters need the IsExternalInit marker, which the BCL only ships from .NET 5 on. -->
+	<ItemGroup Condition="'$(TargetFramework)' != 'net10.0'">
+		<Compile Include="..\Shared\Polyfills\IsExternalInit.cs" Link="Polyfills\IsExternalInit.cs" />
+	</ItemGroup>
 	<ItemGroup>
 		<AdditionalFiles Include="PublicAPI.Shipped.txt" />
 		<AdditionalFiles Include="PublicAPI.Unshipped.txt" />
