@@ -57,9 +57,18 @@ public interface ILoadBalancer
 {
     DestinationConfig? Select(ClusterConfig cluster, ImmutableClusterSnapshot snapshot);
 
+#if SUPPORTS_DEFAULT_INTERFACE_METHODS
     /// <summary>Select with affinity / algorithm context. Default forwards to <see cref="Select(ClusterConfig, ImmutableClusterSnapshot)"/>.</summary>
     DestinationConfig? Select(ClusterConfig cluster, ImmutableClusterSnapshot snapshot, LoadBalanceContext context)
         => Select(cluster, snapshot);
+#else
+    /// <summary>
+    ///     Select with affinity / algorithm context. Abstract here: the target runtime has no default
+    ///     interface methods, so an implementation must forward to
+    ///     <see cref="Select(ClusterConfig, ImmutableClusterSnapshot)" /> itself when it ignores the context.
+    /// </summary>
+    DestinationConfig? Select(ClusterConfig cluster, ImmutableClusterSnapshot snapshot, LoadBalanceContext context);
+#endif
 }
 
 /// <summary>Applies transforms to request/response metadata.</summary>

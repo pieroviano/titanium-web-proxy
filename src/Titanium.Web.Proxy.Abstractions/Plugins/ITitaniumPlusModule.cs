@@ -65,11 +65,27 @@ public interface ILatencyRecorder
 {
     void Record(string name, TimeSpan duration);
 
+#if SUPPORTS_DEFAULT_INTERFACE_METHODS
     /// <summary>Record per-destination RTT for least-time LB. Default no-op.</summary>
     void RecordDestination(string destinationId, TimeSpan duration) => Record(destinationId, duration);
 
     /// <summary>Last observed latency for a destination; null if unknown.</summary>
     TimeSpan? GetDestinationLatency(string destinationId) => null;
+#else
+    /// <summary>
+    ///     Record per-destination RTT for least-time LB. Abstract here: the target runtime has no
+    ///     default interface methods, so an implementation must forward to
+    ///     <see cref="Record(string, TimeSpan)" /> itself.
+    /// </summary>
+    void RecordDestination(string destinationId, TimeSpan duration);
+
+    /// <summary>
+    ///     Last observed latency for a destination; null if unknown. Abstract here: the target
+    ///     runtime has no default interface methods, so an implementation must return null itself
+    ///     when it does not track latency.
+    /// </summary>
+    TimeSpan? GetDestinationLatency(string destinationId);
+#endif
 }
 
 /// <summary>

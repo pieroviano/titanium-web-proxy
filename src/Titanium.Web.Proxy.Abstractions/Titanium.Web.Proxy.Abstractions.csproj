@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 	<PropertyGroup>
 		<TargetFrameworks>net45;net451;net461;netstandard2.0;netstandard2.1;net10.0</TargetFrameworks>
 		<RootNamespace>Titanium.Web.Proxy.Abstractions</RootNamespace>
@@ -20,15 +20,26 @@
 		     net45/net451 cannot consume (NU1202). 1.0.0 is the last build with a netstandard1.1 asset,
 		     and it already carries the ILogger contract this project exposes. -->
 		<PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="1.0.0" Condition="'$(TargetFramework)' == 'net45' or '$(TargetFramework)' == 'net451'" />
-		<PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" Condition="'$(TargetFramework)' != 'net45' and '$(TargetFramework)' != 'net451'" />
+		<!-- net461: 10.0.0 resolves only through its netstandard2.0 asset and drags in a transitive
+		     graph (DependencyInjection.Abstractions, DiagnosticSource, System.Memory, ...) whose
+		     buildTransitive targets warn that net461 is untested. 6.0.1 is the newest build with a real
+		     net461 asset, so the warnings go away at the source rather than being suppressed. -->
+		<PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="6.0.1" Condition="'$(TargetFramework)' == 'net461'" />
+		<PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" Condition="'$(TargetFramework)' != 'net45' and '$(TargetFramework)' != 'net451' and '$(TargetFramework)' != 'net461'" />
 		<PackageReference Include="Microsoft.CodeAnalysis.PublicApiAnalyzers" Version="5.6.0">
 			<PrivateAssets>all</PrivateAssets>
 			<IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
 		</PackageReference>
 	</ItemGroup>
-	<!-- init-only setters need the IsExternalInit marker, which the BCL only ships from .NET 5 on. -->
+	<!-- Compiler-required markers the legacy BCLs do not ship (init-only setters, required members).
+	     Each file guards itself with the matching #if, so the newer targets compile them away. -->
 	<ItemGroup Condition="'$(TargetFramework)' != 'net10.0'">
-		<Compile Include="..\Shared\Polyfills\IsExternalInit.cs" Link="Polyfills\IsExternalInit.cs" />
+		<Compile Include="..\Shared\Polyfills\*.cs" LinkBase="Polyfills" />
+		<!-- ValueTask: net461 and up get it transitively from Logging.Abstractions 10.0.0 (pinning an
+		     older build there is a NU1605 downgrade). Only net45/net451, which are stuck on
+		     Logging.Abstractions 1.0.0, need it declared - and 4.5.4 is the last build with an asset
+		     they can consume. -->
+		<PackageReference Include="System.Threading.Tasks.Extensions" Version="4.5.4" Condition="'$(TargetFramework)' == 'net45' or '$(TargetFramework)' == 'net451'" />
 	</ItemGroup>
 	<ItemGroup>
 		<AdditionalFiles Include="PublicAPI.Shipped.txt" />

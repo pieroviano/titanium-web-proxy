@@ -13,4 +13,14 @@
         <Version>$(VersionPrefix).$(VersionSuffix)</Version>
         <PackageVersion>$(Version)</PackageVersion>
     </PropertyGroup>
+
+    <!--
+      Default interface methods need runtime support, which arrived with netstandard2.1 / .NET Core
+      3.0. An interface member with a body is a compile error (CS8701) on the older targets, so the
+      backported sources declare it abstract there instead. Named once here rather than repeating
+      the framework test at every site.
+    -->
+    <PropertyGroup Condition="$([MSBuild]::IsTargetFrameworkCompatible('$(TargetFramework)', 'netstandard2.1'))">
+        <DefineConstants>$(DefineConstants);SUPPORTS_DEFAULT_INTERFACE_METHODS</DefineConstants>
+    </PropertyGroup>
 </Project>
