@@ -1,12 +1,12 @@
-<?xml version="1.0"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project>
   <PropertyGroup>
-    <NuGetPackageRoot Condition="'$(NuGetPackageRoot)'=='' and '$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Windows)))' == 'true'">$(USERPROFILE)\.nuget\packages\</NuGetPackageRoot>
-    <NuGetPackageRoot Condition="'$(NuGetPackageRoot)'=='' and '$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Windows)))' != 'true'">~/.nuget/packages/</NuGetPackageRoot>
+    <NuGetPackageRoot Condition="'$(NuGetPackageRoot)'=='' and '$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Windows)))'=='true'">$(USERPROFILE)\.nuget\packages\</NuGetPackageRoot>
+    <NuGetPackageRoot Condition="'$(NuGetPackageRoot)'=='' and '$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Windows)))'!='true'">~/.nuget/packages/</NuGetPackageRoot>
     <VersionBuildSuffix Condition="'$(Configuration)'!='Release'">*-*</VersionBuildSuffix>
     <VersionBuildSuffix Condition="'$(Configuration)'=='Release'">*</VersionBuildSuffix>
-    <NuGetUtilityVersion Condition="'$(NuGetUtilityVersion)' == ''">1.0.0</NuGetUtilityVersion>
-    <DirectoryNuGet>true</DirectoryNuGet>
+    <NuGetUtilityVersion Condition="'$(NuGetUtilityVersion)'==''">1.0.16</NuGetUtilityVersion>
+    <DirectoryNuGet Condition="'$(DirectoryNuGet)'==''">true</DirectoryNuGet>
     <ImmatricolazioniWsLibrariesVersion>1.1.0</ImmatricolazioniWsLibrariesVersion>
     <FatturaElettronicaVersion>3.2.1</FatturaElettronicaVersion>
     <DocumentoUnicoLibrariesVersion>2.1.0</DocumentoUnicoLibrariesVersion>
@@ -83,7 +83,7 @@
     <iTextSharpPdfaVersion>6.0.0</iTextSharpPdfaVersion>
     <EntityFramework6Version>6.4.4</EntityFramework6Version>
     <NewtonsoftJsonVersion>13.0.3</NewtonsoftJsonVersion>
-    <NuGetUtilityPocVersion>2.0.12</NuGetUtilityPocVersion>
+    <NuGetUtilityPocVersion>1.0.8</NuGetUtilityPocVersion>
     <PackAsToolVersion>1.1.0</PackAsToolVersion>
     <serilog-sinks-fileVersion>5.0.1</serilog-sinks-fileVersion>
     <DapperLibrariesVersion>1.0.0</DapperLibrariesVersion>
